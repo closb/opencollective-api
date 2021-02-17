@@ -91,6 +91,10 @@ export const Host = new GraphQLObjectType({
             supportedPaymentMethods.push('CREDIT_CARD');
           }
 
+          if (find(connectedAccounts, ['service', 'braintree'])) {
+            supportedPaymentMethods.push('BRAINTREE_PAYPAL');
+          }
+
           if (find(connectedAccounts, ['service', 'paypal']) && !collective.settings?.disablePaypalDonations) {
             supportedPaymentMethods.push('PAYPAL');
           }
