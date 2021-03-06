@@ -113,7 +113,10 @@ type Collective implements CollectiveInterface {
   Defines if a collective is pledged
   """
   isPledged: Boolean
-  data: JSON @deprecated(reason: "2020-10-08: This field is not provided anymore and will return an empty object")
+  data: JSON
+    @deprecated(
+      reason: "2021-03-07: This field is not provided anymore except for event admins (to see/edit privateIntructions for event) and will return an empty object for everyone else"
+    )
   githubContributors: JSON!
   slug: String
   path: String
@@ -461,7 +464,10 @@ interface CollectiveInterface {
   Defines if a collective is pledged
   """
   isPledged: Boolean
-  data: JSON @deprecated(reason: "2020-10-08: This field is not provided anymore and will return an empty object")
+  data: JSON
+    @deprecated(
+      reason: "2021-03-07: This field is not provided anymore except for event admins (to see/edit privateIntructions for event) and will return an empty object for everyone else"
+    )
   githubContributors: JSON!
   slug: String
   path: String
@@ -726,6 +732,11 @@ type CollectiveStatsType {
 
   """
   Amount of money in cents in the currency of the collective currently available to spend
+  """
+  balanceWithBlockedFunds: Int
+
+  """
+  Amount of money in cents in the currency of the collective.
   """
   balance: Int
 
@@ -1078,7 +1089,10 @@ type Event implements CollectiveInterface {
   Defines if a collective is pledged
   """
   isPledged: Boolean
-  data: JSON @deprecated(reason: "2020-10-08: This field is not provided anymore and will return an empty object")
+  data: JSON
+    @deprecated(
+      reason: "2021-03-07: This field is not provided anymore except for event admins (to see/edit privateIntructions for event) and will return an empty object for everyone else"
+    )
   githubContributors: JSON!
   slug: String
   path: String
@@ -1445,7 +1459,10 @@ type Fund implements CollectiveInterface {
   Defines if a collective is pledged
   """
   isPledged: Boolean
-  data: JSON @deprecated(reason: "2020-10-08: This field is not provided anymore and will return an empty object")
+  data: JSON
+    @deprecated(
+      reason: "2021-03-07: This field is not provided anymore except for event admins (to see/edit privateIntructions for event) and will return an empty object for everyone else"
+    )
   githubContributors: JSON!
   slug: String
   path: String
@@ -2472,7 +2489,10 @@ type Organization implements CollectiveInterface {
   Defines if a collective is pledged
   """
   isPledged: Boolean
-  data: JSON @deprecated(reason: "2020-10-08: This field is not provided anymore and will return an empty object")
+  data: JSON
+    @deprecated(
+      reason: "2021-03-07: This field is not provided anymore except for event admins (to see/edit privateIntructions for event) and will return an empty object for everyone else"
+    )
   githubContributors: JSON!
   slug: String
   path: String
@@ -2849,7 +2869,10 @@ type Project implements CollectiveInterface {
   Defines if a collective is pledged
   """
   isPledged: Boolean
-  data: JSON @deprecated(reason: "2020-10-08: This field is not provided anymore and will return an empty object")
+  data: JSON
+    @deprecated(
+      reason: "2021-03-07: This field is not provided anymore except for event admins (to see/edit privateIntructions for event) and will return an empty object for everyone else"
+    )
   githubContributors: JSON!
   slug: String
   path: String
@@ -3697,7 +3720,10 @@ type User implements CollectiveInterface {
   Defines if a collective is pledged
   """
   isPledged: Boolean
-  data: JSON @deprecated(reason: "2020-10-08: This field is not provided anymore and will return an empty object")
+  data: JSON
+    @deprecated(
+      reason: "2021-03-07: This field is not provided anymore except for event admins (to see/edit privateIntructions for event) and will return an empty object for everyone else"
+    )
   githubContributors: JSON!
   slug: String
   path: String

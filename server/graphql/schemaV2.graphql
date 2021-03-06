@@ -272,6 +272,11 @@ type AccountStats {
   """
   Amount of money in cents in the currency of the collective currently available to spend
   """
+  balanceWithBlockedFunds: Amount!
+
+  """
+  Amount of money in cents in the currency of the collective
+  """
   balance: Amount!
 
   """
@@ -3495,6 +3500,11 @@ input ExpenseInviteDraftInput {
   The address of the payee
   """
   payeeLocation: LocationInput
+
+  """
+  The payout method that will be used to reimburse the expense
+  """
+  payoutMethod: PayoutMethodInput
 }
 
 input ExpenseInvitee {

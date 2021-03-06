@@ -643,7 +643,8 @@ export const CollectiveInterfaceType = new GraphQLInterfaceType({
       },
       data: {
         type: GraphQLJSON,
-        deprecationReason: '2020-10-08: This field is not provided anymore and will return an empty object',
+        deprecationReason:
+          '2021-03-07: This field is not provided anymore except for event admins (to see/edit privateIntructions for event) and will return an empty object for everyone else',
       },
       githubContributors: { type: new GraphQLNonNull(GraphQLJSON) },
       slug: { type: GraphQLString },
@@ -1095,9 +1096,14 @@ const CollectiveFields = () => {
     },
     data: {
       type: GraphQLJSON,
-      deprecationReason: '2020-10-08: This field is not provided anymore and will return an empty object',
-      resolve() {
-        return {};
+      deprecationReason:
+        '2021-03-07: This field is not provided anymore except for event admins (to see/edit privateIntructions for event) and will return an empty object for everyone else',
+      resolve(collective, _, req) {
+        if (collective.type === types.EVENT && req.remoteUser.isAdminOfCollective(collective)) {
+          return collective.data;
+        } else {
+          return {};
+        }
       },
     },
     githubContributors: {
