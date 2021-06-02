@@ -158,6 +158,47 @@ describe('server/paymentProviders/stripe/creditcard', () => {
         expect(createIntentRequest).to.have.property('application_fee_amount', `${1000 * 0.1 * 0.15}`);
       });
 
+      it('should process orders correctly with zero decimal currencies', async () => {
+        const { order } = await createOrderWithPaymentMethod('name', {
+          totalAmount: 25000,
+          currency: 'jpy',
+          data: { isFeesOnTop: true, platformFee: 5000 },
+        });
+
+        await creditcard.processOrder(order);
+
+        expect(createIntentRequest).to.have.property('amount', '250');
+        expect(createIntentRequest).to.have.property('application_fee_amount', `50`);
+      });
+
+      it('should work with custom creditCardHostFeeSharePercent', async () => {
+        const { order, host, collective } = await createOrderWithPaymentMethod('name', {
+          totalAmount: 1000,
+        });
+        await collective.update({ hostFeePercent: 10 });
+        await host.update({ plan: 'grow-plan-2021', data: { plan: { creditCardHostFeeSharePercent: 20 } } });
+        await cache.clear();
+
+        await creditcard.processOrder(order);
+
+        expect(createIntentRequest).to.have.property('amount', '1000');
+        expect(createIntentRequest).to.have.property('application_fee_amount', `${1000 * 0.1 * 0.2}`);
+      });
+
+      it('should work with creditCardHostFeeSharePercent = 0', async () => {
+        const { order, host, collective } = await createOrderWithPaymentMethod('name', {
+          totalAmount: 1000,
+        });
+        await collective.update({ hostFeePercent: 10, platformFeePercent: 0 });
+        await host.update({ plan: 'grow-plan-2021', data: { plan: { creditCardHostFeeSharePercent: 0 } } });
+        await cache.clear();
+
+        await creditcard.processOrder(order);
+
+        expect(createIntentRequest).to.have.property('amount', '1000');
+        expect(createIntentRequest).to.not.have.property('application_fee_amount');
+      });
+
       it('should collect both', async () => {
         nock.cleanAll();
         setupNock({

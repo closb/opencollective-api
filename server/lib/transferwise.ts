@@ -16,7 +16,7 @@ import {
   BorderlessAccount,
   CurrencyPair,
   Profile,
-  Quote,
+  QuoteV2,
   RecipientAccount,
   Transfer,
   Webhook,
@@ -54,10 +54,15 @@ const signString = (data: string) => {
   return sign.sign(key, 'base64');
 };
 
-const compactRecipientDetails = <T>(object: T): Partial<T> => omitBy(object, isNull);
+const compactRecipientDetails = <T>(object: T): Partial<T> => <Partial<T>>omitBy(object, isNull);
 
 const getData = <T extends { data?: Record<string, unknown> }>(obj: T | undefined): T['data'] | undefined =>
   obj && obj.data;
+
+const tap = fn => data => {
+  fn(data);
+  return data;
+};
 
 const parseError = (
   error: AxiosError<{ errorCode?: TransferwiseErrorCodes; errors?: Record<string, unknown>[] }>,
@@ -95,10 +100,11 @@ export const requestDataAndThrowParsedError = (
   },
   defaultErrorMessage?: string,
 ): Promise<any> => {
-  debug(`calling ${url}`);
+  debug(`calling ${url}: ${JSON.stringify({ data, params: options.params }, null, 2)}`);
   const pRequest = data ? fn(url, data, options) : fn(url, options);
   return pRequest
     .then(getData)
+    .then(tap(data => debug(JSON.stringify(data, null, 2))))
     .catch(e => {
       // Implements Strong Customer Authentication
       // https://api-docs.transferwise.com/#payouts-guide-strong-customer-authentication
@@ -126,26 +132,41 @@ interface CreateQuote {
   profileId: number;
   sourceCurrency: string;
   targetCurrency: string;
+  targetAccount?: number;
   targetAmount?: number;
   sourceAmount?: number;
+  payOut?: 'BANK_TRANSFER' | 'BALANCE' | 'SWIFT' | 'INTERAC' | null;
 }
 export const createQuote = async (
   token: string,
-  { profileId: profile, sourceCurrency, targetCurrency, targetAmount, sourceAmount }: CreateQuote,
-): Promise<Quote> => {
-  const data = {
-    profile,
-    source: sourceCurrency,
-    target: targetCurrency,
-    rateType: 'FIXED',
-    type: 'BALANCE_PAYOUT',
+  {
+    profileId: profile,
+    sourceCurrency,
+    targetCurrency,
     targetAmount,
     sourceAmount,
+    payOut,
+    targetAccount,
+  }: CreateQuote,
+): Promise<QuoteV2> => {
+  const data = {
+    payOut,
+    profile,
+    sourceAmount,
+    sourceCurrency,
+    targetAccount,
+    targetAmount,
+    targetCurrency,
   };
-  return requestDataAndThrowParsedError(axios.post, `/v1/quotes`, {
-    headers: { Authorization: `Bearer ${token}` },
-    data,
-  });
+  try {
+    return requestDataAndThrowParsedError(axios.post, `/v2/quotes`, {
+      headers: { Authorization: `Bearer ${token}` },
+      data,
+    });
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error while creating the quote on Wise');
+  }
 };
 
 interface CreateRecipientAccount extends RecipientAccount {
@@ -156,20 +177,25 @@ export const createRecipientAccount = async (
   { profileId: profile, currency, type, accountHolderName, legalType, details }: CreateRecipientAccount,
 ): Promise<RecipientAccount> => {
   const data = { profile, currency, type, accountHolderName, legalType, details };
-  const response = await requestDataAndThrowParsedError(axios.post, `/v1/accounts`, {
-    data,
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  return {
-    ...response,
-    details: compactRecipientDetails(response.details),
-  };
+  try {
+    const response = await requestDataAndThrowParsedError(axios.post, `/v1/accounts`, {
+      data,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return {
+      ...response,
+      details: compactRecipientDetails(response.details),
+    };
+  } catch (e) {
+    logger.error(e);
+    throw new Error("There was an error while creating Wise's recipient");
+  }
 };
 
 export interface CreateTransfer {
   accountId: number;
-  quoteId: number;
-  uuid: string;
+  quoteUuid: string;
+  customerTransactionId: string;
   details?: {
     reference?: string;
     transferPurpose?: string;
@@ -178,20 +204,30 @@ export interface CreateTransfer {
 }
 export const createTransfer = async (
   token: string,
-  { accountId: targetAccount, quoteId: quote, uuid: customerTransactionId, details }: CreateTransfer,
+  { accountId: targetAccount, quoteUuid, customerTransactionId, details }: CreateTransfer,
 ): Promise<Transfer> => {
-  const data = { targetAccount, quote, customerTransactionId, details };
-  return requestDataAndThrowParsedError(axios.post, `/v1/transfers`, {
-    data,
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const data = { targetAccount, quoteUuid, customerTransactionId, details };
+  try {
+    return requestDataAndThrowParsedError(axios.post, `/v1/transfers`, {
+      data,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error while creating the Wise transfer');
+  }
 };
 
 export const cancelTransfer = async (token: string, transferId: string | number): Promise<Transfer> => {
-  return requestDataAndThrowParsedError(axios.put, `/v1/transfers/${transferId}/cancel`, {
-    data: {},
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  try {
+    return requestDataAndThrowParsedError(axios.put, `/v1/transfers/${transferId}/cancel`, {
+      data: {},
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error while cancelling the Wise transfer');
+  }
 };
 
 interface FundTransfer {
@@ -202,26 +238,36 @@ export const fundTransfer = async (
   token: string,
   { profileId, transferId }: FundTransfer,
 ): Promise<{ status: 'COMPLETED' | 'REJECTED'; errorCode: string }> => {
-  return requestDataAndThrowParsedError(
-    axios.post,
-    `/v3/profiles/${profileId}/transfers/${transferId}/payments`,
-    {
-      data: { type: 'BALANCE' },
-      headers: { Authorization: `Bearer ${token}` },
-    },
-    'Unable to fund transfer, please check your balance and try again.',
-  );
+  try {
+    return requestDataAndThrowParsedError(
+      axios.post,
+      `/v3/profiles/${profileId}/transfers/${transferId}/payments`,
+      {
+        data: { type: 'BALANCE' },
+        headers: { Authorization: `Bearer ${token}` },
+      },
+      'Unable to fund transfer, please check your balance and try again.',
+    );
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error while funding the transfer for Wise');
+  }
 };
 
 export const getProfiles = async (token: string): Promise<Profile[]> => {
-  return requestDataAndThrowParsedError(
-    axios.get,
-    `/v1/profiles`,
-    {
-      headers: { Authorization: `Bearer ${token}` },
-    },
-    'Unable to fetch profiles.',
-  );
+  try {
+    return requestDataAndThrowParsedError(
+      axios.get,
+      `/v1/profiles`,
+      {
+        headers: { Authorization: `Bearer ${token}` },
+      },
+      'Unable to fetch profiles.',
+    );
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error fetching the profiles for Wise');
+  }
 };
 
 interface GetTemporaryQuote {
@@ -233,23 +279,32 @@ interface GetTemporaryQuote {
 export const getTemporaryQuote = async (
   token: string,
   { sourceCurrency, targetCurrency, ...amount }: GetTemporaryQuote,
-): Promise<Quote> => {
-  const params = {
-    source: sourceCurrency,
-    target: targetCurrency,
-    rateType: 'FIXED',
+): Promise<QuoteV2> => {
+  const data = {
+    sourceCurrency,
+    targetCurrency,
     ...amount,
   };
-  return requestDataAndThrowParsedError(axios.get, `/v1/quotes`, {
-    headers: { Authorization: `Bearer ${token}` },
-    params,
-  });
+  try {
+    return requestDataAndThrowParsedError(axios.post, `/v2/quotes`, {
+      headers: { Authorization: `Bearer ${token}` },
+      data,
+    });
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error while fetching the Wise quote');
+  }
 };
 
 export const getTransfer = async (token: string, transferId: number): Promise<Transfer> => {
-  return requestDataAndThrowParsedError(axios.get, `/v1/transfers/${transferId}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  try {
+    return requestDataAndThrowParsedError(axios.get, `/v1/transfers/${transferId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error fetching transfer for Wise');
+  }
 };
 
 export const getAccountRequirements = async (
@@ -261,10 +316,15 @@ export const getAccountRequirements = async (
     target: targetCurrency,
     ...amount,
   };
-  return requestDataAndThrowParsedError(axios.get, `/v1/account-requirements`, {
-    headers: { Authorization: `Bearer ${token}` },
-    params,
-  });
+  try {
+    return requestDataAndThrowParsedError(axios.get, `/v1/account-requirements`, {
+      headers: { Authorization: `Bearer ${token}` },
+      params,
+    });
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error while fetching account requirements for Wise');
+  }
 };
 
 export const validateAccountRequirements = async (
@@ -277,28 +337,43 @@ export const validateAccountRequirements = async (
     target: targetCurrency,
     ...amount,
   };
-  return requestDataAndThrowParsedError(axios.post, `/v1/account-requirements`, {
-    data: accountDetails,
-    headers: { Authorization: `Bearer ${token}` },
-    params,
-  });
+  try {
+    return requestDataAndThrowParsedError(axios.post, `/v1/account-requirements`, {
+      data: accountDetails,
+      headers: { Authorization: `Bearer ${token}` },
+      params,
+    });
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error while validating account requirements for Wise');
+  }
 };
 
 export const getCurrencyPairs = async (token: string): Promise<{ sourceCurrencies: CurrencyPair[] }> => {
-  return requestDataAndThrowParsedError(axios.get, `/v1/currency-pairs`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  try {
+    return requestDataAndThrowParsedError(axios.get, `/v1/currency-pairs`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error while fetching account requirements for Wise');
+  }
 };
 
 export const getBorderlessAccount = async (token: string, profileId: string | number): Promise<BorderlessAccount> => {
-  const accounts: BorderlessAccount[] = await requestDataAndThrowParsedError(
-    axios.get,
-    `/v1/borderless-accounts?profileId=${profileId}`,
-    {
-      headers: { Authorization: `Bearer ${token}` },
-    },
-  );
-  return accounts.find(a => a.profileId === profileId);
+  try {
+    const accounts: BorderlessAccount[] = await requestDataAndThrowParsedError(
+      axios.get,
+      `/v1/borderless-accounts?profileId=${profileId}`,
+      {
+        headers: { Authorization: `Bearer ${token}` },
+      },
+    );
+    return accounts.find(a => a.profileId === profileId);
+  } catch (e) {
+    logger.error(e);
+    throw new Error("There was an error while fetching Host's Wise account");
+  }
 };
 
 const isProduction = config.env === 'production';
@@ -391,42 +466,64 @@ export const getOrRefreshToken = async ({
   }
 
   const params = new url.URLSearchParams(data);
-  const token: AccessToken = await axios
-    .post(`/oauth/token`, params.toString(), {
-      auth: { username: config.transferwise.clientId, password: config.transferwise.clientSecret },
-    })
-    .then(getData);
-  debug(`getOrRefreshUserToken: ${JSON.stringify(token, null, 2)}`);
-  return token;
+  try {
+    const token: AccessToken = await axios
+      .post(`/oauth/token`, params.toString(), {
+        auth: { username: config.transferwise.clientId, password: config.transferwise.clientSecret },
+      })
+      .then(getData);
+
+    debug(`getOrRefreshUserToken: ${JSON.stringify(token, null, 2)}`);
+    return token;
+  } catch (e) {
+    logger.error(e);
+    throw new Error("There was an error while refreshing host's Wise token");
+  }
 };
 
 export const listApplicationWebhooks = async (): Promise<Webhook[]> => {
   const { access_token } = await getOrRefreshToken({ application: true });
-  const webhooks = await axios
-    .get(`/v3/applications/${config.transferwise.clientKey}/subscriptions`, {
-      headers: { Authorization: `Bearer ${access_token}` },
-    })
-    .then(getData);
-  return webhooks;
+
+  try {
+    const webhooks = await axios
+      .get(`/v3/applications/${config.transferwise.clientKey}/subscriptions`, {
+        headers: { Authorization: `Bearer ${access_token}` },
+      })
+      .then(getData);
+    return webhooks;
+  } catch (e) {
+    logger.error(e);
+    throw new Error("There was an error while listing Wise's application webhooks");
+  }
 };
 
 export const createApplicationWebhook = async (webhookInfo: WebhookCreateInput): Promise<Webhook> => {
   const { access_token } = await getOrRefreshToken({ application: true });
   debug(`createApplicationWebhook: ${JSON.stringify(webhookInfo, null, 2)}`);
-  const webhook: Webhook = await axios
-    .post(`/v3/applications/${config.transferwise.clientKey}/subscriptions`, webhookInfo, {
-      headers: { Authorization: `Bearer ${access_token}` },
-    })
-    .then(getData);
-  return webhook;
+  try {
+    const webhook: Webhook = await axios
+      .post(`/v3/applications/${config.transferwise.clientKey}/subscriptions`, webhookInfo, {
+        headers: { Authorization: `Bearer ${access_token}` },
+      })
+      .then(getData);
+    return webhook;
+  } catch (e) {
+    logger.error(e);
+    throw new Error("There was an error while creating Wise's application webhook");
+  }
 };
 
 export const deleteApplicationWebhook = async (id: string | number): Promise<any> => {
   const { access_token } = await getOrRefreshToken({ application: true });
   debug(`deleteApplicationWebhook: id ${id}`);
-  return await axios
-    .delete(`/v3/applications/${config.transferwise.clientKey}/subscriptions/${id}`, {
-      headers: { Authorization: `Bearer ${access_token}` },
-    })
-    .then(getData);
+  try {
+    return await axios
+      .delete(`/v3/applications/${config.transferwise.clientKey}/subscriptions/${id}`, {
+        headers: { Authorization: `Bearer ${access_token}` },
+      })
+      .then(getData);
+  } catch (e) {
+    logger.error(e);
+    throw new Error("There was an error while deleting Wise's application webhook");
+  }
 };

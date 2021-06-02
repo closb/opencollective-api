@@ -1,16 +1,19 @@
 import { GraphQLBoolean, GraphQLInt, GraphQLInterfaceType, GraphQLList, GraphQLNonNull, GraphQLString } from 'graphql';
 import { GraphQLDateTime } from 'graphql-iso-date';
 import GraphQLJSON from 'graphql-type-json';
-import { assign, get, invert } from 'lodash';
+import { assign, get, invert, isEmpty } from 'lodash';
 
+import { types as CollectiveTypes } from '../../../constants/collectives';
 import models, { Op } from '../../../models';
-import { NotFound } from '../../errors';
+import { NotFound, Unauthorized } from '../../errors';
 import { CollectiveFeatures } from '../../v1/CollectiveInterface.js';
+import { AccountCollection } from '../collection/AccountCollection';
 import { ConversationCollection } from '../collection/ConversationCollection';
 import { MemberCollection, MemberOfCollection } from '../collection/MemberCollection';
 import { OrderCollection } from '../collection/OrderCollection';
 import { TransactionCollection } from '../collection/TransactionCollection';
 import { UpdateCollection } from '../collection/UpdateCollection';
+import { VirtualCardCollection } from '../collection/VirtualCardCollection';
 import {
   AccountOrdersFilter,
   AccountType,
@@ -21,10 +24,8 @@ import {
   TransactionType,
 } from '../enum';
 import { idEncode } from '../identifiers';
-import { AccountReferenceInput } from '../input/AccountReferenceInput';
+import { AccountReferenceInput, fetchAccountWithReference } from '../input/AccountReferenceInput';
 import { ChronologicalOrderInput } from '../input/ChronologicalOrderInput';
-import { HasMembersFields } from '../interface/HasMembers';
-import { IsMemberOfFields } from '../interface/IsMemberOf';
 import { AccountStats } from '../object/AccountStats';
 import { ConnectedAccount } from '../object/ConnectedAccount';
 import { Location } from '../object/Location';
@@ -33,8 +34,11 @@ import PayoutMethod from '../object/PayoutMethod';
 import { TagStats } from '../object/TagStats';
 import { TransferWise } from '../object/TransferWise';
 import EmailAddress from '../scalar/EmailAddress';
+import ISODateTime from '../scalar/ISODateTime';
 
 import { CollectionArgs } from './Collection';
+import { HasMembersFields } from './HasMembers';
+import { IsMemberOfFields } from './IsMemberOf';
 
 const accountFieldsDefinition = () => ({
   id: {
@@ -52,7 +56,7 @@ const accountFieldsDefinition = () => ({
   },
   type: {
     type: AccountType,
-    description: 'The type of the account (BOT/COLLECTIVE/EVENT/ORGANIZATION/INDIVIDUAL)',
+    description: 'The type of the account (BOT/COLLECTIVE/EVENT/ORGANIZATION/INDIVIDUAL/VENDOR)',
   },
   name: {
     type: GraphQLString,
@@ -203,6 +207,10 @@ const accountFieldsDefinition = () => ({
         type: GraphQLBoolean,
         description: 'Only returns orders that have an subscription (monthly/yearly)',
       },
+      includeIncognito: {
+        type: GraphQLBoolean,
+        description: 'Whether outgoing incognito contributions should be included. Only works when user is an admin.',
+      },
       orderBy: {
         type: ChronologicalOrderInput,
       },
@@ -264,7 +272,7 @@ const accountFieldsDefinition = () => ({
       includeExpired: {
         type: GraphQLBoolean,
         description:
-          'Wether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.',
+          'Whether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.',
       },
     },
   },
@@ -315,6 +323,127 @@ const accountFieldsDefinition = () => ({
     description: 'Describes the features enabled and available for this collective',
     resolve(collective) {
       return collective;
+    },
+  },
+  virtualCards: {
+    type: new GraphQLNonNull(VirtualCardCollection),
+    args: {
+      limit: { type: GraphQLInt, defaultValue: 100 },
+      offset: { type: GraphQLInt, defaultValue: 0 },
+      state: { type: GraphQLString, defaultValue: null },
+      merchantAccount: { type: AccountReferenceInput, defaultValue: null },
+      dateFrom: {
+        type: ISODateTime,
+        defaultValue: null,
+        description: 'Only return expenses that were created after this date',
+      },
+      dateTo: {
+        type: ISODateTime,
+        defaultValue: null,
+        description: 'Only return expenses that were created before this date',
+      },
+    },
+    async resolve(account, args, req) {
+      if (!req.remoteUser?.isAdminOfCollective(account)) {
+        throw new Unauthorized('You need to be logged in as an admin of the collective to see its virtual cards');
+      }
+
+      let merchantId;
+      if (!isEmpty(args.merchantAccount)) {
+        merchantId = (await fetchAccountWithReference(args.merchantAccount, { throwIfMissing: true })).id;
+      }
+
+      const query = {
+        group: 'VirtualCard.id',
+        where: {
+          CollectiveId: account.id,
+        },
+        limit: args.limit,
+        offset: args.offset,
+      };
+
+      if (args.dateFrom) {
+        query.where['createdAt'] = { [Op.gte]: args.dateFrom };
+      }
+      if (args.dateTo) {
+        query.where['createdAt'] = Object.assign({}, query.where['createdAt'], { [Op.lte]: args.dateTo });
+      }
+
+      if (args.state) {
+        query.where.data = { state: args.state };
+      }
+
+      if (merchantId) {
+        if (!query.where.data) {
+          query.where.data = {};
+        }
+        query.where.data.type = 'MERCHANT_LOCKED';
+        query.include = [
+          {
+            attributes: [],
+            association: 'expenses',
+            required: true,
+            where: {
+              CollectiveId: merchantId,
+            },
+          },
+        ];
+      }
+
+      const result = await models.VirtualCard.findAndCountAll(query);
+
+      return {
+        nodes: result.rows,
+        totalCount: result.count.length, // See https://github.com/sequelize/sequelize/issues/9109
+        limit: args.limit,
+        offset: args.offset,
+      };
+    },
+  },
+  virtualCardMerchants: {
+    type: new GraphQLNonNull(AccountCollection),
+    args: {
+      limit: { type: GraphQLInt, defaultValue: 100 },
+      offset: { type: GraphQLInt, defaultValue: 0 },
+    },
+    async resolve(account, args, req) {
+      if (!req.remoteUser?.isAdminOfCollective(account)) {
+        throw new Unauthorized(
+          'You need to be logged in as an admin of the collective to see its virtual card merchants',
+        );
+      }
+
+      const result = await models.Collective.findAndCountAll({
+        group: 'Collective.id',
+        where: {
+          type: CollectiveTypes.VENDOR,
+        },
+        include: [
+          {
+            attributes: [],
+            association: 'submittedExpenses',
+            required: true,
+            include: [
+              {
+                attributes: [],
+                association: 'virtualCard',
+                required: true,
+                where: {
+                  CollectiveId: account.id,
+                  data: { type: 'MERCHANT_LOCKED' },
+                },
+              },
+            ],
+          },
+        ],
+      });
+
+      return {
+        nodes: result.rows,
+        totalCount: result.count.length, // See https://github.com/sequelize/sequelize/issues/9109
+        limit: args.limit,
+        offset: args.offset,
+      };
     },
   },
 });
@@ -380,19 +509,36 @@ const accountOrders = {
       type: GraphQLBoolean,
       description: 'Only returns orders that have an subscription (monthly/yearly)',
     },
+    includeIncognito: {
+      type: GraphQLBoolean,
+      description: 'Whether outgoing incognito contributions should be included. Only works when user is an admin.',
+    },
     orderBy: {
       type: ChronologicalOrderInput,
       defaultValue: ChronologicalOrderInput.defaultValue,
     },
   },
-  async resolve(collective, args) {
+  async resolve(collective, args, req) {
+    const outgoingFromCollectiveIds = [collective.id];
     let where, include;
+
+    // Filter for incognito contributions
+    const includesOutgoing = args.filter !== 'INCOMING';
+    const isUser = collective.type === 'USER';
+    if (args.includeIncognito && includesOutgoing && isUser && req.remoteUser?.CollectiveId === collective.id) {
+      const incognitoProfile = await req.remoteUser.getIncognitoProfile();
+      if (incognitoProfile) {
+        outgoingFromCollectiveIds.push(incognitoProfile.id);
+      }
+    }
+
+    // Filter direction (INCOMING/OUTGOING)
     if (args.filter === 'OUTGOING') {
-      where = { FromCollectiveId: collective.id };
+      where = { FromCollectiveId: outgoingFromCollectiveIds };
     } else if (args.filter === 'INCOMING') {
       where = { CollectiveId: collective.id };
     } else {
-      where = { [Op.or]: { CollectiveId: collective.id, FromCollectiveId: collective.id } };
+      where = { [Op.or]: { CollectiveId: collective.id, FromCollectiveId: outgoingFromCollectiveIds } };
     }
 
     if (args.status && args.status.length > 0) {
@@ -571,11 +717,15 @@ export const AccountFields = {
       includeExpired: {
         type: GraphQLBoolean,
         description:
-          'Wether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.',
+          'Whether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.',
       },
     },
     description: 'The list of payment methods that this collective can use to pay for Orders',
     async resolve(collective, args, req) {
+      if (!req.remoteUser?.isAdminOfCollective(collective)) {
+        return [];
+      }
+
       const now = new Date();
       const paymentMethods = await req.loaders.PaymentMethod.findByCollectiveId.load(collective.id);
 

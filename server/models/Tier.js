@@ -5,6 +5,7 @@ import { defaults } from 'lodash';
 import Temporal from 'sequelize-temporal';
 
 import { maxInteger } from '../constants/math';
+import orderStatus from '../constants/order_status';
 import { buildSanitizerOptions, sanitizeHTML } from '../lib/sanitize-html';
 import sequelize, { DataTypes, Op } from '../lib/sequelize';
 import { capitalize, days, formatCurrency } from '../lib/utils';
@@ -189,8 +190,15 @@ function defineModel() {
         type: DataTypes.STRING(8),
         validate: {
           isIn: {
-            args: [['month', 'year']],
-            msg: 'Must be month or year',
+            args: [['month', 'year', 'flexible']],
+            msg: 'Must be month, year or flexible',
+          },
+          isValidTier(value) {
+            if (this.amountType === 'FIXED' && value === 'flexible') {
+              throw new Error(
+                `In ${this.name}'s tier, "flexible" interval can not be selected with "fixed" amount type.`,
+              );
+            }
           },
         },
       },
@@ -251,6 +259,7 @@ function defineModel() {
             name: this.name,
             description: this.description,
             amount: this.amount,
+            interval: this.interval,
             currency: this.currency,
             maxQuantity: this.maxQuantity,
             startsAt: this.startsAt,
@@ -280,7 +289,7 @@ function defineModel() {
             str = `${formatCurrency(this.amount || 0, this.currency)}`;
           }
 
-          if (this.interval) {
+          if (this.interval && this.interval !== 'flexible') {
             str += ` per ${this.interval}`;
           }
           return str;
@@ -338,10 +347,10 @@ function defineModel() {
             debug('No transaction found for order', order.dataValues);
             return false;
           }
-          if (this.interval === 'month' && days(transaction.createdAt, until) <= 31) {
+          if (order.interval === 'month' && days(transaction.createdAt, until) <= 31) {
             return true;
           }
-          if (this.interval === 'year' && days(transaction.createdAt, until) <= 365) {
+          if (order.interval === 'year' && days(transaction.createdAt, until) <= 365) {
             return true;
           }
           return false;
@@ -358,6 +367,7 @@ function defineModel() {
     return models.Order.sum('quantity', {
       where: {
         TierId: this.id,
+        status: { [Op.notIn]: [orderStatus.ERROR, orderStatus.CANCELLED, orderStatus.EXPIRED, orderStatus.REJECTED] },
         processedAt: { [Op.ne]: null },
       },
     }).then(usedQuantity => {

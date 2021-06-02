@@ -2,8 +2,10 @@ import { GraphQLBoolean, GraphQLInputFieldConfigMap, GraphQLInputObjectType, Gra
 import { pick } from 'lodash';
 
 import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE } from '../../../constants/paymentMethods';
-import { PaymentMethodType } from '../enum';
-import { getLegacyServiceTypeFromPaymentMethodType } from '../enum/PaymentMethodType';
+import { PaymentMethodLegacyType } from '../enum';
+import { getServiceTypeFromLegacyPaymentMethodType } from '../enum/PaymentMethodLegacyType';
+import { PaymentMethodService } from '../enum/PaymentMethodService';
+import { PaymentMethodType } from '../enum/PaymentMethodType';
 
 import { CreditCardCreateInput } from './CreditCardCreateInput';
 import { fetchPaymentMethodWithReference } from './PaymentMethodReferenceInput';
@@ -18,8 +20,25 @@ export const PaymentMethodInput = new GraphQLInputObjectType({
       description: 'The id assigned to the payment method',
     },
     type: {
-      type: PaymentMethodType,
+      type: PaymentMethodLegacyType,
       description: 'Type of this payment method',
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+      // @ts-ignore `deprecationReason` is not yet exposed by graphql but it does exist
+      deprecationReason: '2021-03-02: Please use service + type',
+    },
+    legacyType: {
+      type: PaymentMethodLegacyType,
+      description: 'Type of this payment method',
+      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+      // @ts-ignore `deprecationReason` is not yet exposed by graphql but it does exist
+      deprecationReason: '2021-03-02: Please use service + type',
+    },
+    service: {
+      type: PaymentMethodService,
+    },
+    newType: {
+      // TODO: Migrate to `type`
+      type: PaymentMethodType,
     },
     name: {
       type: GraphQLString,
@@ -27,7 +46,7 @@ export const PaymentMethodInput = new GraphQLInputObjectType({
     },
     isSavedForLater: {
       type: GraphQLBoolean,
-      description: 'Wether this payment method should be saved for future payments',
+      description: 'Whether this payment method should be saved for future payments',
     },
     creditCardInfo: {
       type: CreditCardCreateInput,
@@ -51,7 +70,9 @@ export const getLegacyPaymentMethodFromPaymentMethodInput = async (
     return null;
   } else if (pm.id) {
     return fetchPaymentMethodWithReference(pm);
-  } else if (pm.creditCardInfo) {
+  }
+
+  if (pm.creditCardInfo) {
     return {
       service: PAYMENT_METHOD_SERVICE.STRIPE,
       type: PAYMENT_METHOD_TYPE.CREDITCARD,
@@ -61,12 +82,24 @@ export const getLegacyPaymentMethodFromPaymentMethodInput = async (
       data: pick(pm.creditCardInfo, ['brand', 'country', 'expMonth', 'expYear', 'fullName', 'funding', 'zip']),
     };
   } else if (pm.paypalInfo) {
-    return {
-      service: PAYMENT_METHOD_SERVICE.PAYPAL,
-      type: PAYMENT_METHOD_TYPE.PAYMENT,
-      ...pick(pm.paypalInfo, ['token', 'data']),
-    };
+    if (pm.paypalInfo.isNewApi && pm.paypalInfo.subscriptionId) {
+      return {
+        service: PAYMENT_METHOD_SERVICE.PAYPAL,
+        type: PAYMENT_METHOD_TYPE.SUBSCRIPTION,
+        token: pm.paypalInfo.subscriptionId,
+      };
+    } else {
+      return {
+        service: PAYMENT_METHOD_SERVICE.PAYPAL,
+        type: PAYMENT_METHOD_TYPE.PAYMENT,
+        ...pick(pm.paypalInfo, ['token']),
+        data: {
+          ...(pm.paypalInfo.data || {}),
+          ...pick(pm.paypalInfo, ['isNewApi', 'orderId']),
+        },
+      };
+    }
   } else {
-    return getLegacyServiceTypeFromPaymentMethodType(pm.type);
+    return getServiceTypeFromLegacyPaymentMethodType(pm.type);
   }
 };

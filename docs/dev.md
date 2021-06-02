@@ -12,17 +12,16 @@ For example, try this query:
 ```
 query {
   Collective(slug:"apex") {
-      id,
-      slug,
-      name,
-      description,
+      id
+      slug
+      name
+      description
       tiers {
-        id,
-        name,
-        description,
-        amount,
-        currency,
-        maxQuantity
+        id
+        name
+        description
+        amount
+        currency
       }
       members{
         id
@@ -67,7 +66,7 @@ for more info about the tests.
 
 ## Running Scripts
 
-There are many admin scripts in [`/scripts` directory](https://github.com/opencollective/opencollective-api/tree/master/scripts). To run them:
+There are many admin scripts in [`/scripts` directory](https://github.com/opencollective/opencollective-api/tree/main/scripts). To run them:
 
 ```
 # Local development (without Docker)

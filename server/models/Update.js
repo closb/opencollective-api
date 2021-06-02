@@ -5,9 +5,10 @@ import { defaults, pick } from 'lodash';
 import Temporal from 'sequelize-temporal';
 
 import activities from '../constants/activities';
+import MemberRoles from '../constants/roles';
 import * as errors from '../graphql/errors';
-import { mustHaveRole } from '../lib/auth';
 import logger from '../lib/logger';
+import * as SQLQueries from '../lib/queries';
 import { buildSanitizerOptions, generateSummaryForHTML, sanitizeHTML } from '../lib/sanitize-html';
 import sequelize, { DataTypes, Op, QueryTypes } from '../lib/sequelize';
 
@@ -20,6 +21,20 @@ const sanitizerOptions = buildSanitizerOptions({
   links: true,
   videoIframes: true,
 });
+
+/**
+ * Defines the roles targeted by an update notification. Admins of the parent collective are
+ * always included, regardless of the values in this array.
+ */
+const PRIVATE_UPDATE_TARGET_ROLES = [
+  MemberRoles.ADMIN,
+  MemberRoles.MEMBER,
+  MemberRoles.CONTRIBUTOR,
+  MemberRoles.BACKER,
+  MemberRoles.ATTENDEE,
+];
+
+const PUBLIC_UPDATE_TARGET_ROLES = [...PRIVATE_UPDATE_TARGET_ROLES, MemberRoles.FOLLOWER];
 
 function defineModel() {
   const { models } = sequelize;
@@ -101,13 +116,13 @@ function defineModel() {
 
       title: {
         type: DataTypes.STRING,
+        set(title) {
+          this.setDataValue('title', title.replace(/\s+/g, ' ').trim());
+        },
         validate: {
           len: [1, 255],
         },
       },
-
-      // @deprecated
-      markdown: DataTypes.TEXT,
 
       html: {
         type: DataTypes.TEXT,
@@ -174,6 +189,7 @@ function defineModel() {
             createdAt: this.createdAt,
             updatedAt: this.updatedAt,
             publishedAt: this.publishedAt,
+            isPrivate: this.isPrivate,
             slug: this.slug,
             tags: this.tags,
             CollectiveId: this.CollectiveId,
@@ -198,6 +214,7 @@ function defineModel() {
             CollectiveId: this.CollectiveId,
             FromCollectiveId: this.FromCollectiveId,
             TierId: this.TierId,
+            isPrivate: this.isPrivate,
           };
         },
       },
@@ -238,7 +255,6 @@ function defineModel() {
 
   // Edit an update
   Update.prototype.edit = async function (remoteUser, newUpdateData) {
-    mustHaveRole(remoteUser, 'ADMIN', this.CollectiveId, 'edit this update');
     if (newUpdateData.TierId) {
       const tier = await models.Tier.findByPk(newUpdateData.TierId);
       if (!tier) {
@@ -259,7 +275,6 @@ function defineModel() {
 
   // Publish update
   Update.prototype.publish = async function (remoteUser, notificationAudience) {
-    mustHaveRole(remoteUser, 'ADMIN', this.CollectiveId, 'publish this update');
     this.publishedAt = new Date();
     this.notificationAudience = notificationAudience;
     this.collective = this.collective || (await models.Collective.findByPk(this.CollectiveId));
@@ -281,20 +296,98 @@ function defineModel() {
 
   // Unpublish update
   Update.prototype.unpublish = async function (remoteUser) {
-    mustHaveRole(remoteUser, 'ADMIN', this.CollectiveId, 'unpublish this update');
-    this.publishedAt = null;
-    return await this.save();
+    return this.update({ LastEditedByUserId: remoteUser.id, publishedAt: null });
   };
 
   Update.prototype.delete = async function (remoteUser) {
-    mustHaveRole(remoteUser, 'ADMIN', this.CollectiveId, 'delete this update');
     await models.Comment.destroy({ where: { UpdateId: this.id } });
-    return this.destroy();
+    await models.Update.update(
+      { deletedAt: new Date(), LastEditedByUserId: remoteUser.id },
+      { where: { id: this.id } },
+    );
+
+    return this;
   };
 
   // Returns the User model of the User that created this Update
   Update.prototype.getUser = function () {
     return models.User.findByPk(this.CreatedByUserId);
+  };
+
+  Update.prototype.includeHostedAccountsInNotification = async function (notificationAudience) {
+    this.collective = this.collective || (await this.getCollective());
+    const audience = notificationAudience || this.notificationAudience || 'ALL';
+    const audiencesForHostedAccounts = ['ALL', 'COLLECTIVE_ADMINS'];
+    return Boolean(this.collective.isHostAccount && audiencesForHostedAccounts.includes(audience));
+  };
+
+  Update.prototype.getTargetMembersRoles = function (notificationAudience) {
+    const audience = notificationAudience || this.audience || 'ALL';
+    if (audience === 'COLLECTIVE_ADMINS') {
+      return ['__NONE__'];
+    } else if (this.isPrivate) {
+      return PRIVATE_UPDATE_TARGET_ROLES;
+    } else {
+      return PUBLIC_UPDATE_TARGET_ROLES;
+    }
+  };
+
+  /**
+   * Get the member users to notify for this update.
+   */
+  Update.prototype.getUsersToNotify = async function () {
+    const audience = this.audience || 'ALL';
+    return sequelize.query(SQLQueries.usersToNotifyForUpdateSQLQuery, {
+      type: sequelize.QueryTypes.SELECT,
+      mapToModel: true,
+      model: models.User,
+      replacements: {
+        collectiveId: this.CollectiveId,
+        targetRoles: this.getTargetMembersRoles(),
+        includeHostedAccounts: await this.includeHostedAccountsInNotification(),
+        includeMembers: audience !== 'COLLECTIVE_ADMINS',
+      },
+    });
+  };
+
+  /**
+   * Gets a summary of how many users will be notified about this update
+   *
+   * @argument notificationAudience - to override the update audience
+   */
+  Update.prototype.countUsersToNotify = async function (notificationAudience) {
+    this.collective = this.collective || (await this.getCollective());
+    const audience = notificationAudience || this.audience || 'ALL';
+
+    const [result] = await sequelize.query(SQLQueries.countUsersToNotifyForUpdateSQLQuery, {
+      type: sequelize.QueryTypes.SELECT,
+      replacements: {
+        collectiveId: this.CollectiveId,
+        targetRoles: this.getTargetMembersRoles(audience),
+        includeHostedAccounts: await this.includeHostedAccountsInNotification(audience),
+        includeMembers: audience !== 'COLLECTIVE_ADMINS',
+      },
+    });
+
+    return result.count;
+  };
+
+  /**
+   * Gets a summary of who will be notified about this update
+   */
+  Update.prototype.getAudienceMembersStats = async function (audience) {
+    const result = await sequelize.query(SQLQueries.countMembersToNotifyForUpdateSQLQuery, {
+      type: sequelize.QueryTypes.SELECT,
+      replacements: {
+        collectiveId: this.CollectiveId,
+        targetRoles: this.getTargetMembersRoles(audience),
+      },
+    });
+
+    return result.reduce((stats, { type, count }) => {
+      stats[type] = count;
+      return stats;
+    }, {});
   };
 
   /*
@@ -360,19 +453,6 @@ function defineModel() {
     return Promise.map(updates, u => Update.create(defaults({}, u, defaultValues)), { concurrency: 1 }).catch(
       console.error,
     );
-  };
-
-  Update.associate = m => {
-    Update.belongsTo(m.Collective, {
-      foreignKey: 'CollectiveId',
-      as: 'collective',
-    });
-    Update.belongsTo(m.Collective, {
-      foreignKey: 'FromCollectiveId',
-      as: 'fromCollective',
-    });
-    Update.belongsTo(m.Tier, { foreignKey: 'TierId', as: 'tier' });
-    Update.belongsTo(m.User, { foreignKey: 'LastEditedByUserId', as: 'user' });
   };
 
   Temporal(Update, sequelize);

@@ -5,6 +5,7 @@ import sinon from 'sinon';
 
 import { expenseStatus, roles } from '../../../server/constants';
 import plans from '../../../server/constants/plans';
+import { TransactionKind } from '../../../server/constants/transaction-kind';
 import { getFxRate } from '../../../server/lib/currency';
 import emailLib from '../../../server/lib/email';
 import models, { Op, sequelize } from '../../../server/models';
@@ -374,7 +375,7 @@ describe('server/models/Collective', () => {
       });
       expect(sendEmailSpy.callCount).to.equal(2);
 
-      const hostedArgs = sendEmailSpy.args.find(callArgs => callArgs[1].includes('would love to be hosted'));
+      const hostedArgs = sendEmailSpy.args.find(callArgs => callArgs[1].includes('wants to be hosted by'));
       expect(hostedArgs).to.exist;
       expect(hostedArgs[0]).to.equal(hostUser.email);
       expect(hostedArgs[2]).to.contain(user2.collective.name);
@@ -412,7 +413,7 @@ describe('server/models/Collective', () => {
       expect(plan).to.deep.equal({
         id: 3,
         name: 'default',
-        hostedCollectives: 2,
+        hostedCollectives: 0,
         addedFunds: 0,
         bankTransfers: 0,
         transferwisePayouts: 0,
@@ -428,7 +429,7 @@ describe('server/models/Collective', () => {
       website: 'https://opencollective.com',
     });
     // Make sure clearbit image is fetched (done automatically and async in normal conditions)
-    await collective.findImage();
+    await collective.findImage(true);
     // Fetch back the collective from the database
     collective = await models.Collective.findByPk(collective.id);
     expect(collective.image).to.equal('https://logo.clearbit.com/opencollective.com');
@@ -450,7 +451,7 @@ describe('server/models/Collective', () => {
       email: 'xavier@tribal.be',
     });
     // Make sure gravatar image is fetched (done automatically and async in normal conditions)
-    await user.collective.findImageForUser(user);
+    await user.collective.findImageForUser(user, true);
     // Fetch back the collective from the database
     const collective = await models.Collective.findByPk(user.collective.id);
     expect(collective.image).to.equal('https://www.gravatar.com/avatar/a97d0fcd96579015da610aa284f8d8df?default=404');
@@ -1094,7 +1095,8 @@ describe('server/models/Collective', () => {
         amount: 100,
         currency: 'USD',
         data: { hostToPlatformFxRate: 1.23 },
-        PlatformTipForTransactionGroup: t.TransactionGroup,
+        TransactionGroup: t.TransactionGroup,
+        kind: TransactionKind.PLATFORM_TIP,
         createdAt: lastMonth,
       });
       await fakeTransaction({
@@ -1104,7 +1106,8 @@ describe('server/models/Collective', () => {
         amount: 300,
         currency: 'USD',
         data: { hostToPlatformFxRate: 1.2 },
-        PlatformTipForTransactionGroup: t.TransactionGroup,
+        TransactionGroup: t.TransactionGroup,
+        kind: TransactionKind.PLATFORM_TIP,
         createdAt: lastMonth,
         PaymentMethodId: stripePaymentMethod.id,
       });

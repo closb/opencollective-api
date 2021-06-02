@@ -105,7 +105,8 @@
       "perEmailForCollective": "ORDERS_LIMIT_EMAIL_COLLECTIVE",
       "perIp": "ORDERS_LIMIT_IP",
       "forCollective": "ORDERS_LIMIT_COLLECTIVE"
-    }
+    },
+    "skipCleanOrdersLimitSlugs": "ORDERS_LIMIT_SKIP_CLEAN_SLUGS"
   },
   "slack": {
     "webhooks": {
@@ -148,7 +149,10 @@
     "clientId": "TRANSFERWISE_CLIENT_ID",
     "clientSecret": "TRANSFERWISE_CLIENT_SECRET",
     "redirectUri": "TRANSFERWISE_REDIRECT_URI",
-    "privateKey": "TRANSFERWISE_PRIVATE_KEY"
+    "privateKey": "TRANSFERWISE_PRIVATE_KEY",
+    "blockedCurrencies": "TRANSFERWISE_BLOCKED_CURRENCIES",
+    "blockedCurrenciesForBusinessProfiles": "TRANSFERWISE_BLOCKED_CURRENCIES_BUSINESS",
+    "blockedCurrenciesForNonProfits": "TRANSFERWISE_BLOCKED_CURRENCIES_NONPROFIT"
   },
   "fixie": {
     "url": "FIXIE_URL"
@@ -175,5 +179,8 @@
   },
   "sentry": {
     "dsn": "SENTRY_DSN"
+  },
+  "privacy": {
+    "apiUrl": "PRIVACY_API_URL"
   }
 }

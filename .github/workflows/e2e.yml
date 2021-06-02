@@ -30,7 +30,6 @@ env:
 jobs:
   e2e:
     runs-on: ubuntu-latest
-
     timeout-minutes: 30
 
     strategy:
@@ -44,10 +43,11 @@ jobs:
           - 6379:6379
         options: --entrypoint redis-server
       postgres:
-        image: mdillon/postgis:9.6
+        image: postgis/postgis:9.6-2.5
         env:
           POSTGRES_USER: postgres
           POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         # needed because the postgres container does not provide a healthcheck
@@ -83,9 +83,8 @@ jobs:
             - ${{ runner.os }}-npm-cache-
 
       # Checkouts
-
-      - name: Checkout (api)
-        uses: actions/checkout@v2-beta
+      - name: Checkout
+        uses: actions/checkout@v2
 
       - name: Set REF in env, removing the `refs/` part
         run: echo "MATCHING_BRANCH_REF=$(echo $GITHUB_REF | sed 's|refs/||')" >> $GITHUB_ENV
@@ -104,21 +103,21 @@ jobs:
 
       - name: Checkout (frontend - matching branch)
         if: steps.check-matching-branch.outputs.status == 200
-        uses: actions/checkout@v2-beta
+        uses: actions/checkout@v2
         with:
           repository: opencollective/opencollective-frontend
           path: opencollective-frontend
           ref: ${{ github.ref }}
 
-      - name: Checkout (frontend - master)
+      - name: Checkout (frontend - main)
         if: steps.check-matching-branch.outputs.status != 200
-        uses: actions/checkout@v2-beta
+        uses: actions/checkout@v2
         with:
           repository: opencollective/opencollective-frontend
           path: opencollective-frontend
 
       - name: Checkout (images)
-        uses: actions/checkout@v2-beta
+        uses: actions/checkout@v2
         with:
           repository: opencollective/opencollective-images
           path: opencollective-images

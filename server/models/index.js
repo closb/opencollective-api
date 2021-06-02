@@ -20,13 +20,17 @@ import Notification from './Notification';
 import Order from './Order';
 import PaymentMethod from './PaymentMethod';
 import PayoutMethod from './PayoutMethod';
+import PaypalPlan from './PaypalPlan';
+import PaypalProduct from './PaypalProduct';
 import RequiredLegalDocument from './RequiredLegalDocument';
 import Session from './Session';
 import Subscription from './Subscription';
 import Tier from './Tier';
 import Transaction from './Transaction';
+import TransactionSettlement from './TransactionSettlement';
 import Update from './Update';
 import User from './User';
+import VirtualCard from './VirtualCard';
 
 /**
  * Separate function to be able to use in scripts
@@ -39,10 +43,10 @@ export function setupModels() {
    */
   m['Activity'] = Activity;
   m['Application'] = Application;
-  m['ConnectedAccount'] = ConnectedAccount;
   m['Collective'] = Collective;
   m['Comment'] = Comment;
   m['CommentReaction'] = CommentReaction;
+  m['ConnectedAccount'] = ConnectedAccount;
   m['Conversation'] = Conversation;
   m['ConversationFollower'] = ConversationFollower;
   m['CurrencyExchangeRate'] = CurrencyExchangeRate;
@@ -57,19 +61,59 @@ export function setupModels() {
   m['Order'] = Order;
   m['PaymentMethod'] = PaymentMethod;
   m['PayoutMethod'] = PayoutMethod;
+  m['PaypalPlan'] = PaypalPlan;
+  m['PaypalProduct'] = PaypalProduct;
   m['RequiredLegalDocument'] = RequiredLegalDocument;
   m['Session'] = Session;
   m['Subscription'] = Subscription;
   m['Tier'] = Tier;
   m['Transaction'] = Transaction;
+  m['TransactionSettlement'] = TransactionSettlement;
   m['Update'] = Update;
   m['User'] = User;
+  m['VirtualCard'] = VirtualCard;
 
   /**
    * Relationships
    */
 
-  // PaymentMethod.
+  // Collective
+  m.Collective.belongsTo(m.Collective, { foreignKey: 'HostCollectiveId', as: 'host' });
+  m.Collective.belongsTo(m.Collective, { as: 'HostCollective' });
+  m.Collective.belongsToMany(m.Collective, {
+    as: 'memberCollectives',
+    through: {
+      model: m.Member,
+      unique: false,
+      foreignKey: 'MemberCollectiveId',
+    },
+  });
+  m.Collective.belongsToMany(m.Collective, {
+    through: { model: m.Member, unique: false, foreignKey: 'CollectiveId' },
+    as: 'memberOfCollectives',
+  });
+  m.Collective.hasMany(m.Member);
+  m.Collective.hasMany(m.Activity);
+  m.Collective.hasMany(m.Notification);
+  m.Collective.hasMany(m.Tier, { as: 'tiers' });
+  m.Collective.hasMany(m.LegalDocument);
+  m.Collective.hasMany(m.RequiredLegalDocument, { foreignKey: 'HostCollectiveId' });
+  m.Collective.hasMany(m.Collective, { as: 'hostedCollectives', foreignKey: 'HostCollectiveId' });
+  m.Collective.hasMany(m.Expense, { foreignKey: 'CollectiveId', as: 'submittedExpenses' });
+  m.Collective.hasMany(m.ConnectedAccount);
+
+  // Connected accounts
+  m.ConnectedAccount.belongsTo(m.Collective, { foreignKey: 'CollectiveId', as: 'collective' });
+
+  // Conversations
+  m.Conversation.belongsTo(m.Collective, { foreignKey: 'CollectiveId', as: 'collective' });
+  m.Conversation.belongsTo(m.Collective, { foreignKey: 'FromCollectiveId', as: 'fromCollective' });
+
+  // Conversations followers
+  m.ConversationFollower.belongsTo(m.User, { foreignKey: 'UserId', as: 'user' });
+  m.ConversationFollower.belongsTo(m.Conversation, { foreignKey: 'ConversationId', as: 'conversation' });
+
+  // PaymentMethod
   m.PaymentMethod.belongsTo(m.Collective);
   m.PaymentMethod.belongsTo(m.PaymentMethod, {
     as: 'sourcePaymentMethod',
@@ -136,7 +180,7 @@ export function setupModels() {
 
   m.Notification.belongsTo(m.Collective);
 
-  // Transaction.
+  // Transactions
   m.Collective.hasMany(m.Transaction, { foreignKey: 'CollectiveId' });
   m.Transaction.belongsTo(m.Collective, {
     foreignKey: 'CollectiveId',
@@ -162,6 +206,9 @@ export function setupModels() {
   m.Transaction.belongsTo(m.PaymentMethod);
   m.PaymentMethod.hasMany(m.Transaction);
 
+  // Transaction settlements
+  m.TransactionSettlement.belongsTo(m.Expense);
+
   // Expense
   m.Expense.belongsTo(m.User);
   m.Expense.belongsTo(m.PayoutMethod);
@@ -172,6 +219,10 @@ export function setupModels() {
   m.Expense.belongsTo(m.Collective, {
     foreignKey: 'FromCollectiveId',
     as: 'fromCollective',
+  });
+  m.Expense.belongsTo(m.VirtualCard, {
+    foreignKey: 'VirtualCardId',
+    as: 'virtualCard',
   });
   m.Expense.hasMany(m.ExpenseAttachedFile, { as: 'attachedFiles' });
   m.Expense.hasMany(m.ExpenseItem, { as: 'items' });
@@ -184,6 +235,13 @@ export function setupModels() {
 
   // Expense attached files
   m.ExpenseAttachedFile.belongsTo(m.Expense);
+
+  // Comment
+  m.Comment.belongsTo(m.Collective, { foreignKey: 'CollectiveId', as: 'collective' });
+  m.Comment.belongsTo(m.Collective, { foreignKey: 'FromCollectiveId', as: 'fromCollective' });
+  m.Comment.belongsTo(m.Expense, { foreignKey: 'ExpenseId', as: 'expense' });
+  m.Comment.belongsTo(m.Update, { foreignKey: 'UpdateId', as: 'update' });
+  m.Comment.belongsTo(m.User, { foreignKey: 'CreatedByUserId', as: 'user' });
 
   // Comment reactions
   m.CommentReaction.belongsTo(m.Comment);
@@ -219,7 +277,10 @@ export function setupModels() {
   m.Tier.hasMany(m.Order);
 
   // Legal documents
-  m.LegalDocument.belongsTo(m.Collective);
+  m.LegalDocument.belongsTo(m.Collective, { foreignKey: 'CollectiveId', as: 'collective' });
+
+  // RequiredLegalDocument
+  m.RequiredLegalDocument.belongsTo(m.Collective, { foreignKey: 'HostCollectiveId', as: 'hostCollective' });
 
   // Subscription
   m.Order.belongsTo(m.Subscription); // adds SubscriptionId to the Orders table
@@ -238,10 +299,42 @@ export function setupModels() {
   m.PayoutMethod.belongsTo(m.Collective);
   m.Collective.hasMany(m.PayoutMethod);
 
+  // Paypal
+  m.PaypalPlan.belongsTo(m.PaypalProduct, {
+    foreignKey: 'ProductId',
+    as: 'product',
+  });
+
+  m.PaypalProduct.hasMany(m.PaypalPlan, {
+    foreignKey: 'ProductId',
+    as: 'plans',
+  });
+
   // Tier
   m.Tier.belongsTo(m.Collective);
 
-  Object.keys(m).forEach(modelName => m[modelName].associate && m[modelName].associate(m));
+  // Update
+  m.Update.belongsTo(m.Collective, { foreignKey: 'CollectiveId', as: 'collective' });
+  m.Update.belongsTo(m.Collective, { foreignKey: 'FromCollectiveId', as: 'fromCollective' });
+  m.Update.belongsTo(m.Tier, { foreignKey: 'TierId', as: 'tier' });
+  m.Update.belongsTo(m.User, { foreignKey: 'LastEditedByUserId', as: 'user' });
+
+  // VirtualCard
+  m.VirtualCard.belongsTo(m.Collective, {
+    foreignKey: 'CollectiveId',
+    as: 'collective',
+  });
+  m.VirtualCard.belongsTo(m.Collective, {
+    foreignKey: 'HostCollectiveId',
+    as: 'host',
+  });
+  m.VirtualCard.belongsTo(m.User, {
+    foreignKey: 'UserId',
+    as: 'user',
+  });
+  m.VirtualCard.hasMany(m.Expense, { foreignKey: 'VirtualCardId', as: 'expenses' });
+  m.Collective.hasMany(m.VirtualCard, { foreignKey: 'HostCollectiveId', as: 'virtualCards' });
+  m.Collective.hasMany(m.VirtualCard, { foreignKey: 'CollectiveId', as: 'virtualCardCollectives' });
 
   return m;
 }

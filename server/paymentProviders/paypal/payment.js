@@ -1,76 +1,15 @@
-import config from 'config';
-import { get } from 'lodash';
-import fetch from 'node-fetch';
+import { get, isNumber, truncate } from 'lodash';
 
 import * as constants from '../../constants/transactions';
 import { getFxRate } from '../../lib/currency';
 import logger from '../../lib/logger';
 import { floatAmountToCents } from '../../lib/math';
-import { getHostFee, getPlatformFee } from '../../lib/payments';
+import { createRefundTransaction, getHostFee, getPlatformFee } from '../../lib/payments';
+import { paypalAmountToCents } from '../../lib/paypal';
+import { formatCurrency } from '../../lib/utils';
 import models from '../../models';
 
-/** Build an URL for the PayPal API */
-export function paypalUrl(path) {
-  if (path.startsWith('/')) {
-    throw new Error("Please don't use absolute paths");
-  }
-  const baseUrl =
-    config.paypal.payment.environment === 'sandbox'
-      ? 'https://api.sandbox.paypal.com/v1/'
-      : 'https://api.paypal.com/v1/';
-  return new URL(baseUrl + path).toString();
-}
-
-/** Exchange clientid and secretid by an auth token with PayPal API */
-export async function retrieveOAuthToken({ clientId, clientSecret }) {
-  const url = paypalUrl('oauth2/token');
-  const body = 'grant_type=client_credentials';
-  /* The OAuth token entrypoint uses Basic HTTP Auth */
-  const authStr = `${clientId}:${clientSecret}`;
-  const basicAuth = Buffer.from(authStr).toString('base64');
-  const headers = { Authorization: `Basic ${basicAuth}` };
-  /* Execute the request and unpack the token */
-  const response = await fetch(url, { method: 'post', body, headers });
-  const jsonOutput = await response.json();
-  return jsonOutput.access_token;
-}
-
-/** Assemble POST requests for communicating with PayPal API */
-export async function paypalRequest(urlPath, body, hostCollective) {
-  const connectedPaypalAccounts = await hostCollective.getConnectedAccounts({
-    where: { service: 'paypal', deletedAt: null },
-    order: [['createdAt', 'DESC']],
-  });
-  const paypal = connectedPaypalAccounts[0];
-  if (!paypal || !paypal.clientId || !paypal.token) {
-    throw new Error("Host doesn't support PayPal payments.");
-  }
-  const url = paypalUrl(urlPath);
-  const token = await retrieveOAuthToken({ clientId: paypal.clientId, clientSecret: paypal.token });
-  const params = {
-    method: 'POST',
-    body: JSON.stringify(body),
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-  };
-
-  const result = await fetch(url, params);
-  if (!result.ok) {
-    let errorData = null;
-    let errorMessage = 'PayPal payment rejected';
-    try {
-      errorData = await result.json();
-      errorMessage = `${errorMessage}: ${errorData.message}`;
-    } catch (e) {
-      errorData = e;
-    }
-    logger.error('PayPal payment failed', result, errorData);
-    throw new Error(errorMessage);
-  }
-  return result.json();
-}
+import { paypalRequest, paypalRequestV2 } from './api';
 
 /** Create a new payment object in the PayPal API
  *
@@ -122,71 +61,170 @@ export async function executePayment(order) {
 }
 
 /** Create transaction in our database to reflect a PayPal charge */
-export async function createTransaction(order, paymentInfo) {
-  const transaction = paymentInfo.transactions[0];
-
-  const amount = floatAmountToCents(parseFloat(transaction.amount.total));
-  const currency = transaction.amount.currency;
-
-  const paypalTransactionFee = parseFloat(get(transaction, 'related_resources.0.sale.transaction_fee.value', '0.0'));
-  const paymentProcessorFee = floatAmountToCents(paypalTransactionFee);
-
+const recordTransaction = async (order, amount, currency, paypalFee, payload) => {
   const host = await order.collective.getHostCollective();
   if (!host) {
     throw new Error(`Cannot create transaction: collective id ${order.collective.id} doesn't have a host`);
   }
   const hostCurrency = host.currency;
+  const hostPlan = await host.getPlan();
+  const hostFeeSharePercent = isNumber(hostPlan?.paypalHostFeeSharePercent)
+    ? hostPlan?.paypalHostFeeSharePercent
+    : hostPlan?.hostFeeSharePercent;
+  const isSharedRevenue = !!hostFeeSharePercent;
+  const platformTip = order.data?.platformFee;
 
   const hostCurrencyFxRate = await getFxRate(currency, hostCurrency);
   const amountInHostCurrency = Math.round(hostCurrencyFxRate * amount);
-  const paymentProcessorFeeInHostCurrency = Math.round(hostCurrencyFxRate * paymentProcessorFee);
+  const paymentProcessorFeeInHostCurrency = Math.round(hostCurrencyFxRate * paypalFee);
   const hostFeeInHostCurrency = await getHostFee(amountInHostCurrency, order);
-  const platformFeeInHostCurrency = await getPlatformFee(amountInHostCurrency, order);
+  const platformFeeInHostCurrency = isSharedRevenue
+    ? platformTip || 0
+    : await getPlatformFee(amountInHostCurrency, order, host, { hostFeeSharePercent });
 
-  const payload = {
-    CreatedByUserId: order.createdByUser.id,
+  return models.Transaction.createFromPayload({
+    CreatedByUserId: order.CreatedByUserId,
     FromCollectiveId: order.FromCollectiveId,
-    CollectiveId: order.collective.id,
-    PaymentMethodId: order.paymentMethod.id,
-  };
-
-  payload.transaction = {
-    type: constants.TransactionTypes.CREDIT,
-    OrderId: order.id,
-    amount,
-    currency,
-    amountInHostCurrency,
-    hostCurrency,
-    hostCurrencyFxRate,
-    hostFeeInHostCurrency,
-    platformFeeInHostCurrency,
-    paymentProcessorFeeInHostCurrency,
-    taxAmount: order.taxAmount,
-    description: order.description,
-    data: {
-      ...paymentInfo,
-      isFeesOnTop: order.data?.isFeesOnTop,
+    CollectiveId: order.CollectiveId,
+    PaymentMethodId: order.PaymentMethodId,
+    transaction: {
+      type: constants.TransactionTypes.CREDIT,
+      OrderId: order.id,
+      amount,
+      currency,
+      amountInHostCurrency,
+      hostCurrency,
+      hostCurrencyFxRate,
+      hostFeeInHostCurrency,
+      platformFeeInHostCurrency,
+      paymentProcessorFeeInHostCurrency,
+      taxAmount: order.taxAmount,
+      description: order.description,
+      data: {
+        ...payload,
+        isFeesOnTop: order.data?.isFeesOnTop,
+        platformTip: order.data?.platformFee,
+        isSharedRevenue,
+        hostFeeSharePercent,
+      },
     },
-  };
+  });
+};
 
-  return models.Transaction.createFromPayload(payload);
+export async function createTransaction(order, paymentInfo) {
+  const transaction = paymentInfo.transactions[0];
+  const currency = transaction.amount.currency;
+  const amount = paypalAmountToCents(transaction.amount.total);
+  const paypalTransactionFee = parseFloat(get(transaction, 'related_resources.0.sale.transaction_fee.value', '0.0'));
+  const paymentProcessorFee = floatAmountToCents(paypalTransactionFee);
+  return recordTransaction(order, amount, currency, paymentProcessorFee, paymentInfo);
 }
+
+export function recordPaypalSale(order, paypalSale) {
+  const currency = paypalSale.amount.currency;
+  const amount = paypalAmountToCents(paypalSale.amount.total);
+  const fee = paypalAmountToCents(get(paypalSale, 'transaction_fee.value', '0.0'));
+  return recordTransaction(order, amount, currency, fee, { paypalSale });
+}
+
+export function recordPaypalTransaction(order, paypalTransaction) {
+  const currency = paypalTransaction.amount_with_breakdown.gross_amount.currency_code;
+  const amount = floatAmountToCents(parseFloat(paypalTransaction.amount_with_breakdown.gross_amount.value));
+  const fee = parseFloat(get(paypalTransaction.amount_with_breakdown, 'fee_amount.value', '0.0'));
+  return recordTransaction(order, amount, currency, fee, { paypalTransaction });
+}
+
+const recordPaypalCapture = async (order, capture) => {
+  const currency = capture.amount.currency;
+  const amount = paypalAmountToCents(capture.amount.value);
+  const fee = paypalAmountToCents(get(capture, 'seller_receivable_breakdown.paypal_fee.value', '0.0'));
+  return recordTransaction(order, amount, currency, fee, { capture });
+};
+
+const processPaypalOrder = async (order, paypalOrderId) => {
+  const hostCollective = await order.collective.getHostCollective();
+  const paypalOrderUrl = `checkout/orders/${paypalOrderId}`;
+
+  // Check payment details
+  const paypalOrderDetails = await paypalRequestV2(paypalOrderUrl, hostCollective, 'GET');
+  const purchaseUnit = paypalOrderDetails['purchase_units'][0];
+  const paypalAmountInCents = floatAmountToCents(parseFloat(purchaseUnit.amount['value']));
+  const paypalCurrency = purchaseUnit.amount['currency_code'];
+  if (paypalAmountInCents !== order.totalAmount || paypalCurrency !== order.currency) {
+    const expected = formatCurrency(order.totalAmount, order.currency);
+    const actual = formatCurrency(paypalAmountInCents, paypalCurrency);
+    throw new Error(
+      `The amount/currency for this payment doesn't match what's expected for this order (expected: ${expected}, actual: ${actual})`,
+    );
+  } else if (paypalOrderDetails.status === 'COMPLETED') {
+    throw new Error('This PayPal order has already been charged');
+  }
+
+  // Trigger the actual charge
+  const capture = await paypalRequestV2(`${paypalOrderUrl}/capture`, hostCollective, 'POST');
+  const captureId = capture.purchase_units[0].payments.captures[0].id;
+  const captureDetails = await paypalRequestV2(`payments/captures/${captureId}`, hostCollective, 'GET');
+
+  // Record the charge in our ledger
+  return recordPaypalCapture(order, captureDetails);
+};
+
+export const refundPaypalCapture = async (transaction, captureId, user, reason) => {
+  const host = await transaction.getHostCollective();
+  if (!host) {
+    throw new Error(`PayPal: Can't find host for transaction #${transaction.id}`);
+  }
+
+  // eslint-disable-next-line camelcase
+  const payload = { note_to_payer: truncate(reason, { length: 255 }) || undefined };
+  const result = await paypalRequestV2(`payments/captures/${captureId}/refund`, host, 'POST', payload);
+  const rawRefundedPaypalFee = get(result, 'seller_payable_breakdown.paypal_fee.amount.value', '0.00');
+  const refundedPaypalFee = floatAmountToCents(parseFloat(rawRefundedPaypalFee));
+  return createRefundTransaction(transaction, refundedPaypalFee, { paypalResponse: result }, user);
+};
 
 /** Process order in paypal and create transactions in our db */
 export async function processOrder(order) {
-  const paymentInfo = await executePayment(order);
-  logger.info('PayPal Payment');
-  logger.info(paymentInfo);
-  const transaction = await createTransaction(order, paymentInfo);
-  await order.update({ processedAt: new Date() });
-  await order.paymentMethod.update({ confirmedAt: new Date() });
-  return transaction;
+  if (order.paymentMethod.data?.isNewApi) {
+    if (order.paymentMethod.data.orderId) {
+      return processPaypalOrder(order, order.paymentMethod.data.orderId);
+    } else {
+      throw new Error('Must provide an orderId');
+    }
+  } else {
+    const paymentInfo = await executePayment(order);
+    logger.info('PayPal Payment');
+    logger.info(paymentInfo);
+    const transaction = await createTransaction(order, paymentInfo);
+    await order.update({ processedAt: new Date() });
+    await order.paymentMethod.update({ confirmedAt: new Date() });
+    return transaction;
+  }
 }
+
+const getCaptureIdFromPaypalTransaction = transaction => {
+  const { data } = transaction;
+  if (!data) {
+    return null;
+  } else if (data.intent === 'sale') {
+    return get(data, 'transactions.0.related_resources.0.sale.id');
+  } else {
+    return data.capture?.id || data.paypalSale?.id || data.paypalTransaction?.id;
+  }
+};
+
+const refundPaypalPaymentTransaction = async (transaction, user, reason) => {
+  const captureId = getCaptureIdFromPaypalTransaction(transaction);
+  if (!captureId) {
+    throw new Error(`PayPal Payment capture not found for transaction #${transaction.id}`);
+  }
+
+  return refundPaypalCapture(transaction, captureId, user, reason);
+};
 
 /* Interface expected for a payment method */
 export default {
-  features: {
-    recurring: false,
-  },
+  features: { recurring: false },
   processOrder,
+  refundTransaction: refundPaypalPaymentTransaction,
 };

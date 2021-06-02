@@ -1,6 +1,6 @@
 import debugLib from 'debug';
 import express from 'express';
-import { flatten, get, omit, pick, size } from 'lodash';
+import { flatten, get, isEqual, isNil, omit, omitBy, pick, size } from 'lodash';
 
 import { activities, expenseStatus, roles } from '../../constants';
 import { types as collectiveTypes } from '../../constants/collectives';
@@ -10,7 +10,7 @@ import FEATURE from '../../constants/feature';
 import { getFxRate } from '../../lib/currency';
 import { floatAmountToCents } from '../../lib/math';
 import * as libPayments from '../../lib/payments';
-import { handleTransferwisePayoutsLimit } from '../../lib/plans';
+import { notifyTeamAboutSpamExpense } from '../../lib/spam';
 import { createFromPaidExpense as createTransactionFromPaidExpense } from '../../lib/transactions';
 import {
   handleTwoFactorAuthenticationPayoutLimit,
@@ -23,6 +23,7 @@ import { ExpenseAttachedFile } from '../../models/ExpenseAttachedFile';
 import { ExpenseItem } from '../../models/ExpenseItem';
 import { PayoutMethodTypes } from '../../models/PayoutMethod';
 import paymentProviders from '../../paymentProviders';
+import PrivacyCardProviderService from '../../paymentProviders/privacy';
 import { BadRequest, FeatureNotAllowedForUser, Forbidden, NotFound, Unauthorized, ValidationFailed } from '../errors';
 
 const debug = debugLib('expenses');
@@ -30,13 +31,16 @@ const debug = debugLib('expenses');
 const isOwner = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
   if (!req.remoteUser) {
     return false;
-  }
-
-  if (!expense.fromCollective) {
+  } else if (req.remoteUser.id === expense.UserId) {
+    return true;
+  } else if (!expense.fromCollective) {
     expense.fromCollective = await req.loaders.Collective.byId.load(expense.FromCollectiveId);
+    if (!expense.fromCollective) {
+      return false;
+    }
   }
 
-  return req.remoteUser.isAdminOfCollective(expense.fromCollective) || req.remoteUser.id === expense.UserId;
+  return req.remoteUser.isAdminOfCollective(expense.fromCollective);
 };
 
 const isCollectiveAccountant = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
@@ -189,10 +193,28 @@ export const canEditExpense = async (req: express.Request, expense: typeof model
     expenseStatus.SCHEDULED_FOR_PAYMENT,
   ];
 
-  if (nonEditableStatuses.includes(expense.status)) {
+  // Collective Admin can attach receipts to paid charge expenses
+  if (
+    expense.type === expenseType.CHARGE &&
+    expense.status === expenseStatus.PAID &&
+    req.remoteUser?.hasRole([roles.ADMIN], expense.CollectiveId)
+  ) {
+    return true;
+  } else if (nonEditableStatuses.includes(expense.status)) {
     return false;
   } else if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
     return false;
+  } else {
+    return remoteUserMeetsOneCondition(req, expense, [isOwner, isHostAdmin, isCollectiveAdmin]);
+  }
+};
+
+export const canEditExpenseTags = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
+  if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
+    return false;
+  } else if (expense.status === expenseStatus.PAID) {
+    // Only collective/host admins can edit tags after the expense is paid
+    return remoteUserMeetsOneCondition(req, expense, [isHostAdmin, isCollectiveAdmin]);
   } else {
     return remoteUserMeetsOneCondition(req, expense, [isOwner, isHostAdmin, isCollectiveAdmin]);
   }
@@ -203,7 +225,7 @@ export const canEditExpense = async (req: express.Request, expense: typeof model
  * and only when its status is REJECTED.
  */
 export const canDeleteExpense = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
-  if (expense.status !== expenseStatus.REJECTED) {
+  if (![expenseStatus.REJECTED, expenseStatus.DRAFT].includes(expense.status)) {
     return false;
   } else if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
     return false;
@@ -243,6 +265,19 @@ export const canApprove = async (req: express.Request, expense: typeof models.Ex
  */
 export const canReject = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
   if (![expenseStatus.PENDING, expenseStatus.UNVERIFIED].includes(expense.status)) {
+    return false;
+  } else if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
+    return false;
+  } else {
+    return remoteUserMeetsOneCondition(req, expense, [isCollectiveAdmin, isHostAdmin]);
+  }
+};
+
+/**
+ * Returns true if expense can be rejected by user
+ */
+export const canMarkAsSpam = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
+  if (![expenseStatus.REJECTED].includes(expense.status)) {
     return false;
   } else if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
     return false;
@@ -342,6 +377,31 @@ export const rejectExpense = async (
   return updatedExpense;
 };
 
+export const markExpenseAsSpam = async (
+  req: express.Request,
+  expense: typeof models.Expense,
+): Promise<typeof models.Expense> => {
+  if (expense.status === expenseStatus.SPAM) {
+    return expense;
+  } else if (!(await canMarkAsSpam(req, expense))) {
+    throw new Forbidden();
+  }
+
+  const updatedExpense = await expense.update({ status: expenseStatus.SPAM, lastEditedById: req.remoteUser.id });
+
+  // Limit the user so they can't submit expenses in the future
+  const submittedByUser = await updatedExpense.getSubmitterUser();
+  await submittedByUser.limitFeature(FEATURE.USE_EXPENSES);
+
+  // We create the activity as a good practice but there is no email sent right now
+  const activity = await expense.createActivity(activities.COLLECTIVE_EXPENSE_MARKED_AS_SPAM, req.remoteUser);
+
+  // For now, we send the Slack notification directly from here as there is no framework in activities/notifications
+  notifyTeamAboutSpamExpense(activity);
+
+  return updatedExpense;
+};
+
 export const scheduleExpenseForPayment = async (
   req: express.Request,
   expense: typeof models.Expense,
@@ -420,6 +480,8 @@ const EXPENSE_EDITABLE_FIELDS = [
   'payeeLocation',
 ];
 
+const EXPENSE_PAID_CHARGE_EDITABLE_FIELDS = ['description', 'tags', 'privateMessage', 'invoiceInfo'];
+
 const getPayoutMethodFromExpenseData = async (expenseData, remoteUser, fromCollective, dbTransaction) => {
   if (expenseData.payoutMethod) {
     if (expenseData.payoutMethod.id) {
@@ -467,6 +529,7 @@ type ExpenseData = {
   tags?: string[];
   incurredAt?: Date;
   amount?: number;
+  description?: string;
 };
 
 export async function createExpense(
@@ -481,6 +544,11 @@ export async function createExpense(
 
   if (!get(expenseData, 'collective.id')) {
     throw new Unauthorized('Missing expense.collective.id');
+  }
+
+  const isMember = Boolean(remoteUser.rolesByCollectiveId[String(expenseData.collective.id)]);
+  if (expenseData.collective.settings?.['disablePublicExpenseSubmission'] && !isMember) {
+    throw new Error('You must be a member of the collective to create new expense');
   }
 
   const itemsData = expenseData.items;
@@ -583,6 +651,11 @@ export const changesRequireStatusUpdate = (
 ): boolean => {
   const updatedValues = { ...expense.dataValues, ...newExpenseData };
   const hasAmountChanges = typeof updatedValues.amount !== 'undefined' && updatedValues.amount !== expense.amount;
+  const isPaidCreditCardCharge = expense.type === expenseType.CHARGE && expense.status === expenseStatus.PAID;
+
+  if (isPaidCreditCardCharge && !hasAmountChanges) {
+    return false;
+  }
   return hasItemsChanges || hasAmountChanges || hasPayoutChanges;
 };
 
@@ -596,7 +669,7 @@ export const getItemsChanges = async (
   if (expenseData.items) {
     const baseItems = await models.ExpenseItem.findAll({ where: { ExpenseId: expense.id } });
     const itemsDiff = models.ExpenseItem.diffDBEntries(baseItems, expenseData.items);
-    const hasItemChanges = flatten(itemsDiff).length > 0;
+    const hasItemChanges = flatten(<unknown[]>itemsDiff).length > 0;
     return [hasItemChanges, expenseData.items, itemsDiff];
   } else {
     return [false, [], [[], [], []]];
@@ -623,11 +696,33 @@ export async function editExpense(
       { model: models.PayoutMethod },
     ],
   });
+  const [hasItemChanges, itemsData, itemsDiff] = await getItemsChanges(expense, expenseData);
 
   if (!expense) {
     throw new NotFound('Expense not found');
-  } else if (!options?.['skipPermissionCheck'] && !(await canEditExpense(req, expense))) {
+  }
+
+  const modifiedFields = Object.keys(omitBy(expenseData, (value, key) => key === 'id' || isNil(value)));
+  if (isEqual(modifiedFields, ['tags'])) {
+    // Special mode when editing **only** tags: we don't care about the expense status there
+    if (!(await canEditExpenseTags(req, expense))) {
+      throw new Unauthorized("You don't have permission to edit tags for this expense");
+    }
+
+    return expense.update({ tags: expenseData.tags });
+  }
+
+  if (!options?.['skipPermissionCheck'] && !(await canEditExpense(req, expense))) {
     throw new Unauthorized("You don't have permission to edit this expense");
+  }
+
+  const isPaidCreditCardCharge =
+    expense.type === expenseType.CHARGE && expense.status === expenseStatus.PAID && Boolean(expense.VirtualCardId);
+
+  if (isPaidCreditCardCharge && !hasItemChanges) {
+    throw new ValidationFailed(
+      'You need to include Expense Items when adding missing information to card charge expenses',
+    );
   }
 
   if (size(expenseData.attachedFiles) > 15) {
@@ -652,16 +747,23 @@ export async function editExpense(
     });
   }
 
-  const cleanExpenseData = pick(expenseData, EXPENSE_EDITABLE_FIELDS);
+  const cleanExpenseData = pick(
+    expenseData,
+    isPaidCreditCardCharge ? EXPENSE_PAID_CHARGE_EDITABLE_FIELDS : EXPENSE_EDITABLE_FIELDS,
+  );
+
   let payoutMethod = await expense.getPayoutMethod();
   const updatedExpense = await sequelize.transaction(async t => {
     // Update payout method if we get new data from one of the param for it
-    if (expenseData.payoutMethod !== undefined && expenseData.payoutMethod?.id !== expense.PayoutMethodId) {
+    if (
+      !isPaidCreditCardCharge &&
+      expenseData.payoutMethod !== undefined &&
+      expenseData.payoutMethod?.id !== expense.PayoutMethodId
+    ) {
       payoutMethod = await getPayoutMethodFromExpenseData(expenseData, remoteUser, fromCollective, t);
     }
 
     // Update items
-    const [hasItemChanges, itemsData, itemsDiff] = await getItemsChanges(expense, expenseData);
     if (hasItemChanges) {
       checkExpenseItems({ ...expense.dataValues, ...cleanExpenseData }, itemsData);
       const [newItemsData, oldItems, itemsToUpdate] = itemsDiff;
@@ -707,22 +809,37 @@ export async function editExpense(
       );
     }
 
-    return expense.update(
-      {
-        ...cleanExpenseData,
-        lastEditedById: remoteUser.id,
-        incurredAt: expenseData.incurredAt || new Date(),
-        status: shouldUpdateStatus ? 'PENDING' : expense.status,
-        FromCollectiveId: fromCollective.id,
-        PayoutMethodId: PayoutMethodId,
-        legacyPayoutMethod: models.Expense.getLegacyPayoutMethodTypeFromPayoutMethod(payoutMethod),
-        tags: cleanExpenseData.tags,
-      },
-      { transaction: t },
-    );
+    const updatedExpenseProps = {
+      ...cleanExpenseData,
+      lastEditedById: remoteUser.id,
+      incurredAt: expenseData.incurredAt || new Date(),
+      status: shouldUpdateStatus ? 'PENDING' : expense.status,
+      FromCollectiveId: fromCollective.id,
+      PayoutMethodId: PayoutMethodId,
+      legacyPayoutMethod: models.Expense.getLegacyPayoutMethodTypeFromPayoutMethod(payoutMethod),
+      tags: cleanExpenseData.tags,
+    };
+    if (isPaidCreditCardCharge) {
+      updatedExpenseProps['data'] = { ...expense.data, missingDetails: false };
+    }
+    return expense.update(updatedExpenseProps, { transaction: t });
   });
 
-  await updatedExpense.createActivity(activities.COLLECTIVE_EXPENSE_UPDATED, remoteUser);
+  if (isPaidCreditCardCharge) {
+    const virtualCard = await models.VirtualCard.findByPk(expense.VirtualCardId);
+    const host = await models.Collective.findByPk(virtualCard.HostCollectiveId);
+    if (host.settings?.virtualcards?.autopause) {
+      PrivacyCardProviderService.autoPauseResumeCard(virtualCard);
+    }
+    if (cleanExpenseData.description) {
+      await models.Transaction.update(
+        { description: cleanExpenseData.description },
+        { where: { ExpenseId: updatedExpense.id } },
+      );
+    }
+  } else {
+    await updatedExpense.createActivity(activities.COLLECTIVE_EXPENSE_UPDATED, remoteUser);
+  }
 
   return updatedExpense;
 }
@@ -795,8 +912,9 @@ async function payExpenseWithPayPal(remoteUser, expense, host, paymentMethod, to
       fees['hostFeeInHostCurrency'],
       fees['platformFeeInHostCurrency'],
     );
-    await markExpenseAsPaid(expense, remoteUser);
+    const updatedExpense = await markExpenseAsPaid(expense, remoteUser);
     await paymentMethod.updateBalance();
+    return updatedExpense;
   } catch (err) {
     debug('paypal> error', JSON.stringify(err, null, '  '));
     if (
@@ -819,8 +937,6 @@ async function payExpenseWithTransferwise(host, payoutMethod, expense, fees, rem
   if (!connectedAccount) {
     throw new Error('Host is not connected to Transferwise');
   }
-
-  await handleTransferwisePayoutsLimit(host);
 
   const data = await paymentProviders.transferwise.payExpense(connectedAccount, payoutMethod, expense);
   const transactions = await createTransactions(host, expense, fees, data);
@@ -870,7 +986,7 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
     throw new FeatureNotAllowedForUser();
   }
 
-  return lockExpense(args.id, async () => {
+  const expense = await lockExpense(args.id, async () => {
     const expense = await models.Expense.findByPk(expenseId, {
       include: [
         { model: models.Collective, as: 'collective' },
@@ -927,8 +1043,12 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
         throw new Error('Host is not connected to Transferwise');
       }
       const quote = await paymentProviders.transferwise.getTemporaryQuote(connectedAccount, payoutMethod, expense);
+      const paymentOption = quote.paymentOptions.find(p => p.payIn === 'BALANCE' && p.payOut === quote.payOut);
+      if (!paymentOption) {
+        throw new BadRequest(`Could not find available payment option for this transaction.`, null, quote);
+      }
       // Notice this is the FX rate between Host and Collective, that's why we use `fxrate`.
-      fees.paymentProcessorFeeInCollectiveCurrency = floatAmountToCents(quote.fee / fxrate);
+      fees.paymentProcessorFeeInCollectiveCurrency = floatAmountToCents(paymentOption.fee.total / fxrate);
     } else if (payoutMethodType === PayoutMethodTypes.PAYPAL && !args.forceManual) {
       fees.paymentProcessorFeeInCollectiveCurrency = await paymentProviders.paypal.types['adaptive'].fees({
         amount: expense.amount,
@@ -938,10 +1058,12 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
     }
 
     feesInHostCurrency['paymentProcessorFeeInHostCurrency'] = Math.round(
-      fxrate * (fees.paymentProcessorFeeInCollectiveCurrency || 0),
+      fxrate * (<number>fees.paymentProcessorFeeInCollectiveCurrency || 0),
     );
-    feesInHostCurrency['hostFeeInHostCurrency'] = Math.round(fxrate * (fees.hostFeeInCollectiveCurrency || 0));
-    feesInHostCurrency['platformFeeInHostCurrency'] = Math.round(fxrate * (fees.platformFeeInCollectiveCurrency || 0));
+    feesInHostCurrency['hostFeeInHostCurrency'] = Math.round(fxrate * (<number>fees.hostFeeInCollectiveCurrency || 0));
+    feesInHostCurrency['platformFeeInHostCurrency'] = Math.round(
+      fxrate * (<number>fees.platformFeeInCollectiveCurrency || 0),
+    );
 
     if (!fees.paymentProcessorFeeInCollectiveCurrency) {
       fees.paymentProcessorFeeInCollectiveCurrency = 0;
@@ -995,7 +1117,7 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
         } else if (args.forceManual) {
           await createTransactions(host, expense, feesInHostCurrency);
         } else if (paypalPaymentMethod) {
-          await payExpenseWithPayPal(remoteUser, expense, host, paypalPaymentMethod, paypalEmail, feesInHostCurrency);
+          return payExpenseWithPayPal(remoteUser, expense, host, paypalPaymentMethod, paypalEmail, feesInHostCurrency);
         } else {
           throw new Error('No Paypal account linked, please reconnect Paypal or pay manually');
         }
@@ -1030,11 +1152,18 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
         await resetRollingPayoutLimitOnFailure(req.remoteUser, expense);
       }
 
-      return error;
+      throw error;
     }
 
     return markExpenseAsPaid(expense, remoteUser, true);
   });
+
+  // Update transactions settlement
+  if (expense.data?.['isPlatformTipSettlement']) {
+    await models.TransactionSettlement.markExpenseAsSettled(expense);
+  }
+
+  return expense;
 }
 
 export async function markExpenseAsUnpaid(

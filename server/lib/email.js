@@ -4,6 +4,7 @@ import path from 'path';
 import Promise from 'bluebird';
 import config from 'config';
 import debugLib from 'debug';
+import { htmlToText } from 'html-to-text';
 import juice from 'juice';
 import { get, includes, isArray, merge, pick } from 'lodash';
 import nodemailer from 'nodemailer';
@@ -16,6 +17,8 @@ import { isEmailInternal, md5, sha512 } from './utils';
 import whiteListDomains from './whiteListDomains';
 
 const debug = debugLib('email');
+
+export const NO_REPLY_EMAIL = 'Open Collective <no-reply@opencollective.com>';
 
 export const getMailer = () => {
   if (config.maildev.client) {
@@ -36,18 +39,13 @@ export const getMailer = () => {
 };
 
 const render = (template, data) => {
-  let text;
   data.imageNotSvg = data.collective && data.collective.image && !data.collective.image.endsWith('.svg');
   data = merge({}, data);
   delete data.config;
   data.config = { host: config.host };
 
-  if (templates[`${template}.text`]) {
-    text = templates[`${template}.text`](data);
-  }
-
   const html = juice(templates[template](data));
-
+  const text = htmlToText(html);
   return { text, html };
 };
 
@@ -218,8 +216,6 @@ const getNotificationLabel = (template, recipients) => {
   if (!isArray(recipients)) {
     recipients = [recipients];
   }
-
-  template = template.replace('.text', '');
 
   const notificationTypeLabels = {
     'email.approve': 'notifications of new emails pending approval',
@@ -392,7 +388,6 @@ const generateEmailFromTemplateAndSend = async (template, recipient, data, optio
 
 const emailLib = {
   render,
-  getTemplateAttributes,
   sendMessage,
   generateUnsubscribeToken,
   isValidUnsubscribeToken,

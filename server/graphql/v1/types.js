@@ -17,9 +17,10 @@ import { omit, pick } from 'lodash';
 import moment from 'moment';
 
 import intervals from '../../constants/intervals';
+import INTERVALS from '../../constants/intervals';
 import { maxInteger } from '../../constants/math';
 import orderStatus from '../../constants/order_status';
-import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE, PAYMENT_METHOD_TYPES } from '../../constants/paymentMethods';
+import { PAYMENT_METHOD_TYPE } from '../../constants/paymentMethods';
 import roles from '../../constants/roles';
 import { getCollectiveAvatarUrl } from '../../lib/collectivelib';
 import { getContributorsForTier } from '../../lib/contributors';
@@ -206,7 +207,7 @@ export const UserType = new GraphQLObjectType({
             type: GraphQLBoolean,
             defaultValue: true,
             description:
-              'Wether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.',
+              'Whether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.',
           },
         },
         resolve(user, args, req) {
@@ -530,7 +531,7 @@ export const ContributorType = new GraphQLObjectType({
     },
     type: {
       type: new GraphQLNonNull(GraphQLString),
-      description: 'Wether the contributor is an individual, an organization...',
+      description: 'Whether the contributor is an individual, an organization...',
     },
     isIncognito: {
       type: new GraphQLNonNull(GraphQLBoolean),
@@ -964,9 +965,10 @@ export const UpdateType = new GraphQLObjectType({
       userCanSeeUpdate: {
         description: 'Indicates whether or not the user is allowed to see the content of this update',
         type: GraphQLBoolean,
-        resolve(update, _, req) {
+        async resolve(update, _, req) {
           if (!update.publishedAt || update.isPrivate) {
-            return Boolean(req.remoteUser && req.remoteUser.canSeePrivateUpdates(update.CollectiveId));
+            update.collective = update.collective || (await req.loaders.Collective.byId.load(update.CollectiveId));
+            return Boolean(req.remoteUser?.canSeePrivateUpdatesForCollective(update.collective));
           } else {
             return true;
           }
@@ -998,9 +1000,12 @@ export const UpdateType = new GraphQLObjectType({
       },
       summary: {
         type: GraphQLString,
-        resolve(update, _, req) {
-          if (update.isPrivate && !(req.remoteUser && req.remoteUser.canSeePrivateUpdates(update.CollectiveId))) {
-            return null;
+        async resolve(update, _, req) {
+          if (update.isPrivate) {
+            update.collective = update.collective || (await req.loaders.Collective.byId.load(update.CollectiveId));
+            if (!req.remoteUser?.canSeePrivateUpdatesForCollective(update.collective)) {
+              return null;
+            }
           }
 
           return update.summary || '';
@@ -1008,12 +1013,15 @@ export const UpdateType = new GraphQLObjectType({
       },
       html: {
         type: GraphQLString,
-        resolve(update, _, req) {
-          if (update.isPrivate && !(req.remoteUser && req.remoteUser.canSeePrivateUpdates(update.CollectiveId))) {
-            return null;
-          } else {
-            return update.html;
+        async resolve(update, _, req) {
+          if (update.isPrivate) {
+            update.collective = update.collective || (await req.loaders.Collective.byId.load(update.CollectiveId));
+            if (!req.remoteUser?.canSeePrivateUpdatesForCollective(update.collective)) {
+              return null;
+            }
           }
+
+          return update.html;
         },
       },
       tags: {
@@ -1248,13 +1256,16 @@ export const TierStatsType = new GraphQLObjectType({
         },
       },
       totalRecurringDonations: {
-        description: 'How much money is given for this tier for each tier.interval (monthly/yearly)',
+        description:
+          'How much money is given for this tier for each tier.interval (monthly/yearly). For flexible tiers, this amount is a monthly average of contributions amount, taking into account both yearly and monthly subscriptions.',
         type: GraphQLInt,
         resolve(tier, args, req) {
           if (tier.interval === intervals.MONTH) {
             return req.loaders.Tier.totalMonthlyDonations.load(tier.id);
           } else if (tier.interval === intervals.YEAR) {
             return req.loaders.Tier.totalYearlyDonations.load(tier.id);
+          } else if (tier.interval === intervals.FLEXIBLE) {
+            return req.loaders.Tier.totalRecurringDonations.load(tier.id);
           } else {
             return 0;
           }
@@ -1445,10 +1456,23 @@ export const TierType = new GraphQLObjectType({
           if (args.isProcessed) {
             query.where = { processedAt: { [Op.ne]: null } };
           }
-          if (args.isActive) {
-            if (tier.interval) {
-              query.include = [{ model: models.Subscription, where: { isActive: true } }];
-            }
+          if (args.isActive && tier.interval) {
+            query.group = sequelize.col('Order.id');
+            query.include = [
+              {
+                model: models.Transaction,
+                attributes: [],
+                required: true,
+                where: {
+                  isRefund: false,
+                  createdAt: {
+                    [Op.gte]: moment()
+                      .subtract(1, tier.interval === INTERVALS.MONTH ? 'month' : 'year')
+                      .subtract(5, 'day'), // Give it a few more days to keep order active while payment is being renewed
+                  },
+                },
+              },
+            ];
           }
           return tier.getOrders(query);
         },
@@ -1828,8 +1852,14 @@ export const PaymentMethodType = new GraphQLObjectType({
       },
       expiryDate: {
         type: DateString,
-        resolve(paymentMethod) {
-          return paymentMethod.expiryDate;
+        resolve(paymentMethod, _, req) {
+          // Keep gift cards expiry dates public for legacy compatibility when claiming as a new user
+          const isGiftCard = paymentMethod.type === 'giftcard';
+          if (!isGiftCard && !req.remoteUser?.isAdmin(paymentMethod.CollectiveId)) {
+            return null;
+          } else {
+            return paymentMethod.expiryDate;
+          }
         },
       },
       service: {
@@ -1851,40 +1881,27 @@ export const PaymentMethodType = new GraphQLObjectType({
       data: {
         type: GraphQLJSON,
         resolve(paymentMethod, _, req) {
-          if (!paymentMethod.data) {
+          if (!req.remoteUser?.isAdmin(paymentMethod.CollectiveId)) {
             return null;
           }
 
-          // Protect and whitelist fields for gift cards
+          // Protect and limit fields
+          let allowedFields = [];
           if (paymentMethod.type === PAYMENT_METHOD_TYPE.GIFT_CARD) {
-            if (!req.remoteUser || !req.remoteUser.isAdmin(paymentMethod.CollectiveId)) {
-              return null;
-            }
-            return pick(paymentMethod.data, ['email']);
+            allowedFields = ['email'];
+          } else if (paymentMethod.type === PAYMENT_METHOD_TYPE.CREDITCARD) {
+            allowedFields = ['fullName', 'expMonth', 'expYear', 'brand', 'country', 'last4'];
           }
 
-          const data = paymentMethod.data;
-          // white list fields to send back; removes fields like CustomerIdForHost
-          const dataSubset = {
-            fullName: data.fullName,
-            expMonth: data.expMonth,
-            expYear: data.expYear,
-            brand: data.brand,
-            country: data.country,
-            last4: data.last4,
-          };
-          return dataSubset;
+          return pick(paymentMethod.data, allowedFields);
         },
       },
       name: {
         // last 4 digit of card number for Stripe
         type: GraphQLString,
         resolve(paymentMethod, _, req) {
-          if (
-            paymentMethod.service === PAYMENT_METHOD_SERVICE.PAYPAL &&
-            paymentMethod.type === PAYMENT_METHOD_TYPES.ADAPTIVE
-          ) {
-            return req.remoteUser?.isAdmin(paymentMethod.CollectiveId) ? paymentMethod.name : null;
+          if (!req.remoteUser?.isAdmin(paymentMethod.CollectiveId)) {
+            return null;
           } else {
             return paymentMethod.name;
           }

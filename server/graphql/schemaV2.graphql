@@ -28,7 +28,7 @@ interface Account {
   slug: String
 
   """
-  The type of the account (BOT/COLLECTIVE/EVENT/ORGANIZATION/INDIVIDUAL)
+  The type of the account (BOT/COLLECTIVE/EVENT/ORGANIZATION/INDIVIDUAL/VENDOR)
   """
   type: AccountType
   name: String
@@ -145,6 +145,11 @@ interface Account {
     Only returns orders that have an subscription (monthly/yearly)
     """
     onlySubscriptions: Boolean
+
+    """
+    Whether outgoing incognito contributions should be included. Only works when user is an admin.
+    """
+    includeIncognito: Boolean
     orderBy: ChronologicalOrderInput
   ): OrderCollection!
   settings: JSON!
@@ -184,7 +189,7 @@ interface Account {
     types: [String]
 
     """
-    Wether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
+    Whether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
     """
     includeExpired: Boolean
   ): [PaymentMethod]
@@ -221,6 +226,13 @@ interface Account {
   Describes the features enabled and available for this collective
   """
   features: CollectiveFeatures!
+  virtualCards(
+    limit: Int = 100
+    offset: Int = 0
+    state: String = null
+    merchantAccount: AccountReferenceInput = null
+  ): VirtualCardCollection!
+  virtualCardMerchants(limit: Int = 100, offset: Int = 0): AccountCollection!
 }
 
 """
@@ -272,6 +284,11 @@ type AccountStats {
   """
   Amount of money in cents in the currency of the collective currently available to spend
   """
+  balanceWithBlockedFunds: Amount!
+
+  """
+  Amount of money in cents in the currency of the collective
+  """
   balance: Amount!
 
   """
@@ -303,6 +320,7 @@ enum AccountType {
   INDIVIDUAL
   ORGANIZATION
   PROJECT
+  VENDOR
 }
 
 input AccountUpdateInput {
@@ -454,10 +472,12 @@ enum ActivityType {
   COLLECTIVE_EXPENSE_UNAPPROVED
   COLLECTIVE_EXPENSE_PAID
   COLLECTIVE_EXPENSE_MARKED_AS_UNPAID
+  COLLECTIVE_EXPENSE_MARKED_AS_SPAM
   COLLECTIVE_EXPENSE_PROCESSING
   COLLECTIVE_EXPENSE_SCHEDULED_FOR_PAYMENT
   COLLECTIVE_EXPENSE_ERROR
   COLLECTIVE_EXPENSE_INVITE_DRAFTED
+  COLLECTIVE_EXPENSE_MISSING_RECEIPT
   COLLECTIVE_MEMBER_CREATED
   COLLECTIVE_TRANSACTION_CREATED
   COLLECTIVE_UPDATE_CREATED
@@ -477,6 +497,7 @@ enum ActivityType {
   ADDED_FUND_TO_ORG
   ACTIVATED_COLLECTIVE_AS_HOST
   DEACTIVATED_COLLECTIVE_AS_HOST
+  VIRTUAL_CARD_REQUESTED
   COLLECTIVE_TRANSACTION_PAID
   COLLECTIVE_USER_ADDED
 }
@@ -622,7 +643,7 @@ type Bot implements Account {
     isArchived: Boolean
 
     """
-    Wether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
+    Whether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
     """
     includeIncognito: Boolean = true
 
@@ -664,6 +685,11 @@ type Bot implements Account {
     Only returns orders that have an subscription (monthly/yearly)
     """
     onlySubscriptions: Boolean
+
+    """
+    Whether outgoing incognito contributions should be included. Only works when user is an admin.
+    """
+    includeIncognito: Boolean
     orderBy: ChronologicalOrderInput = { field: CREATED_AT, direction: DESC }
   ): OrderCollection!
   settings: JSON!
@@ -700,7 +726,7 @@ type Bot implements Account {
     types: [String]
 
     """
-    Wether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
+    Whether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
     """
     includeExpired: Boolean
   ): [PaymentMethod]!
@@ -733,6 +759,13 @@ type Bot implements Account {
   Describes the features enabled and available for this collective
   """
   features: CollectiveFeatures!
+  virtualCards(
+    limit: Int = 100
+    offset: Int = 0
+    state: String = null
+    merchantAccount: AccountReferenceInput = null
+  ): VirtualCardCollection!
+  virtualCardMerchants(limit: Int = 100, offset: Int = 0): AccountCollection!
 }
 
 """
@@ -856,7 +889,7 @@ type Collective implements Account & AccountWithHost & AccountWithContributions 
     isArchived: Boolean
 
     """
-    Wether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
+    Whether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
     """
     includeIncognito: Boolean = true
 
@@ -898,6 +931,11 @@ type Collective implements Account & AccountWithHost & AccountWithContributions 
     Only returns orders that have an subscription (monthly/yearly)
     """
     onlySubscriptions: Boolean
+
+    """
+    Whether outgoing incognito contributions should be included. Only works when user is an admin.
+    """
+    includeIncognito: Boolean
     orderBy: ChronologicalOrderInput = { field: CREATED_AT, direction: DESC }
   ): OrderCollection!
   settings: JSON!
@@ -934,7 +972,7 @@ type Collective implements Account & AccountWithHost & AccountWithContributions 
     types: [String]
 
     """
-    Wether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
+    Whether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
     """
     includeExpired: Boolean
   ): [PaymentMethod]!
@@ -967,6 +1005,13 @@ type Collective implements Account & AccountWithHost & AccountWithContributions 
   Describes the features enabled and available for this collective
   """
   features: CollectiveFeatures!
+  virtualCards(
+    limit: Int = 100
+    offset: Int = 0
+    state: String = null
+    merchantAccount: AccountReferenceInput = null
+  ): VirtualCardCollection!
+  virtualCardMerchants(limit: Int = 100, offset: Int = 0): AccountCollection!
 
   """
   Returns the Fiscal Host
@@ -1104,7 +1149,6 @@ type Comment {
   id: String
   createdAt: DateTime
   html: String
-  markdown: String @deprecated(reason: "2020-01-25: Use html")
   fromAccount: Account
   account: Account
 
@@ -1151,7 +1195,6 @@ input CommentReferenceInput {
 
 input CommentUpdateInput {
   id: String!
-  markdown: String
   html: String
 }
 
@@ -1255,6 +1298,7 @@ enum ConnectedAccountService {
   github
   twitter
   transferwise
+  privacy
   meetup @deprecated(reason: "Not using this service anymore")
 }
 
@@ -1311,7 +1355,7 @@ type Contributor {
   totalAmountDonated: Int!
 
   """
-  Wether the contributor is an individual, an organization...
+  Whether the contributor is an individual, an organization...
   """
   type: String!
 
@@ -3028,7 +3072,7 @@ type Event implements Account & AccountWithHost & AccountWithContributions {
     isArchived: Boolean
 
     """
-    Wether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
+    Whether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
     """
     includeIncognito: Boolean = true
 
@@ -3070,6 +3114,11 @@ type Event implements Account & AccountWithHost & AccountWithContributions {
     Only returns orders that have an subscription (monthly/yearly)
     """
     onlySubscriptions: Boolean
+
+    """
+    Whether outgoing incognito contributions should be included. Only works when user is an admin.
+    """
+    includeIncognito: Boolean
     orderBy: ChronologicalOrderInput = { field: CREATED_AT, direction: DESC }
   ): OrderCollection!
   settings: JSON!
@@ -3106,7 +3155,7 @@ type Event implements Account & AccountWithHost & AccountWithContributions {
     types: [String]
 
     """
-    Wether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
+    Whether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
     """
     includeExpired: Boolean
   ): [PaymentMethod]!
@@ -3139,6 +3188,13 @@ type Event implements Account & AccountWithHost & AccountWithContributions {
   Describes the features enabled and available for this collective
   """
   features: CollectiveFeatures!
+  virtualCards(
+    limit: Int = 100
+    offset: Int = 0
+    state: String = null
+    merchantAccount: AccountReferenceInput = null
+  ): VirtualCardCollection!
+  virtualCardMerchants(limit: Int = 100, offset: Int = 0): AccountCollection!
 
   """
   Returns the Fiscal Host
@@ -3209,9 +3265,9 @@ type Event implements Account & AccountWithHost & AccountWithContributions {
   contributionPolicy: String
 
   """
-  The Collective hosting this Event
+  The Account hosting this Event
   """
-  parent: Collective
+  parent: Account
 
   """
   The Collective hosting this Event
@@ -3305,6 +3361,11 @@ type Expense {
   The payout method to use for this expense
   """
   payoutMethod: PayoutMethod
+
+  """
+  The virtual card used to pay for this charge
+  """
+  virtualCard: VirtualCard
 
   """
   (Optional) files attached to the expense
@@ -3495,6 +3556,11 @@ input ExpenseInviteDraftInput {
   The address of the payee
   """
   payeeLocation: LocationInput
+
+  """
+  The payout method that will be used to reimburse the expense
+  """
+  payoutMethod: PayoutMethodInput
 }
 
 input ExpenseInvitee {
@@ -3594,10 +3660,17 @@ input ExpenseItemInput {
 Fields for the user permissions on an expense
 """
 type ExpensePermissions {
+  id: String!
+
   """
   Whether the current user can edit the expense
   """
   canEdit: Boolean!
+
+  """
+  Tags permissions are a bit different, and can be edited by admins even if the expense has already been paid
+  """
+  canEditTags: Boolean!
 
   """
   Whether the current user can edit the expense
@@ -3628,6 +3701,11 @@ type ExpensePermissions {
   Whether the current user can reject this expense
   """
   canReject: Boolean!
+
+  """
+  Whether the current user can mark this expense as spam
+  """
+  canMarkAsSpam: Boolean!
 
   """
   Whether the current user can mark this expense as unpaid
@@ -3673,6 +3751,11 @@ enum ExpenseProcessAction {
   To trigger the payment
   """
   PAY
+
+  """
+  To mark the expense as spam
+  """
+  MARK_AS_SPAM
 }
 
 input ExpenseReferenceInput {
@@ -3697,6 +3780,7 @@ enum ExpenseStatus {
   ERROR
   PAID
   SCHEDULED_FOR_PAYMENT
+  SPAM
 }
 
 """
@@ -3712,6 +3796,7 @@ enum ExpenseStatusFilter {
   ERROR
   PAID
   SCHEDULED_FOR_PAYMENT
+  SPAM
 
   """
   Only expenses that are ready to be paid (must be approved, have the sufficiant balance and have the tax forms completed)
@@ -3729,7 +3814,7 @@ enum ExpenseType {
   INVOICE
 
   """
-  Receipt:  Get paid back for a purchase already made.
+  Receipt: Get paid back for a purchase already made.
   """
   RECEIPT
 
@@ -3742,6 +3827,11 @@ enum ExpenseType {
   Unclassified expense
   """
   UNCLASSIFIED
+
+  """
+  Credit Card Charge: Payment done using an issued (virtual) credit card issued by your Fiscal Host.
+  """
+  CHARGE
 }
 
 input ExpenseUpdateInput {
@@ -3909,7 +3999,7 @@ type Fund implements Account & AccountWithHost & AccountWithContributions {
     isArchived: Boolean
 
     """
-    Wether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
+    Whether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
     """
     includeIncognito: Boolean = true
 
@@ -3951,6 +4041,11 @@ type Fund implements Account & AccountWithHost & AccountWithContributions {
     Only returns orders that have an subscription (monthly/yearly)
     """
     onlySubscriptions: Boolean
+
+    """
+    Whether outgoing incognito contributions should be included. Only works when user is an admin.
+    """
+    includeIncognito: Boolean
     orderBy: ChronologicalOrderInput = { field: CREATED_AT, direction: DESC }
   ): OrderCollection!
   settings: JSON!
@@ -3987,7 +4082,7 @@ type Fund implements Account & AccountWithHost & AccountWithContributions {
     types: [String]
 
     """
-    Wether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
+    Whether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
     """
     includeExpired: Boolean
   ): [PaymentMethod]!
@@ -4020,6 +4115,13 @@ type Fund implements Account & AccountWithHost & AccountWithContributions {
   Describes the features enabled and available for this collective
   """
   features: CollectiveFeatures!
+  virtualCards(
+    limit: Int = 100
+    offset: Int = 0
+    state: String = null
+    merchantAccount: AccountReferenceInput = null
+  ): VirtualCardCollection!
+  virtualCardMerchants(limit: Int = 100, offset: Int = 0): AccountCollection!
 
   """
   Returns the Fiscal Host
@@ -4220,7 +4322,7 @@ type Host implements Account & AccountWithContributions {
     isArchived: Boolean
 
     """
-    Wether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
+    Whether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
     """
     includeIncognito: Boolean = true
 
@@ -4262,6 +4364,11 @@ type Host implements Account & AccountWithContributions {
     Only returns orders that have an subscription (monthly/yearly)
     """
     onlySubscriptions: Boolean
+
+    """
+    Whether outgoing incognito contributions should be included. Only works when user is an admin.
+    """
+    includeIncognito: Boolean
     orderBy: ChronologicalOrderInput = { field: CREATED_AT, direction: DESC }
   ): OrderCollection!
   settings: JSON!
@@ -4298,7 +4405,7 @@ type Host implements Account & AccountWithContributions {
     types: [String]
 
     """
-    Wether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
+    Whether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
     """
     includeExpired: Boolean
   ): [PaymentMethod]!
@@ -4331,6 +4438,13 @@ type Host implements Account & AccountWithContributions {
   Describes the features enabled and available for this collective
   """
   features: CollectiveFeatures!
+  virtualCards(
+    limit: Int = 100
+    offset: Int = 0
+    state: String = null
+    merchantAccount: AccountReferenceInput = null
+  ): VirtualCardCollection!
+  virtualCardMerchants(limit: Int = 100, offset: Int = 0): AccountCollection!
 
   """
   Number of unique financial contributors.
@@ -4394,13 +4508,18 @@ type Host implements Account & AccountWithContributions {
   """
   The list of payment methods (Stripe, Paypal, manual bank transfer, etc ...) the Host can accept for its Collectives
   """
-  supportedPaymentMethods: [PaymentMethodType]
+  supportedPaymentMethods: [PaymentMethodLegacyType]
   bankAccount: PayoutMethod
 
   """
   Paypal preapproval info. Returns null if PayPal account is not connected.
   """
   paypalPreApproval: PaymentMethod
+
+  """
+  If the host supports PayPal, this will contain the client ID to use in the frontend
+  """
+  paypalClientId: String
 
   """
   The list of payout methods this Host accepts for its expenses
@@ -4436,6 +4555,15 @@ type Host implements Account & AccountWithContributions {
     """
     orderBy: ChronologicalOrderInput! = { field: CREATED_AT, direction: DESC }
   ): HostApplicationCollection!
+  hostedVirtualCards(
+    limit: Int = 100
+    offset: Int = 0
+    state: String = null
+    merchantAccount: AccountReferenceInput = null
+    collectiveAccountIds: [AccountReferenceInput] = null
+  ): VirtualCardCollection!
+  hostedVirtualCardMerchants(limit: Int = 100, offset: Int = 0): AccountCollection!
+  hostedVirtualCardCollectives(limit: Int = 100, offset: Int = 0): AccountCollection!
 }
 
 type HostApplication {
@@ -4577,7 +4705,7 @@ type HostPlan {
   hostedCollectivesLimit: Int
 
   """
-  Wether this plan allows to use the added funds feature
+  Whether this plan allows to use the added funds feature
   """
   addedFunds: Int
 
@@ -4587,17 +4715,17 @@ type HostPlan {
   addedFundsLimit: Int
 
   """
-  Wether this plan allows to use the host dashboard
+  Whether this plan allows to use the host dashboard
   """
   hostDashboard: Boolean
 
   """
-  Wether this plan allows to use the manual payments feature
+  Whether this plan allows to use the manual payments feature
   """
   manualPayments: Boolean
 
   """
-  Wether this plan allows to use the bank transfers feature
+  Whether this plan allows to use the bank transfers feature
   """
   bankTransfers: Int
 
@@ -4607,7 +4735,7 @@ type HostPlan {
   bankTransfersLimit: Int
 
   """
-  Wether this plan allows to use the transferwise payouts feature
+  Whether this plan allows to use the transferwise payouts feature
   """
   transferwisePayouts: Int
 
@@ -4625,6 +4753,11 @@ type HostPlan {
   Charge on revenues made through Host Fees.
   """
   hostFeeSharePercent: Int
+
+  """
+  Ability to collect Platform Tips.
+  """
+  platformTips: Boolean
 }
 
 enum ImageFormat {
@@ -4732,7 +4865,7 @@ type Individual implements Account {
     isArchived: Boolean
 
     """
-    Wether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
+    Whether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
     """
     includeIncognito: Boolean = true
 
@@ -4774,6 +4907,11 @@ type Individual implements Account {
     Only returns orders that have an subscription (monthly/yearly)
     """
     onlySubscriptions: Boolean
+
+    """
+    Whether outgoing incognito contributions should be included. Only works when user is an admin.
+    """
+    includeIncognito: Boolean
     orderBy: ChronologicalOrderInput = { field: CREATED_AT, direction: DESC }
   ): OrderCollection!
   settings: JSON!
@@ -4810,7 +4948,7 @@ type Individual implements Account {
     types: [String]
 
     """
-    Wether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
+    Whether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
     """
     includeExpired: Boolean
   ): [PaymentMethod]!
@@ -4845,6 +4983,13 @@ type Individual implements Account {
   Describes the features enabled and available for this collective
   """
   features: CollectiveFeatures!
+  virtualCards(
+    limit: Int = 100
+    offset: Int = 0
+    state: String = null
+    merchantAccount: AccountReferenceInput = null
+  ): VirtualCardCollection!
+  virtualCardMerchants(limit: Int = 100, offset: Int = 0): AccountCollection!
   firstName: String @deprecated(reason: "2020-10-12: Use the name field")
   lastName: String @deprecated(reason: "2020-10-12: Use the name field")
   email: String
@@ -5053,12 +5198,12 @@ type Mutation {
     account: AccountReferenceInput!
     amount: AmountInput!
     description: String!
-    hostFeePercent: Int!
+    hostFeePercent: Float!
 
     """
     Can only be set if root
     """
-    platformFeePercent: Int
+    platformFeePercent: Float
   ): Order!
   createCollective(
     """
@@ -5077,7 +5222,7 @@ type Mutation {
     user: IndividualCreateInput
 
     """
-    Wether to trigger the automated approval for Open Source collectives with GitHub.
+    Whether to trigger the automated approval for Open Source collectives with GitHub.
     """
     automateApprovalWithGithub: Boolean = false
 
@@ -5536,6 +5681,11 @@ type Mutation {
     paymentMethod: PaymentMethodReferenceInput
 
     """
+    To update the order with a PayPal subscription
+    """
+    paypalSubscriptionId: String
+
+    """
     Reference to a Tier to update the order with
     """
     tier: TierReferenceInput
@@ -5590,6 +5740,21 @@ type Mutation {
   confirmCreditCard(paymentMethod: PaymentMethodReferenceInput!): CreditCardWithStripeError!
 
   """
+  Add platform tips to a transaction
+  """
+  addPlatformTipToTransaction(
+    """
+    Reference to the transaction in the platform tip
+    """
+    transaction: TransactionReferenceInput!
+
+    """
+    Amount of the platform tip
+    """
+    amount: AmountInput!
+  ): Transaction!
+
+  """
   Refunds transaction
   """
   refundTransaction(
@@ -5635,9 +5800,89 @@ type Mutation {
   ): Member!
   createUpdate(update: UpdateCreateInput!): Update!
   editUpdate(update: UpdateUpdateInput!): Update!
-  publishUpdate(id: String!, notificationAudience: UpdateAudienceType!): Update!
+  publishUpdate(id: String!, notificationAudience: UpdateAudience!): Update!
   unpublishUpdate(id: String!): Update!
   deleteUpdate(id: String!): Update!
+
+  """
+  Assign new Virtual Card information to existing hosted collective
+  """
+  assignNewVirtualCard(
+    """
+    Virtual Card data
+    """
+    virtualCard: VirtualCardInput!
+
+    """
+    Account where the virtual card will be associated
+    """
+    account: AccountReferenceInput!
+
+    """
+    Individual account responsible for the card
+    """
+    assignee: AccountReferenceInput!
+  ): VirtualCard!
+
+  """
+  Edit existing Virtual Card information
+  """
+  editVirtualCard(
+    """
+    Virtual Card being edited its new values
+    """
+    virtualCard: VirtualCardUpdateInput!
+
+    """
+    The individual account reference to attach the Virtual Card to if desired
+    """
+    assignee: AccountReferenceInput
+  ): VirtualCard!
+
+  """
+  Request Virtual Card to host
+  """
+  requestVirtualCard(
+    """
+    Request notes
+    """
+    notes: String
+
+    """
+    Account where the virtual card will be associated
+    """
+    account: AccountReferenceInput!
+  ): Boolean
+
+  """
+  Pause active Virtual Card
+  """
+  pauseVirtualCard(
+    """
+    Virtual Card reference
+    """
+    virtualCard: VirtualCardReferenceInput!
+  ): VirtualCard!
+
+  """
+  Resume paused Virtual Card
+  """
+  resumeVirtualCard(
+    """
+    Virtual Card reference
+    """
+    virtualCard: VirtualCardReferenceInput!
+  ): VirtualCard!
+
+  """
+  Delete Virtual Card
+  """
+  deleteVirtualCard(
+    """
+    Virtual Card reference
+    """
+    virtualCard: VirtualCardReferenceInput!
+  ): Boolean
 }
 
 input NewAccountOrganizationInput {
@@ -5679,6 +5924,7 @@ type Order {
   quantity: Int
   status: OrderStatus
   frequency: ContributionFrequency
+  nextChargeDate: DateTime
   tier: Tier
   fromAccount: Account
   toAccount: Account
@@ -5806,6 +6052,8 @@ enum OrderDirection {
 Fields for the user permissions on an order
 """
 type OrderPermissions {
+  id: String!
+
   """
   Whether the current user can mark this order as expired
   """
@@ -5992,7 +6240,7 @@ type Organization implements Account & AccountWithContributions {
     isArchived: Boolean
 
     """
-    Wether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
+    Whether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
     """
     includeIncognito: Boolean = true
 
@@ -6034,6 +6282,11 @@ type Organization implements Account & AccountWithContributions {
     Only returns orders that have an subscription (monthly/yearly)
     """
     onlySubscriptions: Boolean
+
+    """
+    Whether outgoing incognito contributions should be included. Only works when user is an admin.
+    """
+    includeIncognito: Boolean
     orderBy: ChronologicalOrderInput = { field: CREATED_AT, direction: DESC }
   ): OrderCollection!
   settings: JSON!
@@ -6070,7 +6323,7 @@ type Organization implements Account & AccountWithContributions {
     types: [String]
 
     """
-    Wether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
+    Whether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
     """
     includeExpired: Boolean
   ): [PaymentMethod]!
@@ -6105,6 +6358,13 @@ type Organization implements Account & AccountWithContributions {
   Describes the features enabled and available for this collective
   """
   features: CollectiveFeatures!
+  virtualCards(
+    limit: Int = 100
+    offset: Int = 0
+    state: String = null
+    merchantAccount: AccountReferenceInput = null
+  ): VirtualCardCollection!
+  virtualCardMerchants(limit: Int = 100, offset: Int = 0): AccountCollection!
 
   """
   Number of unique financial contributors.
@@ -6171,13 +6431,13 @@ type PaymentMethod {
   id: String
   legacyId: Int
   name: String
-  service: String @deprecated(reason: "2020-08-18: This field is being deprecated in favor of providerType")
-  type: String @deprecated(reason: "2020-08-18: This field is being deprecated in favor of providerType")
+  service: PaymentMethodService
+  type: PaymentMethodType
 
   """
   Defines the type of the payment method. Meant to be moved to "type" in the future.
   """
-  providerType: PaymentMethodType
+  providerType: PaymentMethodLegacyType @deprecated(reason: "2021-03-02: Please use service + type")
 
   """
   Returns the balance amount and the currency of this paymentMethod
@@ -6207,7 +6467,14 @@ input PaymentMethodInput {
   """
   Type of this payment method
   """
-  type: PaymentMethodType
+  type: PaymentMethodLegacyType
+
+  """
+  Type of this payment method
+  """
+  legacyType: PaymentMethodLegacyType
+  service: PaymentMethodService
+  newType: PaymentMethodType
 
   """
   Name of this payment method
@@ -6215,7 +6482,7 @@ input PaymentMethodInput {
   name: String
 
   """
-  Wether this payment method should be saved for future payments
+  Whether this payment method should be saved for future payments
   """
   isSavedForLater: Boolean
 
@@ -6230,14 +6497,7 @@ input PaymentMethodInput {
   paypalInfo: PaypalPaymentInput
 }
 
-input PaymentMethodReferenceInput {
-  """
-  The id assigned to the payment method
-  """
-  id: String
-}
-
-enum PaymentMethodType {
+enum PaymentMethodLegacyType {
   CREDIT_CARD
   GIFT_CARD
   PREPAID_BUDGET
@@ -6245,6 +6505,32 @@ enum PaymentMethodType {
   PAYPAL
   BANK_TRANSFER
   ADDED_FUNDS
+}
+
+input PaymentMethodReferenceInput {
+  """
+  The id assigned to the payment method
+  """
+  id: String
+}
+
+enum PaymentMethodService {
+  PAYPAL
+  STRIPE
+  OPENCOLLECTIVE
+  PREPAID
+}
+
+enum PaymentMethodType {
+  creditcard
+  prepaid
+  payment
+  subscription
+  collective
+  host
+  adaptive
+  giftcard
+  manual
 }
 
 """
@@ -6290,11 +6576,22 @@ enum PayoutMethodType {
   PAYPAL
   BANK_ACCOUNT
   ACCOUNT_BALANCE
+  CREDIT_CARD
 }
 
 input PaypalPaymentInput {
-  token: String!
+  token: String
   data: JSON
+  orderId: String
+  subscriptionId: String
+  isNewApi: Boolean
+}
+
+"""
+A PayPal plan to associate with a contribution
+"""
+type PaypalPlan {
+  id: String!
 }
 
 """
@@ -6466,7 +6763,7 @@ type Project implements Account & AccountWithHost & AccountWithContributions {
     isArchived: Boolean
 
     """
-    Wether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
+    Whether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
     """
     includeIncognito: Boolean = true
 
@@ -6508,6 +6805,11 @@ type Project implements Account & AccountWithHost & AccountWithContributions {
     Only returns orders that have an subscription (monthly/yearly)
     """
     onlySubscriptions: Boolean
+
+    """
+    Whether outgoing incognito contributions should be included. Only works when user is an admin.
+    """
+    includeIncognito: Boolean
     orderBy: ChronologicalOrderInput = { field: CREATED_AT, direction: DESC }
   ): OrderCollection!
   settings: JSON!
@@ -6544,7 +6846,7 @@ type Project implements Account & AccountWithHost & AccountWithContributions {
     types: [String]
 
     """
-    Wether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
+    Whether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
     """
     includeExpired: Boolean
   ): [PaymentMethod]!
@@ -6577,6 +6879,13 @@ type Project implements Account & AccountWithHost & AccountWithContributions {
   Describes the features enabled and available for this collective
   """
   features: CollectiveFeatures!
+  virtualCards(
+    limit: Int = 100
+    offset: Int = 0
+    state: String = null
+    merchantAccount: AccountReferenceInput = null
+  ): VirtualCardCollection!
+  virtualCardMerchants(limit: Int = 100, offset: Int = 0): AccountCollection!
 
   """
   Returns the Fiscal Host
@@ -6647,9 +6956,9 @@ type Project implements Account & AccountWithHost & AccountWithContributions {
   contributionPolicy: String
 
   """
-  The Fund hosting this Project
+  The Account hosting this Project
   """
-  parent: Fund
+  parent: Account
 }
 
 input ProjectCreateInput {
@@ -6821,6 +7130,11 @@ type Query {
     dateFrom: ISODateTime
 
     """
+    Only return expenses that were created after this date
+    """
+    dateTo: ISODateTime
+
+    """
     The term to search
     """
     searchTerm: String
@@ -6913,6 +7227,11 @@ type Query {
     Only return orders that were created after this date
     """
     dateFrom: ISODateTime
+
+    """
+    Only return orders that were created after this date
+    """
+    dateTo: ISODateTime
 
     """
     The term to search
@@ -7021,11 +7340,6 @@ type Query {
     """
     The update slug identifying the update
     """
-    updateSlug: String
-
-    """
-    The update slug identifying the update
-    """
     slug: String
 
     """
@@ -7033,6 +7347,23 @@ type Query {
     """
     account: AccountReferenceInput
   ): Update
+  paypalPlan(
+    """
+    The account that serves as a payment target
+    """
+    account: AccountReferenceInput!
+
+    """
+    The contribution amount for 1 quantity, without platform contribution and taxes
+    """
+    amount: AmountInput!
+    frequency: ContributionFrequency!
+
+    """
+    The tier you are contributing to
+    """
+    tier: TierReferenceInput
+  ): PaypalPlan!
   loggedInAccount: Account
 }
 
@@ -7111,6 +7442,7 @@ type TierCollection implements Collection {
 enum TierInterval {
   month
   year
+  flexible
 }
 
 input TierReferenceInput {
@@ -7180,6 +7512,8 @@ type TransactionCollection implements Collection {
 Fields for the user permissions on an transaction
 """
 type TransactionPermissions {
+  id: String!
+
   """
   Whether the current user can edit the transaction
   """
@@ -7282,12 +7616,29 @@ type Update {
   Indicates whether or not the user is allowed to see the content of this update
   """
   userCanSeeUpdate: Boolean!
+
+  """
+  Indicates whether or not the user is allowed to publish this update
+  """
+  userCanPublishUpdate: Boolean!
   isPrivate: Boolean!
   title: String!
   createdAt: DateTime!
   updatedAt: DateTime!
   publishedAt: DateTime
-  notificationAudience: UpdateAudienceType
+  notificationAudience: UpdateAudience
+
+  """
+  Some stats about the target audience. Will be null if the update is already
+  published or if you don't have enough permissions so see this information. Not
+  backed by a loader, avoid using this field in lists.
+  """
+  audienceStats(
+    """
+    To override the default notificationAudience
+    """
+    audience: UpdateAudience
+  ): UpdateAudienceStats
   makePublicOn: DateTime
   summary: String
   html: String
@@ -7304,7 +7655,7 @@ type Update {
 """
 Defines targets for an update
 """
-enum UpdateAudienceType {
+enum UpdateAudience {
   """
   Will be sent to collective admins and financial contributors
   """
@@ -7319,6 +7670,23 @@ enum UpdateAudienceType {
   Will be sent to financial contributors
   """
   FINANCIAL_CONTRIBUTORS
+}
+
+"""
+Stats about the potential audience of an update
+"""
+type UpdateAudienceStats {
+  id: String!
+  coreContributors: Int!
+  individuals: Int!
+  organizations: Int!
+  collectives: Int!
+  hosted: Int!
+
+  """
+  The total number of emails to send
+  """
+  total: Int!
 }
 
 """
@@ -7367,3 +7735,336 @@ input UpdateUpdateInput {
 A field whose value conforms to the standard URL format as specified in RFC3986: https://www.ietf.org/rfc/rfc3986.txt.
 """
 scalar URL
+
+"""
+This represents a Vendor account
+"""
+type Vendor implements Account & AccountWithHost & AccountWithContributions {
+  id: String
+  legacyId: Int
+
+  """
+  The slug identifying the account (ie: babel)
+  """
+  slug: String
+  type: AccountType
+  name: String
+  description: String
+  longDescription: String
+  tags: [String]
+  website: String
+  twitterHandle: String
+  githubHandle: String
+  currency: String
+  expensePolicy: String
+
+  """
+  Defines if the contributors wants to be incognito (name not displayed)
+  """
+  isIncognito: Boolean!
+  imageUrl(height: Int, format: ImageFormat): String
+  backgroundImageUrl(height: Int, format: ImageFormat): String
+
+  """
+  The time of creation
+  """
+  createdAt: DateTime
+  updatedAt: DateTime
+
+  """
+  Returns whether this account is archived
+  """
+  isArchived: Boolean
+
+  """
+  Returns whether it's active: can accept financial contributions and pay expenses.
+  """
+  isActive: Boolean!
+
+  """
+  Returns whether the account is setup to Host collectives.
+  """
+  isHost: Boolean
+
+  """
+  Returns true if the remote user is an admin of this account
+  """
+  isAdmin: Boolean!
+
+  """
+  Get all members (admins, members, backers, followers)
+  """
+  members(
+    limit: Int = 100
+    offset: Int = 0
+    role: [MemberRole]
+    accountType: [AccountType]
+
+    """
+    Admin only. To filter on the email address of a member, useful to check if a member exists.
+    """
+    email: EmailAddress
+
+    """
+    Order of the results
+    """
+    orderBy: ChronologicalOrderInput! = { field: CREATED_AT, direction: ASC }
+  ): MemberCollection
+  memberOf(
+    limit: Int
+    offset: Int
+    role: [MemberRole]
+    accountType: [AccountType]
+    account: AccountReferenceInput
+
+    """
+    Filter on whether the account is a host or not
+    """
+    isHostAccount: Boolean
+
+    """
+    Filter on (un)approved collectives
+    """
+    isApproved: Boolean
+
+    """
+    Filter on archived collectives
+    """
+    isArchived: Boolean
+
+    """
+    Whether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.
+    """
+    includeIncognito: Boolean = true
+
+    """
+    A term to search membership. Searches in collective tags, name, slug, members description and role.
+    """
+    searchTerm: String
+
+    """
+    Filters on the Host fees structure applied to this account
+    """
+    hostFeesStructure: HostFeeStructure
+
+    """
+    Order of the results
+    """
+    orderBy: ChronologicalOrderInput! = { field: CREATED_AT, direction: ASC }
+  ): MemberOfCollection
+  transactions(
+    type: TransactionType
+    limit: Int = 100
+    offset: Int = 0
+    orderBy: ChronologicalOrderInput = { field: CREATED_AT, direction: DESC }
+
+    """
+    If the account is a user and this field is true, contributions from the
+    incognito profile will be included too (admins only)
+    """
+    includeIncognitoTransactions: Boolean! = false
+  ): TransactionCollection!
+  orders(
+    limit: Int = 100
+    offset: Int = 0
+    filter: AccountOrdersFilter
+    status: [OrderStatus]
+    tierSlug: String
+
+    """
+    Only returns orders that have an subscription (monthly/yearly)
+    """
+    onlySubscriptions: Boolean
+
+    """
+    Whether outgoing incognito contributions should be included. Only works when user is an admin.
+    """
+    includeIncognito: Boolean
+    orderBy: ChronologicalOrderInput = { field: CREATED_AT, direction: DESC }
+  ): OrderCollection!
+  settings: JSON!
+  conversations(
+    limit: Int
+    offset: Int
+
+    """
+    Only return conversations matching this tag
+    """
+    tag: String
+  ): ConversationCollection
+
+  """
+  Returns conversation's tags for collective sorted by popularity
+  """
+  conversationsTags(limit: Int = 30): [TagStat]
+
+  """
+  Returns expense tags for collective sorted by popularity
+  """
+  expensesTags(limit: Int = 30): [TagStat]
+  transferwise: TransferWise
+
+  """
+  The list of payout methods that this collective can use to get paid
+  """
+  payoutMethods: [PayoutMethod]
+
+  """
+  The list of payment methods that this collective can use to pay for Orders
+  """
+  paymentMethods(
+    types: [String]
+
+    """
+    Whether to include expired payment methods. Payment methods expired since more than 6 months will never be returned.
+    """
+    includeExpired: Boolean
+  ): [PaymentMethod]!
+
+  """
+  The list of connected accounts (Stripe, Twitter, etc ...)
+  """
+  connectedAccounts: [ConnectedAccount]
+
+  """
+  The address associated to this account. This field is always public for collectives and events.
+  """
+  location: Location
+  categories: [String]!
+  stats: AccountStats
+  updates(
+    """
+    The number of results to fetch (default 10, max 1000)
+    """
+    limit: Int = 10
+
+    """
+    The offset to use to fetch
+    """
+    offset: Int = 0
+    onlyPublishedUpdates: Boolean
+  ): UpdateCollection!
+
+  """
+  Describes the features enabled and available for this collective
+  """
+  features: CollectiveFeatures!
+  virtualCards(
+    limit: Int = 100
+    offset: Int = 0
+    state: String = null
+    merchantAccount: AccountReferenceInput = null
+  ): VirtualCardCollection!
+  virtualCardMerchants(limit: Int = 100, offset: Int = 0): AccountCollection!
+
+  """
+  Returns the Fiscal Host
+  """
+  host: Host
+
+  """
+  Describe how the host charges the collective
+  """
+  hostFeesStructure: HostFeeStructure
+
+  """
+  Fees percentage that the host takes for this collective
+  """
+  hostFeePercent: Float
+
+  """
+  How much platform fees are charged for this account
+  """
+  platformFeePercent: Int!
+
+  """
+  Date of approval by the Fiscal Host.
+  """
+  approvedAt: DateTime
+
+  """
+  Returns whether it's approved by the Fiscal Host
+  """
+  isApproved: Boolean!
+
+  """
+  Number of unique financial contributors.
+  """
+  totalFinancialContributors(
+    """
+    Type of account (COLLECTIVE/EVENT/ORGANIZATION/INDIVIDUAL)
+    """
+    accountType: AccountType
+  ): Int!
+  tiers: TierCollection!
+
+  """
+  All the persons and entities that contribute to this account
+  """
+  contributors(
+    """
+    The number of results to fetch (default 10, max 1000)
+    """
+    limit: Int = 10
+
+    """
+    The offset to use to fetch
+    """
+    offset: Int = 0
+    roles: [MemberRole]
+  ): ContributorCollection!
+
+  """
+  Returns true if a custom contribution to Open Collective can be submitted for contributions made to this account
+  """
+  platformContributionAvailable: Boolean!
+
+  """
+  Amount of money in cents in the currency of the account currently available to spend
+  """
+  balance: Int @deprecated(reason: "2020/04/09 - Should not have been introduced. Use stats.balance.value")
+  contributionPolicy: String
+}
+
+"""
+VirtualCard related properties.
+"""
+type VirtualCard {
+  id: String
+  account: Account
+  host: Account
+  assignee: Individual
+  name: String
+  last4: String
+  data: JSONObject
+  privateData: JSONObject
+  createdAt: DateTime
+  updatedAt: DateTime
+}
+
+"""
+A collection of Virtual Cards
+"""
+type VirtualCardCollection implements Collection {
+  offset: Int
+  limit: Int
+  totalCount: Int
+  nodes: [VirtualCard]
+}
+
+input VirtualCardInput {
+  id: String
+  name: String
+  last4: String
+  data: JSONObject
+  privateData: JSONObject
+}
+
+input VirtualCardReferenceInput {
+  id: String
+}
+
+input VirtualCardUpdateInput {
+  id: String
+  privateData: JSONObject
+}

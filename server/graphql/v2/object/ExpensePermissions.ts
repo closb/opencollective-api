@@ -1,17 +1,30 @@
 import express from 'express';
-import { GraphQLBoolean, GraphQLNonNull, GraphQLObjectType } from 'graphql';
+import { GraphQLBoolean, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
 
 import * as ExpenseLib from '../../common/expenses';
+import { getIdEncodeResolver, IDENTIFIER_TYPES } from '../identifiers';
 
 const ExpensePermissions = new GraphQLObjectType({
   name: 'ExpensePermissions',
   description: 'Fields for the user permissions on an expense',
   fields: () => ({
+    id: {
+      type: new GraphQLNonNull(GraphQLString),
+      resolve: getIdEncodeResolver(IDENTIFIER_TYPES.EXPENSE),
+    },
     canEdit: {
       type: new GraphQLNonNull(GraphQLBoolean),
       description: 'Whether the current user can edit the expense',
       async resolve(expense, _, req: express.Request): Promise<boolean> {
         return ExpenseLib.canEditExpense(req, expense);
+      },
+    },
+    canEditTags: {
+      type: new GraphQLNonNull(GraphQLBoolean),
+      description:
+        'Tags permissions are a bit different, and can be edited by admins even if the expense has already been paid',
+      async resolve(expense, _, req: express.Request): Promise<boolean> {
+        return ExpenseLib.canEditExpenseTags(req, expense);
       },
     },
     canDelete: {
@@ -54,6 +67,13 @@ const ExpensePermissions = new GraphQLObjectType({
       description: 'Whether the current user can reject this expense',
       async resolve(expense, _, req: express.Request): Promise<boolean> {
         return ExpenseLib.canReject(req, expense);
+      },
+    },
+    canMarkAsSpam: {
+      type: new GraphQLNonNull(GraphQLBoolean),
+      description: 'Whether the current user can mark this expense as spam',
+      async resolve(expense, _, req: express.Request): Promise<boolean> {
+        return ExpenseLib.canMarkAsSpam(req, expense);
       },
     },
     canMarkAsUnpaid: {

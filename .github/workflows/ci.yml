@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches:
-      - master
+      - main
   pull_request:
     types:
       - opened
@@ -22,7 +22,6 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
-
     timeout-minutes: 15
 
     steps:
@@ -59,7 +58,6 @@ jobs:
 
   prettier:
     runs-on: ubuntu-latest
-
     timeout-minutes: 15
 
     steps:
@@ -96,7 +94,6 @@ jobs:
 
   typescript:
     runs-on: ubuntu-latest
-
     timeout-minutes: 15
 
     steps:
@@ -170,7 +167,6 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
-
     timeout-minutes: 15
 
     steps:
@@ -224,10 +220,11 @@ jobs:
           - 6379:6379
         options: --entrypoint redis-server
       postgres:
-        image: mdillon/postgis:9.6
+        image: postgis/postgis:9.6-2.5
         env:
           POSTGRES_USER: postgres
           POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
@@ -270,7 +267,6 @@ jobs:
 
   test-graphql:
     runs-on: ubuntu-latest
-
     timeout-minutes: 30
 
     services:
@@ -280,10 +276,11 @@ jobs:
           - 6379:6379
         options: --entrypoint redis-server
       postgres:
-        image: mdillon/postgis:9.6
+        image: postgis/postgis:9.6-2.5
         env:
           POSTGRES_USER: postgres
           POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
@@ -328,7 +325,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@master
+        uses: actions/checkout@main
+
       - name: Restore node_modules
         uses: actions/cache@v1
         id: api-node-modules
@@ -351,7 +349,6 @@ jobs:
         run: ./scripts/check-schemas.sh
 
   graphql-inspector:
-    needs: schema-update
     name: GraphQL Inspector
     runs-on: ubuntu-latest
     services:
@@ -361,27 +358,29 @@ jobs:
           - 6379:6379
         options: --entrypoint redis-server
       postgres:
-        image: mdillon/postgis:9.6
+        image: postgis/postgis:9.6-2.5
         env:
           POSTGRES_USER: postgres
           POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
     steps:
       - name: Checkout
-        uses: actions/checkout@master
+        uses: actions/checkout@main
+
       - name: GraphQL Inspector (V1)
         uses: kamilkisiela/graphql-inspector@master
         with:
           name: 'GraphQL Inspector - Schema v1'
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          schema: 'master:server/graphql/schemaV1.graphql'
+          schema: 'main:server/graphql/schemaV1.graphql'
           fail-on-breaking: false
       - name: GraphQL Inspector (V2)
         uses: kamilkisiela/graphql-inspector@master
         with:
           name: 'GraphQL Inspector - Schema v2'
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          schema: 'master:server/graphql/schemaV2.graphql'
+          schema: 'main:server/graphql/schemaV2.graphql'
           fail-on-breaking: false

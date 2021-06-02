@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import sinon from 'sinon';
 
+import { TransactionKind } from '../../../server/constants/transaction-kind';
 import models from '../../../server/models';
 import { fakeCollective, fakeHost, fakeOrder, fakeUser } from '../../test-helpers/fake-data';
 import * as utils from '../../utils';
@@ -9,21 +10,60 @@ const { Transaction } = models;
 
 const transactionsData = utils.data('transactions1').transactions;
 
+const SNAPSHOT_COLUMNS = [
+  'kind',
+  'type',
+  'netAmountInCollectiveCurrency',
+  'currency',
+  'HostCollectiveId',
+  'platformFeeInHostCurrency',
+  'paymentProcessorFeeInHostCurrency',
+  'taxAmount',
+  'amount',
+  'description',
+];
+
+const SNAPSHOT_COLUMNS_WITH_DEBT = [
+  'kind',
+  'type',
+  'isDebt',
+  'FromCollectiveId',
+  'CollectiveId',
+  'HostCollectiveId',
+  'amount',
+  'currency',
+  'platformFeeInHostCurrency',
+  'paymentProcessorFeeInHostCurrency',
+  'settlementStatus',
+  'description',
+];
+
 describe('server/models/Transaction', () => {
   let user, host, inc, collective, defaultTransactionData;
 
   beforeEach(() => utils.resetTestDB());
 
   beforeEach(async () => {
-    user = await fakeUser({}, { id: 10 });
+    user = await fakeUser({}, { id: 10, name: 'User' });
     inc = await fakeHost({
       id: 8686,
       slug: 'opencollectiveinc',
+      name: 'Open Collective',
       CreatedByUserId: user.id,
       HostCollectiveId: 8686,
     });
-    host = await fakeHost({ id: 2, CreatedByUserId: user.id });
-    collective = await fakeCollective({ id: 3, HostCollectiveId: host.id, CreatedByUserId: user.id });
+    host = await fakeHost({
+      id: 2,
+      name: 'Random Host',
+      CreatedByUserId: user.id,
+      data: { reimbursePaymentProcessorFeeOnTips: true },
+    });
+    collective = await fakeCollective({
+      id: 3,
+      HostCollectiveId: host.id,
+      CreatedByUserId: user.id,
+      name: 'Collective',
+    });
     defaultTransactionData = {
       CreatedByUserId: user.id,
       FromCollectiveId: user.CollectiveId,
@@ -80,12 +120,16 @@ describe('server/models/Transaction', () => {
       CollectiveId: collective.id,
     }).then(() => {
       return Transaction.findAll().then(transactions => {
+        utils.snapshotTransactions(transactions, { columns: SNAPSHOT_COLUMNS });
+
         expect(transactions.length).to.equal(2);
+        expect(transactions[0].kind).to.equal(TransactionKind.CONTRIBUTION);
         expect(transactions[0].type).to.equal('DEBIT');
         expect(transactions[0].netAmountInCollectiveCurrency).to.equal(-12100);
         expect(transactions[0].currency).to.equal('EUR');
         expect(transactions[0].HostCollectiveId).to.be.null;
 
+        expect(transactions[1].kind).to.equal(TransactionKind.CONTRIBUTION);
         expect(transactions[1].type).to.equal('CREDIT');
         expect(transactions[1].amount).to.equal(12100);
         expect(transactions[1].platformFeeInHostCurrency).to.equal(-500);
@@ -123,20 +167,22 @@ describe('server/models/Transaction', () => {
     }).then(() => {
       return Transaction.findAll().then(transactions => {
         expect(transactions.length).to.equal(2);
+        expect(transactions[0] instanceof models.Transaction).to.be.true;
         expect(transactions[0].type).to.equal('DEBIT');
         expect(transactions[0].netAmountInCollectiveCurrency).to.equal(-10000);
         expect(transactions[0].currency).to.equal('EUR');
         expect(transactions[0].HostCollectiveId).to.be.null;
+        expect(transactions[0].kind).to.equal(TransactionKind.CONTRIBUTION);
+        expect(transactions[0].description).to.equal(transaction.description);
 
         expect(transactions[1].type).to.equal('CREDIT');
+        expect(transactions[1].kind).to.equal(TransactionKind.CONTRIBUTION);
         expect(transactions[1].amount).to.equal(10000);
         expect(transactions[1].platformFeeInHostCurrency).to.equal(-550);
         expect(transactions[1].paymentProcessorFeeInHostCurrency).to.equal(-330);
         expect(transactions[1].taxAmount).to.be.null;
         expect(transactions[1].amount).to.equal(10000);
         expect(transactions[1].netAmountInCollectiveCurrency).to.equal(8700);
-        expect(transactions[0] instanceof models.Transaction).to.be.true;
-        expect(transactions[0].description).to.equal(transaction.description);
       });
     });
   });
@@ -188,6 +234,7 @@ describe('server/models/Transaction', () => {
       });
 
       expect(t).to.have.property('platformFeeInHostCurrency').equal(0);
+      expect(t).to.have.property('kind').equal(TransactionKind.CONTRIBUTION);
       expect(t)
         .to.have.property('netAmountInCollectiveCurrency')
         .equal(
@@ -200,7 +247,7 @@ describe('server/models/Transaction', () => {
         );
     });
 
-    it('should create an aditional pair of transactions between contributor and Open Collective Inc', async () => {
+    it('should create an additional pair of transactions between contributor and Open Collective Inc', async () => {
       const order = await fakeOrder({
         CreatedByUserId: user.id,
         FromCollectiveId: user.CollectiveId,
@@ -233,25 +280,44 @@ describe('server/models/Transaction', () => {
         CollectiveId: collective.id,
       });
 
-      const allTransactions = await Transaction.findAll({ where: { OrderId: order.id } });
-      expect(allTransactions).to.have.length(4);
+      // Should have 6 transactions:
+      // - 2 for contributions
+      // - 2 for platform tip (contributor -> Open Collective)
+      // - 2 for platform tip debt (host -> Open Collective)
+      const sqlOrder = [['createdAt', 'ASC']];
+      const include = [{ association: 'host' }];
+      const allTransactions = await Transaction.findAll({ where: { OrderId: order.id }, order: sqlOrder, include });
+      await models.TransactionSettlement.attachStatusesToTransactions(allTransactions);
+      expect(allTransactions).to.have.length(6);
+      await utils.preloadAssociationsForTransactions(allTransactions, SNAPSHOT_COLUMNS_WITH_DEBT);
+      utils.snapshotTransactions(allTransactions, { columns: SNAPSHOT_COLUMNS_WITH_DEBT });
 
-      const donationCredit = allTransactions.find(t => t.CollectiveId === inc.id);
-      expect(donationCredit).to.have.property('type').equal('CREDIT');
-      expect(donationCredit).to.have.property('amount').equal(1000);
-      expect(donationCredit)
-        .to.have.property('PlatformTipForTransactionGroup')
-        .equal(createdTransaction.TransactionGroup);
+      // Check base tip transactions
+      const tipCredit = allTransactions.find(t => t.CollectiveId === inc.id && !t.isDebt);
+      expect(tipCredit).to.have.property('type').equal('CREDIT');
+      expect(tipCredit).to.have.property('amount').equal(1000);
+      expect(tipCredit).to.have.property('kind').equal(TransactionKind.PLATFORM_TIP);
+      expect(tipCredit).to.have.property('TransactionGroup').equal(createdTransaction.TransactionGroup);
 
-      const donationDebit = allTransactions.find(t => t.FromCollectiveId === inc.id);
+      const tipDebit = allTransactions.find(t => t.FromCollectiveId === inc.id && !t.isDebt);
       const partialPaymentProcessorFee = Math.round(200 * (1000 / 11000));
-      expect(donationDebit).to.have.property('type').equal('DEBIT');
-      expect(donationDebit)
+      expect(tipDebit).to.have.property('type').equal('DEBIT');
+      expect(tipDebit).to.have.property('kind').equal(TransactionKind.PLATFORM_TIP);
+      expect(tipDebit).to.have.property('TransactionGroup').equal(createdTransaction.TransactionGroup);
+      expect(tipDebit)
         .to.have.property('amount')
         .equal(-1000 + partialPaymentProcessorFee);
-      expect(donationDebit)
-        .to.have.property('PlatformTipForTransactionGroup')
-        .equal(createdTransaction.TransactionGroup);
+
+      // Check tip DEBT transactions
+      const tipDebtCredit = allTransactions.find(t => t.CollectiveId === inc.id && t.isDebt);
+      const tipDebtDebit = allTransactions.find(t => t.CollectiveId === inc.id && t.isDebt);
+      expect(tipDebtCredit).to.exist;
+      expect(tipDebtDebit).to.exist;
+
+      // Check settlement
+      const settlement = await models.TransactionSettlement.getByTransaction(tipCredit);
+      expect(settlement).to.exist;
+      expect(settlement.status).to.eq('OWED');
     });
 
     it('should convert the donation transaction to USD and store the FX rate', async () => {
@@ -289,7 +355,7 @@ describe('server/models/Transaction', () => {
       });
 
       const allTransactions = await Transaction.findAll({ where: { OrderId: order.id } });
-      expect(allTransactions).to.have.length(4);
+      expect(allTransactions).to.have.length(6);
 
       const donationCredit = allTransactions.find(t => t.CollectiveId === inc.id);
       expect(donationCredit).to.have.property('type').equal('CREDIT');

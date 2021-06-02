@@ -2,20 +2,22 @@ import assert from 'assert';
 
 import Promise from 'bluebird';
 import debugLib from 'debug';
-import { defaultsDeep, get, isNil, isNull, isUndefined, pick } from 'lodash';
+import { defaultsDeep, get, isNil, isNull, isUndefined, omit, pick } from 'lodash';
 import moment from 'moment';
 import { v4 as uuid } from 'uuid';
 
 import activities from '../constants/activities';
-import { FEES_ON_TOP_TRANSACTION_PROPERTIES, TransactionTypes } from '../constants/transactions';
+import { TransactionKind } from '../constants/transaction-kind';
+import { PLATFORM_TIP_TRANSACTION_PROPERTIES, TransactionTypes } from '../constants/transactions';
 import { getFxRate } from '../lib/currency';
 import { toNegative } from '../lib/math';
 import { calcFee } from '../lib/payments';
 import { stripHTML } from '../lib/sanitize-html';
-import sequelize, { DataTypes } from '../lib/sequelize';
+import sequelize, { DataTypes, Op } from '../lib/sequelize';
 import { exportToCSV } from '../lib/utils';
 
 import CustomDataTypes from './DataTypes';
+import { TransactionSettlementStatus } from './TransactionSettlement';
 
 const debug = debugLib('models:Transaction');
 
@@ -26,6 +28,11 @@ function defineModel() {
     'Transaction',
     {
       type: DataTypes.STRING, // DEBIT or CREDIT
+
+      kind: {
+        allowNull: true,
+        type: DataTypes.ENUM(Object.values(TransactionKind)),
+      },
 
       uuid: {
         type: DataTypes.UUID,
@@ -164,14 +171,14 @@ function defineModel() {
         references: { model: 'Transactions', key: 'id' },
       },
 
-      PlatformTipForTransactionGroup: {
-        type: DataTypes.STRING,
-        allowNull: true,
-      },
-
       isRefund: {
         type: DataTypes.BOOLEAN,
         defaultValue: false,
+      },
+
+      isDebt: {
+        type: DataTypes.BOOLEAN,
+        allowNull: true,
       },
 
       createdAt: {
@@ -186,6 +193,11 @@ function defineModel() {
 
       deletedAt: {
         type: DataTypes.DATE,
+      },
+
+      /** A virtual field to make working with settlements easier. Must be preloaded manually. */
+      settlementStatus: {
+        type: DataTypes.VIRTUAL,
       },
     },
     {
@@ -211,6 +223,7 @@ function defineModel() {
             id: this.id,
             uuid: this.uuid,
             type: this.type,
+            kind: this.kind,
             description: this.description,
             amount: this.amount,
             currency: this.currency,
@@ -232,13 +245,14 @@ function defineModel() {
             ExpenseId: this.ExpenseId,
             OrderId: this.OrderId,
             isRefund: this.isRefund,
+            isDebt: this.isDebt,
           };
         },
       },
 
       hooks: {
-        afterCreate: transaction => {
-          Transaction.createActivity(transaction);
+        afterCreate: (transaction, options) => {
+          Transaction.createActivity(transaction, { transaction: options.transaction });
           // intentionally returns null, needs to be async (https://github.com/petkaantonov/bluebird/blob/master/docs/docs/warning-explanations.md#warning-a-promise-was-created-in-a-handler-but-was-not-returned-from-it)
           return null;
         },
@@ -314,16 +328,18 @@ function defineModel() {
   };
 
   Transaction.prototype.hasPlatformTip = function () {
-    return this.data?.isFeesOnTop ? true : false;
+    return Boolean(this.data?.isFeesOnTop && this.kind !== TransactionKind.PLATFORM_TIP);
   };
 
   Transaction.prototype.getPlatformTipTransaction = function () {
     if (this.hasPlatformTip()) {
       return models.Transaction.findOne({
         where: {
-          ...pick(FEES_ON_TOP_TRANSACTION_PROPERTIES, ['CollectiveId']),
+          ...pick(PLATFORM_TIP_TRANSACTION_PROPERTIES, ['CollectiveId']),
           type: this.type,
-          PlatformTipForTransactionGroup: this.TransactionGroup,
+          TransactionGroup: this.TransactionGroup,
+          kind: TransactionKind.PLATFORM_TIP,
+          isDebt: { [Op.not]: true },
         },
       });
     }
@@ -336,7 +352,8 @@ function defineModel() {
         CollectiveId: this.FromCollectiveId,
         FromCollectiveId: this.CollectiveId,
         TransactionGroup: this.TransactionGroup,
-        PlatformTipForTransactionGroup: this.PlatformTipForTransactionGroup,
+        kind: this.kind,
+        isDebt: this.isDebt,
       },
     });
   };
@@ -470,7 +487,7 @@ function defineModel() {
    *
    */
 
-  Transaction.createDoubleEntry = async transaction => {
+  Transaction.createDoubleEntry = async (transaction, opts) => {
     transaction.type = transaction.amount > 0 ? TransactionTypes.CREDIT : TransactionTypes.DEBIT;
     transaction.netAmountInCollectiveCurrency = transaction.netAmountInCollectiveCurrency || transaction.amount;
     transaction.TransactionGroup = transaction.TransactionGroup || uuid();
@@ -530,7 +547,7 @@ function defineModel() {
         paymentProcessorFeeInHostCurrency: Math.round(
           transaction.paymentProcessorFeeInHostCurrency * oppositeTransactionHostCurrencyFxRate,
         ),
-        data: { ...transaction.data, oppositeTransactionHostCurrencyFxRate },
+        data: { ...omit(transaction.data, ['hostToPlatformFxRate']), oppositeTransactionHostCurrencyFxRate },
       };
 
       // Also keep rate on original transaction
@@ -559,10 +576,56 @@ function defineModel() {
       transactions.push(transaction);
     }
 
-    return Promise.mapSeries(transactions, t => Transaction.create(t)).then(results => results[index]);
+    return Promise.mapSeries(transactions, t => Transaction.create(t, opts)).then(results => results[index]);
   };
 
-  Transaction.createFeesOnTopTransaction = async ({ transaction }) => {
+  /**
+   * Record a debt transaction and its associated settlement
+   */
+  Transaction.createPlatformTipDebtTransactions = async (tipCreditTransactionData, host) => {
+    if (tipCreditTransactionData.type === 'DEBIT') {
+      throw new Error('createPlatformTipDebtTransactions must be given a CREDIT');
+    }
+
+    const hostToPlatformFxRate = tipCreditTransactionData.data?.hostToPlatformFxRate || 1;
+    const amountInHostCurrency = Math.round(
+      tipCreditTransactionData.netAmountInCollectiveCurrency / hostToPlatformFxRate,
+    );
+
+    // Create debt transaction
+    const debtTransactionData = {
+      ...omit(tipCreditTransactionData, ['id', 'uuid', 'PaymentMethodId', 'data']), // TODO: We may want to remove the OrderId here
+      type: 'CREDIT',
+      description: 'Platform Tip collected for Open Collective',
+      amountInHostCurrency,
+      amount: amountInHostCurrency,
+      netAmountInCollectiveCurrency: amountInHostCurrency,
+      currency: host.currency,
+      hostCurrency: host.currency,
+      data: { hostToPlatformFxRate },
+      CollectiveId: host.id,
+      FromCollectiveId: PLATFORM_TIP_TRANSACTION_PROPERTIES.CollectiveId,
+      HostCollectiveId: host.id,
+      kind: TransactionKind.PLATFORM_TIP,
+      isDebt: true,
+    };
+
+    const debtTransaction = await Transaction.createDoubleEntry(debtTransactionData);
+
+    // Create settlement
+    const settlementStatus = TransactionSettlementStatus.OWED;
+    await models.TransactionSettlement.createForTransaction(debtTransaction, settlementStatus);
+
+    return debtTransaction;
+  };
+
+  /**
+   * Creates platform tip transactions from a given transaction.
+   * @param {Transaction} The actual transaction
+   * @param {models.Collective} The host
+   * @param {boolean} Whether tip has been collected already (no debt needed)
+   */
+  Transaction.createPlatformTipTransactions = async (transaction, host, isDirectlyCollected = false) => {
     if (!transaction.data?.isFeesOnTop) {
       throw new Error('This transaction does not have fees on top');
     } else if (!transaction.platformFeeInHostCurrency) {
@@ -571,19 +634,20 @@ function defineModel() {
 
     // Calculate the paymentProcessorFee proportional to the feeOnTop amount
     const feeOnTopPercent = Math.abs(transaction.platformFeeInHostCurrency / transaction.amountInHostCurrency);
-    const feeOnTopPaymentProcessorFee = toNegative(
-      Math.round(transaction.paymentProcessorFeeInHostCurrency * feeOnTopPercent),
-    );
-    const platformCurrencyFxRate = await getFxRate(transaction.currency, FEES_ON_TOP_TRANSACTION_PROPERTIES.currency);
-    const donationTransaction = defaultsDeep(
+    const feeOnTopPaymentProcessorFee = host?.data?.reimbursePaymentProcessorFeeOnTips
+      ? toNegative(Math.round(transaction.paymentProcessorFeeInHostCurrency * feeOnTopPercent))
+      : 0;
+    const platformCurrencyFxRate = await getFxRate(transaction.currency, PLATFORM_TIP_TRANSACTION_PROPERTIES.currency);
+    const platformTipTransactionData = defaultsDeep(
       {},
-      FEES_ON_TOP_TRANSACTION_PROPERTIES,
+      PLATFORM_TIP_TRANSACTION_PROPERTIES,
       {
         description: 'Financial contribution to Open Collective',
         amount: Math.round(Math.abs(transaction.platformFeeInHostCurrency) * platformCurrencyFxRate),
         amountInHostCurrency: Math.round(Math.abs(transaction.platformFeeInHostCurrency) * platformCurrencyFxRate),
         platformFeeInHostCurrency: 0,
         hostFeeInHostCurrency: 0,
+        kind: TransactionKind.PLATFORM_TIP,
         // Represent the paymentProcessorFee in USD
         paymentProcessorFeeInHostCurrency: Math.round(feeOnTopPaymentProcessorFee * platformCurrencyFxRate),
         // Calculate the netAmount by deducting the proportional paymentProcessorFee
@@ -592,9 +656,10 @@ function defineModel() {
         ),
         // This is always 1 because OpenCollective and OpenCollective Inc (Host) are in USD.
         hostCurrencyFxRate: 1,
-        PlatformTipForTransactionGroup: transaction.TransactionGroup,
+        TransactionGroup: transaction.TransactionGroup,
+        isDebt: false,
         data: {
-          hostToPlatformFxRate: await getFxRate(transaction.hostCurrency, FEES_ON_TOP_TRANSACTION_PROPERTIES.currency),
+          hostToPlatformFxRate: await getFxRate(transaction.hostCurrency, PLATFORM_TIP_TRANSACTION_PROPERTIES.currency),
           feeOnTopPaymentProcessorFee,
           settled: transaction.data?.settled,
         },
@@ -602,7 +667,14 @@ function defineModel() {
       transaction,
     );
 
-    await Transaction.createDoubleEntry(donationTransaction);
+    const platformTipTransaction = await Transaction.createDoubleEntry(platformTipTransactionData);
+    let platformTipDebtTransaction;
+    if (!isDirectlyCollected) {
+      platformTipDebtTransaction = await Transaction.createPlatformTipDebtTransactions(
+        platformTipTransactionData,
+        host,
+      );
+    }
 
     // Deduct the paymentProcessorFee we considered part of the feeOnTop donation
     transaction.paymentProcessorFeeInHostCurrency =
@@ -615,22 +687,24 @@ function defineModel() {
     // Reset the platformFee because we're accounting for this value in a separate set of transactions
     transaction.platformFeeInHostCurrency = 0;
 
-    return transaction;
+    return { transaction, platformTipTransaction, platformTipDebtTransaction };
   };
 
-  Transaction.createFromPayload = async ({
-    CreatedByUserId,
-    FromCollectiveId,
-    CollectiveId,
-    transaction,
-    PaymentMethodId,
-  }) => {
+  /**
+   * Creates a transaction pair from given payload. Defaults to `CONTRIBUTION` kind unless
+   * specified otherwise.
+   */
+  Transaction.createFromPayload = async (
+    { CreatedByUserId, FromCollectiveId, CollectiveId, transaction, PaymentMethodId },
+    opts = { isPlatformTipDirectlyCollected: false },
+  ) => {
     if (!transaction.amount) {
       throw new Error('transaction.amount cannot be null or zero');
     }
 
     const collective = await models.Collective.findByPk(CollectiveId);
-    const HostCollectiveId = collective.isHostAccount ? collective.id : await collective.getHostCollectiveId();
+    const host = await collective.getHostCollective();
+    const HostCollectiveId = collective.isHostAccount ? collective.id : host.id;
     if (!HostCollectiveId && !transaction.HostCollectiveId) {
       throw new Error(`Cannot create a transaction: collective id ${CollectiveId} doesn't have a host`);
     }
@@ -650,9 +724,16 @@ function defineModel() {
     transaction.taxAmount = toNegative(transaction.taxAmount);
     transaction.paymentProcessorFeeInHostCurrency = toNegative(transaction.paymentProcessorFeeInHostCurrency);
 
+    // TODO: createFromPayload is only used by payment methods, for contributions. So it sounds right to do
+    // that here, but we should probably rename the function to something clearer (createFromContributionPayload?)
+    transaction.kind = isUndefined(transaction.kind) ? TransactionKind.CONTRIBUTION : transaction.kind;
+
     // Separate donation transaction and remove platformFee from the main transaction
     if (transaction.data?.isFeesOnTop && transaction.platformFeeInHostCurrency) {
-      transaction = await Transaction.createFeesOnTopTransaction({ transaction });
+      const isTipAlreadyCollected = Boolean(opts?.isPlatformTipDirectlyCollected);
+      const result = await Transaction.createPlatformTipTransactions(transaction, host, isTipAlreadyCollected);
+      // Transaction was modified by createPlatformTipTransactions, we get it from the result
+      transaction = result.transaction;
     }
 
     // populate netAmountInCollectiveCurrency for financial contributions
@@ -664,7 +745,7 @@ function defineModel() {
     return Transaction.createDoubleEntry(transaction);
   };
 
-  Transaction.createActivity = transaction => {
+  Transaction.createActivity = (transaction, options) => {
     if (transaction.deletedAt) {
       return Promise.resolve();
     }
@@ -676,6 +757,7 @@ function defineModel() {
           { model: models.User, as: 'createdByUser' },
           { model: models.PaymentMethod },
         ],
+        transaction: options.transaction,
       })
         // Create activity.
         .then(transaction => {
@@ -697,7 +779,7 @@ function defineModel() {
           if (transaction.PaymentMethod) {
             activityPayload.data.paymentMethod = transaction.PaymentMethod.info;
           }
-          return models.Activity.create(activityPayload);
+          return models.Activity.create(activityPayload, { transaction: options.transaction });
         })
         .catch(err =>
           console.error(
@@ -715,6 +797,7 @@ function defineModel() {
     const platformFee = calcFee(order.totalAmount, platformFeePercent);
     const payload = {
       type: 'CREDIT',
+      kind: TransactionKind.ADDED_FUNDS,
       amount,
       description: order.description,
       currency: order.currency,
@@ -753,6 +836,21 @@ function defineModel() {
   Transaction.getFxRate = async function (fromCurrency, toCurrency, transaction) {
     if (fromCurrency === toCurrency) {
       return 1;
+    }
+
+    // For platform tips, we store the FX rate of the host<>currency
+    // TODO: The thingy below is useful for the migration of platform tips with debts, but
+    // we should ideally not rely on `data?.hostToPlatformFxRate` for that
+    if (transaction.data?.hostToPlatformFxRate) {
+      if (
+        toCurrency === PLATFORM_TIP_TRANSACTION_PROPERTIES.currency &&
+        fromCurrency === transaction.hostCurrency &&
+        transaction.type === 'CREDIT' &&
+        transaction.kind === 'PLATFORM_TIP' &&
+        transaction.FromCollectiveId === PLATFORM_TIP_TRANSACTION_PROPERTIES.CollectiveId
+      ) {
+        return transaction.data.hostToPlatformFxRate;
+      }
     }
 
     // If Stripe transaction, we check if we have the rate stored locally
@@ -823,13 +921,13 @@ function defineModel() {
   Transaction.validate = async (transaction, { validateOppositeTransaction = true } = {}) => {
     // Skip as there is a known bug there
     // https://github.com/opencollective/opencollective/issues/3935
-    if (transaction.PlatformTipForTransactionGroup) {
+    if (transaction.kind === TransactionKind.PLATFORM_TIP) {
       return;
     }
 
     // Skip as there is a known bug there
     // https://github.com/opencollective/opencollective/issues/3934
-    if (transaction.PlatformTipForTransactionGroup && transaction.taxAmount) {
+    if (transaction.kind === TransactionKind.PLATFORM_TIP && transaction.taxAmount) {
       return;
     }
 

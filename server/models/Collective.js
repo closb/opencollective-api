@@ -18,7 +18,6 @@ import {
   sum,
   sumBy,
   trim,
-  uniqBy,
   unset,
 } from 'lodash';
 import moment from 'moment';
@@ -29,14 +28,15 @@ import { v4 as uuid } from 'uuid';
 import { isISO31661Alpha2 } from 'validator';
 
 import activities from '../constants/activities';
-import { types } from '../constants/collectives';
+import { CollectiveTypesList, types } from '../constants/collectives';
 import expenseStatus from '../constants/expense_status';
 import expenseTypes from '../constants/expense_type';
 import FEATURE from '../constants/feature';
 import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE } from '../constants/paymentMethods';
-import plans, { PLANS_COLLECTIVE_SLUG } from '../constants/plans';
+import plans from '../constants/plans';
 import roles, { MemberRoleLabels } from '../constants/roles';
-import { FEES_ON_TOP_TRANSACTION_PROPERTIES, TransactionTypes } from '../constants/transactions';
+import { TransactionKind } from '../constants/transaction-kind';
+import { PLATFORM_TIP_TRANSACTION_PROPERTIES, TransactionTypes } from '../constants/transactions';
 import { hasOptedOutOfFeature, isFeatureAllowedForCollectiveType } from '../lib/allowed-features';
 import {
   getBalanceAmount,
@@ -46,9 +46,9 @@ import {
   getTotalNetAmountReceivedAmount,
   getYearlyIncome,
 } from '../lib/budget';
-import cache, { purgeCacheForCollective } from '../lib/cache';
+import { purgeCacheForCollective } from '../lib/cache';
 import {
-  collectiveSlugReservedlist,
+  collectiveSlugReservedList,
   filterCollectiveSettings,
   getCollectiveAvatarUrl,
   isCollectiveSlugReserved,
@@ -58,14 +58,13 @@ import { invalidateContributorsCache } from '../lib/contributors';
 import { getFxRate } from '../lib/currency';
 import emailLib from '../lib/email';
 import logger from '../lib/logger';
-import { handleHostCollectivesLimit } from '../lib/plans';
 import queries from '../lib/queries';
 import { buildSanitizerOptions, sanitizeHTML } from '../lib/sanitize-html';
 import sequelize, { DataTypes, Op, Sequelize } from '../lib/sequelize';
 import { collectiveSpamCheck, notifyTeamAboutSuspiciousCollective } from '../lib/spam';
 import { canUseFeature } from '../lib/user-permissions';
 import userlib from '../lib/userlib';
-import { capitalize, cleanTags, flattenArray, formatCurrency, getDomain, md5, sumByWhen } from '../lib/utils';
+import { capitalize, cleanTags, formatCurrency, getDomain, md5, sumByWhen } from '../lib/utils';
 
 import CustomDataTypes from './DataTypes';
 import { PayoutMethodTypes } from './PayoutMethod';
@@ -99,8 +98,6 @@ const defaultTiers = currency => {
   ];
 };
 
-const validTypes = ['USER', 'COLLECTIVE', 'ORGANIZATION', 'EVENT', 'PROJECT', 'FUND', 'BOT'];
-
 const policiesSanitizeOptions = buildSanitizerOptions({
   basicTextFormatting: true,
   multilineTextFormatting: true,
@@ -133,8 +130,8 @@ function defineModel() {
         defaultValue: 'COLLECTIVE',
         validate: {
           isIn: {
-            args: [validTypes],
-            msg: `Must be one of: ${validTypes}`,
+            args: [CollectiveTypesList],
+            msg: `Must be one of: ${CollectiveTypesList}`,
           },
         },
       },
@@ -152,7 +149,7 @@ function defineModel() {
           len: [1, 255],
           isLowercase: true,
           notIn: {
-            args: [collectiveSlugReservedlist],
+            args: [collectiveSlugReservedList],
             msg: 'The slug given for this collective is a reserved keyword',
           },
           isValid(value) {
@@ -300,14 +297,6 @@ function defineModel() {
         },
         get() {
           return this.getDataValue('backgroundImage');
-        },
-      },
-
-      // Max quantity of tickets across all tiers
-      maxQuantity: {
-        type: DataTypes.INTEGER,
-        validate: {
-          min: 0,
         },
       },
 
@@ -468,11 +457,6 @@ function defineModel() {
         },
       },
 
-      isSupercollective: {
-        type: DataTypes.BOOLEAN,
-        defaultValue: false,
-      },
-
       monthlySpending: {
         type: new DataTypes.VIRTUAL(DataTypes.INTEGER),
       },
@@ -533,9 +517,9 @@ function defineModel() {
             longDescription: this.longDescription,
             currency: this.currency,
             image: this.image,
+            previewImage: this.previewImage,
             data: this.data,
             backgroundImage: this.backgroundImage,
-            maxQuantity: this.maxQuantity,
             locationName: this.locationName,
             address: this.address,
             geoLocationLatLong: this.geoLocationLatLong,
@@ -558,7 +542,6 @@ function defineModel() {
             platformFeePercent: this.platformFeePercent,
             tags: this.tags,
             HostCollectiveId: this.HostCollectiveId,
-            isSupercollective: this.isSupercollective,
           };
         },
         card() {
@@ -602,7 +585,6 @@ function defineModel() {
             twitterHandle: this.twitterHandle,
             githubHandle: this.githubHandle,
             publicUrl: this.publicUrl,
-            isSupercollective: this.isSupercollective,
           };
         },
         activity() {
@@ -846,21 +828,21 @@ function defineModel() {
   };
 
   // If no image has been provided, try to find an image using clearbit and save it
-  Collective.prototype.findImage = function () {
+  Collective.prototype.findImage = function (force = false) {
     if (this.getDataValue('image')) {
       return;
     }
 
     if (this.type === 'ORGANIZATION' && this.website && !this.website.match(/^https:\/\/twitter\.com\//)) {
       const image = `https://logo.clearbit.com/${getDomain(this.website)}`;
-      return this.checkAndUpdateImage(image);
+      return this.checkAndUpdateImage(image, force);
     }
 
     return Promise.resolve();
   };
 
   // If no image has been provided, try to find an image using gravatar and save it
-  Collective.prototype.findImageForUser = function (user) {
+  Collective.prototype.findImageForUser = function (user, force = false) {
     if (this.getDataValue('image')) {
       return;
     }
@@ -869,7 +851,7 @@ function defineModel() {
       if (user && user.email && this.name && this.name !== 'incognito') {
         const emailHash = md5(user.email.toLowerCase().trim());
         const avatar = `https://www.gravatar.com/avatar/${emailHash}?default=404`;
-        return this.checkAndUpdateImage(avatar);
+        return this.checkAndUpdateImage(avatar, force);
       }
     }
 
@@ -877,19 +859,21 @@ function defineModel() {
   };
 
   // Save image it if it returns 200
-  Collective.prototype.checkAndUpdateImage = async function (image) {
-    try {
-      const response = await fetch(image);
-      if (response.status !== 200) {
-        throw new Error(`status=${response.status}`);
+  Collective.prototype.checkAndUpdateImage = async function (image, force = false) {
+    if (force || !['e2e', 'ci', 'test'].includes(process.env.OC_ENV)) {
+      try {
+        const response = await fetch(image);
+        if (response.status !== 200) {
+          throw new Error(`status=${response.status}`);
+        }
+        const body = await response.text();
+        if (body.length === 0) {
+          throw new Error(`length=0`);
+        }
+        return this.update({ image });
+      } catch (err) {
+        logger.info(`collective.checkAndUpdateImage: Unable to fetch ${image} (${err.message})`);
       }
-      const body = await response.text();
-      if (body.length === 0) {
-        throw new Error(`length=0`);
-      }
-      return this.update({ image });
-    } catch (err) {
-      logger.info(`collective.checkAndUpdateImage: Unable to fetch ${image} (${err.message})`);
     }
   };
 
@@ -1118,39 +1102,12 @@ function defineModel() {
   };
 
   // Returns the User model of the User that created this collective
-  Collective.prototype.getUser = function (queryParams) {
-    switch (this.type) {
-      case types.USER:
-      case types.ORGANIZATION:
-        return models.User.findByPk(this.CreatedByUserId, queryParams);
-      default:
-        return Promise.resolve(null);
+  Collective.prototype.getUser = async function (queryParams) {
+    if (this.type === types.USER) {
+      return models.User.findOne({ where: { CollectiveId: this.id }, ...queryParams });
+    } else {
+      return null;
     }
-  };
-
-  /**
-   * Returns all the users of a collective (admins, members, backers, followers, attendees, ...)
-   * including all the admins of the organizations that are members/backers of this collective
-   */
-  Collective.prototype.getUsers = async function () {
-    debug('getUsers for ', this.id);
-    const memberships = await models.Member.findAll({
-      where: { CollectiveId: this.id },
-      include: [{ model: models.Collective, as: 'memberCollective', required: true }],
-    });
-    debug('>>> members found', memberships.length);
-    const memberCollectives = memberships.map(membership => membership.memberCollective);
-    const users = await Promise.map(memberCollectives, memberCollective => {
-      debug('>>> fetching user for', memberCollective.slug, memberCollective.type);
-      if (memberCollective.type === types.USER) {
-        return memberCollective.getUser().then(user => [user]);
-      } else {
-        debug('User', memberCollective.slug, 'type: ', memberCollective.type);
-        return memberCollective.getAdminUsers();
-      }
-    });
-    const usersFlattened = flattenArray(users);
-    return uniqBy(usersFlattened, 'id');
   };
 
   Collective.prototype.getAdmins = async function () {
@@ -1316,7 +1273,7 @@ function defineModel() {
       ],
     });
 
-    orders = Promise.map(orders, async order => {
+    orders = await Promise.map(orders, async order => {
       order.totalTransactions = await order.getTotalTransactions();
       return order;
     });
@@ -1585,7 +1542,7 @@ function defineModel() {
       case roles.MEMBER:
       case roles.ACCOUNTANT:
       case roles.ADMIN:
-        if (![types.FUND, types.PROJECT].includes(this.type)) {
+        if (![types.FUND, types.PROJECT, types.EVENT].includes(this.type)) {
           await this.sendNewMemberEmail(user, role, member, sequelizeParams);
         }
         break;
@@ -1656,7 +1613,10 @@ function defineModel() {
     }
 
     // We only send the notification for new member for role MEMBER and ADMIN
-    const template = `${this.type.toLowerCase()}.newmember`;
+    const supportedTemplates = ['collective', 'organization'];
+    const lowercaseType = this.type.toLowerCase();
+    const typeForTemplate = supportedTemplates.includes(lowercaseType) ? lowercaseType : 'collective';
+    const template = `${typeForTemplate}.newmember`;
     return emailLib.send(
       template,
       memberUser.email,
@@ -1670,7 +1630,7 @@ function defineModel() {
         collective: {
           slug: this.slug,
           name: this.name,
-          type: this.type.toLowerCase(),
+          type: lowercaseType,
         },
         recipient: {
           collective: memberUser.collective.activity,
@@ -1914,11 +1874,6 @@ function defineModel() {
   Collective.prototype.addHost = async function (hostCollective, creatorUser, options) {
     if (this.HostCollectiveId) {
       throw new Error(`This collective already has a host (HostCollectiveId: ${this.HostCollectiveId})`);
-    }
-
-    if (this.type === types.COLLECTIVE) {
-      // Check limits
-      await handleHostCollectivesLimit(hostCollective, { throwException: true, notifyAdmins: true });
     }
 
     const member = {
@@ -2952,38 +2907,20 @@ function defineModel() {
   };
 
   Collective.prototype.getPlan = async function () {
-    const cacheKey = `plan_${this.id}`;
-    const fromCache = await cache.get(cacheKey);
-    if (fromCache) {
-      return fromCache;
-    }
-
-    const [hostedCollectives, addedFunds, bankTransfers, transferwisePayouts] = await Promise.all([
-      this.getHostedCollectivesCount(),
-      this.getTotalAddedFunds(),
-      this.getTotalBankTransfers(),
-      this.getTotalTransferwisePayouts(),
-    ]);
-
     if (this.plan) {
-      const tier = await models.Tier.findOne({
-        where: { slug: this.plan, deletedAt: null },
-        include: [{ model: models.Collective, where: { slug: PLANS_COLLECTIVE_SLUG } }],
-      });
-      const planData = (tier && tier.data) || plans[this.plan];
+      const planData = plans[this.plan];
       if (planData) {
         const extraPlanData = get(this.data, 'plan', {});
         const plan = {
           id: this.id,
           name: this.plan,
-          hostedCollectives,
-          addedFunds,
-          bankTransfers,
-          transferwisePayouts,
+          hostedCollectives: 0,
+          addedFunds: 0,
+          bankTransfers: 0,
+          transferwisePayouts: 0,
           ...planData,
           ...extraPlanData,
         };
-        await cache.set(cacheKey, plan, 5 * 60 /* 5 minutes */);
         return plan;
       }
     }
@@ -2991,13 +2928,13 @@ function defineModel() {
     const plan = {
       id: this.id,
       name: 'default',
-      hostedCollectives,
-      addedFunds,
-      bankTransfers,
-      transferwisePayouts,
+      hostedCollectives: 0,
+      addedFunds: 0,
+      bankTransfers: 0,
+      transferwisePayouts: 0,
       ...plans.default,
     };
-    await cache.set(cacheKey, plan, 5 * 60 /* 5 minutes */);
+
     return plan;
   };
 
@@ -3061,10 +2998,11 @@ function defineModel() {
 
     const tipsTransactions = await models.Transaction.findAll({
       where: {
-        ...pick(FEES_ON_TOP_TRANSACTION_PROPERTIES, ['CollectiveId', 'HostCollectiveId']),
+        ...pick(PLATFORM_TIP_TRANSACTION_PROPERTIES, ['CollectiveId', 'HostCollectiveId']),
         createdAt: { [Op.gte]: from, [Op.lt]: to },
         type: TransactionTypes.CREDIT,
-        PlatformTipForTransactionGroup: { [Op.in]: transactions.map(t => t.TransactionGroup) },
+        TransactionGroup: { [Op.in]: transactions.map(t => t.TransactionGroup) },
+        kind: TransactionKind.PLATFORM_TIP,
       },
       include: [
         {
@@ -3280,30 +3218,6 @@ function defineModel() {
           collectives: allCollectives,
         }));
       });
-  };
-
-  Collective.associate = m => {
-    Collective.hasMany(m.ConnectedAccount);
-    Collective.belongsToMany(m.Collective, {
-      through: {
-        model: m.Member,
-        unique: false,
-        foreignKey: 'MemberCollectiveId',
-      },
-      as: 'memberCollectives',
-    });
-    Collective.belongsToMany(m.Collective, {
-      through: { model: m.Member, unique: false, foreignKey: 'CollectiveId' },
-      as: 'memberOfCollectives',
-    });
-    Collective.hasMany(m.Member);
-    Collective.hasMany(m.Activity);
-    Collective.hasMany(m.Notification);
-    Collective.hasMany(m.Tier, { as: 'tiers' });
-    Collective.hasMany(m.LegalDocument);
-    Collective.hasMany(m.RequiredLegalDocument, { foreignKey: 'HostCollectiveId' });
-    Collective.hasMany(m.Collective, { as: 'hostedCollectives', foreignKey: 'HostCollectiveId' });
-    Collective.belongsTo(m.Collective, { as: 'HostCollective' });
   };
 
   Temporal(Collective, sequelize);

@@ -74,13 +74,17 @@ export const TransferWise = new GraphQLObjectType({
       args: {
         ignoreBlockedCurrencies: {
           type: GraphQLBoolean,
-          description: 'Ignores blocklisted currencies, used to generate the bank information form for manual payments',
+          description: 'Ignores blocked currencies, used to generate the bank information form for manual payments',
         },
       },
       type: new GraphQLList(GraphQLJSONObject),
       async resolve(host, args) {
         if (host) {
-          return await transferwise.getAvailableCurrencies(host, args?.ignoreBlockedCurrencies);
+          try {
+            return await transferwise.getAvailableCurrencies(host, args?.ignoreBlockedCurrencies);
+          } catch (_) {
+            return [];
+          }
         } else {
           return null;
         }

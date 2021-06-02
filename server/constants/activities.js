@@ -20,15 +20,18 @@ export default {
   COLLECTIVE_EXPENSE_UNAPPROVED: 'collective.expense.unapproved',
   COLLECTIVE_EXPENSE_PAID: 'collective.expense.paid',
   COLLECTIVE_EXPENSE_MARKED_AS_UNPAID: 'collective.expense.unpaid',
+  COLLECTIVE_EXPENSE_MARKED_AS_SPAM: 'collective.expense.spam',
   COLLECTIVE_EXPENSE_PROCESSING: 'collective.expense.processing',
   COLLECTIVE_EXPENSE_SCHEDULED_FOR_PAYMENT: 'collective.expense.scheduledForPayment',
   COLLECTIVE_EXPENSE_ERROR: 'collective.expense.error',
   COLLECTIVE_EXPENSE_INVITE_DRAFTED: 'collective.expense.invite.drafted',
+  COLLECTIVE_EXPENSE_MISSING_RECEIPT: 'collective.expense.missing.receipt',
   COLLECTIVE_MEMBER_CREATED: 'collective.member.created',
   COLLECTIVE_TRANSACTION_CREATED: 'collective.transaction.created',
   COLLECTIVE_UPDATE_CREATED: 'collective.update.created',
   COLLECTIVE_UPDATE_PUBLISHED: 'collective.update.published',
   COLLECTIVE_CONTACT: 'collective.contact',
+  COLLECTIVE_VIRTUAL_CARD_ASSIGNED: 'collective.virtualcard.assigned',
   ORGANIZATION_COLLECTIVE_CREATED: 'organization.collective.created',
   SUBSCRIPTION_ACTIVATED: 'subscription.activated',
   SUBSCRIPTION_CONFIRMED: 'subscription.confirmed',
@@ -43,6 +46,7 @@ export default {
   ADDED_FUND_TO_ORG: 'added.fund.to.org',
   ACTIVATED_COLLECTIVE_AS_HOST: 'activated.collective.as.host',
   DEACTIVATED_COLLECTIVE_AS_HOST: 'deactivated.collective.as.host',
+  VIRTUAL_CARD_REQUESTED: 'virtual_card.requested',
 
   // Not used anymore, leaving for historical reference
   COLLECTIVE_TRANSACTION_PAID: 'collective.transaction.paid', // replaced with COLLECTIVE_EXPENSE_PAID

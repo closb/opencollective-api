@@ -3,6 +3,7 @@ import { createContext } from 'dataloader-sequelize';
 import { get, groupBy } from 'lodash';
 import moment from 'moment';
 
+import orderStatus from '../../constants/order_status';
 import { TransactionTypes } from '../../constants/transactions';
 import { getListOfAccessibleMembers } from '../../lib/auth';
 import { getBalances, getBalancesWithBlockedFunds } from '../../lib/budget';
@@ -15,6 +16,7 @@ import * as expenseLoaders from './expenses';
 import { createDataLoaderWithOptions, sortResults } from './helpers';
 import { generateCollectivePayoutMethodsLoader, generateCollectivePaypalPayoutMethodsLoader } from './payout-method';
 import { generateCanSeeUserPrivateInfoLoader } from './user';
+import { generateCollectiveVirtualCardLoader, generateHostCollectiveVirtualCardLoader } from './virtual-card';
 
 export const loaders = req => {
   const cache = {};
@@ -45,6 +47,10 @@ export const loaders = req => {
   context.loaders.PayoutMethod.paypalByCollectiveId = generateCollectivePaypalPayoutMethodsLoader(req, cache);
   context.loaders.PayoutMethod.byCollectiveId = generateCollectivePayoutMethodsLoader(req, cache);
 
+  // Virtual Card
+  context.loaders.VirtualCard.byCollectiveId = generateCollectiveVirtualCardLoader(req, cache);
+  context.loaders.VirtualCard.byHostCollectiveId = generateHostCollectiveVirtualCardLoader(req, cache);
+
   // User
   context.loaders.User.canSeeUserPrivateInfo = generateCanSeeUserPrivateInfoLoader(req, cache);
 
@@ -52,6 +58,20 @@ export const loaders = req => {
 
   // Collective - by UserId
   context.loaders.Collective.byUserId = collectiveLoaders.byUserId(req, cache);
+
+  // Collective - Host
+  context.loaders.Collective.host = new DataLoader(ids =>
+    models.Collective.findAll({
+      where: { id: { [Op.in]: ids } },
+      include: [{ model: models.Collective, as: 'host' }],
+    }).then(results => {
+      const resultsById = {};
+      for (const result of results) {
+        resultsById[result.id] = result.host;
+      }
+      return ids.map(id => resultsById[id] || null);
+    }),
+  );
 
   // Collective - Balance
   context.loaders.Collective.balance = new DataLoader(ids =>
@@ -244,13 +264,16 @@ export const loaders = req => {
         `
           SELECT t.id, (t."maxQuantity" - COALESCE(SUM(o.quantity), 0)) AS "availableQuantity"
           FROM "Tiers" t
-          LEFT JOIN "Orders" o ON o."TierId" = t.id AND o."processedAt" IS NOT NULL
+          LEFT JOIN "Orders" o ON o."TierId" = t.id AND o."processedAt" IS NOT NULL AND o."status" NOT IN (?)
           WHERE t.id IN (?)
           AND t."maxQuantity" IS NOT NULL
           GROUP BY t.id
         `,
         {
-          replacements: [tierIds],
+          replacements: [
+            [orderStatus.ERROR, orderStatus.CANCELLED, orderStatus.EXPIRED, orderStatus.REJECTED],
+            tierIds,
+          ],
           type: sequelize.QueryTypes.SELECT,
         },
       )
@@ -375,6 +398,36 @@ export const loaders = req => {
       )
       .then(results => sortResults(ids, results, 'TierId').map(result => (result ? result.total : 0))),
   );
+
+  // Tier - totalRecurringDonations
+  context.loaders.Tier.totalRecurringDonations = new DataLoader(ids => {
+    return sequelize
+      .query(
+        `
+          SELECT o."TierId" AS "TierId",
+          COALESCE(
+            SUM(
+              CASE
+                WHEN s."interval" = 'year'
+                  THEN s."amount"/12
+                ELSE s."amount"
+              END
+            ), 0)
+          AS "total"
+          FROM "Orders" o
+          INNER JOIN "Subscriptions" s ON o."SubscriptionId" = s.id
+          WHERE "TierId" IN (?)
+          AND s."isActive" = TRUE
+          AND s."interval" IN ('year', 'month')
+          GROUP BY "TierId";
+      `,
+        {
+          replacements: [ids],
+          type: sequelize.QueryTypes.SELECT,
+        },
+      )
+      .then(results => sortResults(ids, results, 'TierId').map(result => (result ? result.total : 0)));
+  });
 
   // Tier - contributorsStats
   context.loaders.Tier.contributorsStats = new DataLoader(tiersIds =>

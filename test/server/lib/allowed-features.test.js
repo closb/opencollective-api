@@ -35,7 +35,7 @@ describe('server/lib/allowed-features', () => {
       expect(isFeatureAllowedForCollectiveType('PROJECT', FEATURE.EVENTS)).to.be.false;
     });
     it('PROJECTS', () => {
-      expect(isFeatureAllowedForCollectiveType('COLLECTIVE', FEATURE.PROJECTS)).to.be.false;
+      expect(isFeatureAllowedForCollectiveType('COLLECTIVE', FEATURE.PROJECTS)).to.be.true;
       expect(isFeatureAllowedForCollectiveType('ORGANIZATION', FEATURE.PROJECTS)).to.be.false;
       expect(isFeatureAllowedForCollectiveType('ORGANIZATION', FEATURE.PROJECTS, true)).to.be.false;
       expect(isFeatureAllowedForCollectiveType('USER', FEATURE.PROJECTS)).to.be.false;
@@ -86,9 +86,9 @@ describe('server/lib/allowed-features', () => {
       expect(isFeatureAllowedForCollectiveType('ORGANIZATION', FEATURE.UPDATES)).to.be.false;
       expect(isFeatureAllowedForCollectiveType('ORGANIZATION', FEATURE.UPDATES, true)).to.be.true;
       expect(isFeatureAllowedForCollectiveType('USER', FEATURE.UPDATES)).to.be.false;
-      expect(isFeatureAllowedForCollectiveType('EVENT', FEATURE.UPDATES)).to.be.false;
+      expect(isFeatureAllowedForCollectiveType('EVENT', FEATURE.UPDATES)).to.be.true;
       expect(isFeatureAllowedForCollectiveType('FUND', FEATURE.UPDATES)).to.be.true;
-      expect(isFeatureAllowedForCollectiveType('PROJECT', FEATURE.UPDATES)).to.be.false;
+      expect(isFeatureAllowedForCollectiveType('PROJECT', FEATURE.UPDATES)).to.be.true;
     });
     it('CONVERSATIONS', () => {
       expect(isFeatureAllowedForCollectiveType('COLLECTIVE', FEATURE.CONVERSATIONS)).to.be.true;

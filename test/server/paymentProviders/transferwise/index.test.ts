@@ -12,13 +12,32 @@ describe('server/paymentProviders/transferwise/index', () => {
   const sandbox = sinon.createSandbox();
   const quote = {
     id: 1234,
-    source: 'USD',
-    target: 'EUR',
+    sourceCurrency: 'USD',
+    targetCurrency: 'EUR',
     sourceAmount: 101.14,
     targetAmount: 90.44,
     rate: 0.9044,
-    fee: 1.14,
+    payOut: 'BANK_TRANSFER',
+    paymentOptions: [
+      {
+        formattedEstimatedDelivery: 'by March 18th',
+        estimatedDeliveryDelays: [],
+        allowedProfileTypes: ['PERSONAL', 'BUSINESS'],
+        payInProduct: 'BALANCE',
+        feePercentage: 0.0038,
+        estimatedDelivery: '2021-03-18T12:45:00Z',
+        fee: { transferwise: 3.79, payIn: 0, discount: 0, total: 3.79, priceSetId: 134, partner: 0 },
+        payIn: 'BALANCE',
+        sourceAmount: 101.14,
+        targetAmount: 90.44,
+        sourceCurrency: 'USD',
+        targetCurrency: 'EUR',
+        payOut: 'BANK_TRANSFER',
+        disabled: false,
+      },
+    ],
   };
+
   let createQuote,
     createRecipientAccount,
     createTransfer,
@@ -72,6 +91,9 @@ describe('server/paymentProviders/transferwise/index', () => {
             { currencyCode: 'EUR', minInvoiceAmount: 1 },
             { currencyCode: 'GBP', minInvoiceAmount: 1 },
             { currencyCode: 'BRL', minInvoiceAmount: 1 },
+            { currencyCode: 'INR', minInvoiceAmount: 1 },
+            { currencyCode: 'PKR', minInvoiceAmount: 1 },
+            { currencyCode: 'BTC', minInvoiceAmount: 1 },
           ],
         },
       ],
@@ -88,7 +110,14 @@ describe('server/paymentProviders/transferwise/index', () => {
       CollectiveId: host.id,
       service: 'transferwise',
       token: 'fake-token',
-      data: { type: 'business', id: 0 },
+      data: {
+        type: 'business',
+        id: 0,
+        details: {
+          companyType: 'NON_PROFIT_CORPORATION',
+        },
+        blockedCurrencies: ['BTC'],
+      },
     });
     collective = await fakeCollective({ isHostAccount: false, HostCollectiveId: host.id });
     payoutMethod = await fakePayoutMethod({
@@ -245,6 +274,15 @@ describe('server/paymentProviders/transferwise/index', () => {
 
     it('should block currencies for business accounts by default', async () => {
       expect(data).to.not.deep.include({ code: 'BRL', minInvoiceAmount: 1 });
+      expect(data).to.not.deep.include({ code: 'PKR', minInvoiceAmount: 1 });
+    });
+
+    it('should block currencies for non-profit accounts', async () => {
+      expect(data).to.not.deep.include({ code: 'INR', minInvoiceAmount: 1 });
+    });
+
+    it('should block currencies specified in connectedAccount.data.blockedCurrencies', async () => {
+      expect(data).to.not.deep.include({ code: 'BTC', minInvoiceAmount: 1 });
     });
 
     it('should return blocked currencies if explicitly requested', async () => {

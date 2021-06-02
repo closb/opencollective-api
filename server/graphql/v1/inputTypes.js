@@ -169,6 +169,7 @@ export const CollectiveInputType = new GraphQLInputObjectType({
     tiers: { type: new GraphQLList(TierInputType) },
     settings: { type: GraphQLJSON },
     data: { type: GraphQLJSON, deprecationReason: '2020-10-08: data cannot be edited. This field will be ignored.' },
+    privateInstructions: { type: GraphQLString, description: 'Private instructions related to an event' },
     members: { type: new GraphQLList(MemberInputType) },
     notifications: { type: new GraphQLList(NotificationInputType) },
     HostCollectiveId: { type: GraphQLInt },
@@ -380,7 +381,6 @@ export const CommentInputType = new GraphQLInputObjectType({
   deprecationReason: 'Comments are now fully supported by API V2',
   fields: () => ({
     id: { type: GraphQLInt },
-    markdown: { type: GraphQLString, deprecationReason: 'Markdown editor is deprecated, please use html instead.' },
     html: { type: GraphQLString },
     FromCollectiveId: {
       type: GraphQLInt,
@@ -411,52 +411,11 @@ export const CommentAttributesInputType = new GraphQLInputObjectType({
   description: 'Input type for CommentType',
   fields: () => ({
     id: { type: GraphQLInt },
-    markdown: {
-      deprecationReason: 'Deprecated since 2020-03-18: Please use html.',
-      type: GraphQLString,
-    },
     html: { type: GraphQLString },
     UpdateId: {
       deprecationReason: 'Deprecated since 2020-03-18: This field has never been active and will be removed soon.',
       type: GraphQLInt,
     },
-  }),
-});
-
-export const UpdateInputType = new GraphQLInputObjectType({
-  name: 'UpdateInputType',
-  description: 'Input type for UpdateType',
-  fields: () => ({
-    id: { type: GraphQLInt },
-    views: { type: GraphQLInt },
-    slug: { type: GraphQLString },
-    title: { type: GraphQLString },
-    image: { type: GraphQLString },
-    isPrivate: { type: GraphQLBoolean },
-    makePublicOn: { type: IsoDateString },
-    markdown: { type: GraphQLString, deprecationReason: '2021-01-25: Please use html' },
-    html: { type: GraphQLString },
-    fromCollective: { type: CollectiveAttributesInputType },
-    collective: { type: new GraphQLNonNull(CollectiveAttributesInputType) },
-    tier: { type: TierInputType },
-  }),
-});
-
-export const UpdateAttributesInputType = new GraphQLInputObjectType({
-  name: 'UpdateAttributesInputType',
-  description: 'Input type for UpdateType',
-  fields: () => ({
-    id: { type: GraphQLInt },
-    views: { type: GraphQLInt },
-    slug: { type: GraphQLString },
-    title: { type: GraphQLString },
-    image: { type: GraphQLString },
-    isPrivate: { type: GraphQLBoolean },
-    makePublicOn: { type: IsoDateString },
-    markdown: { type: GraphQLString, deprecationReason: '2021-01-25: Please use html' },
-    html: { type: GraphQLString },
-    fromCollective: { type: CollectiveAttributesInputType },
-    tier: { type: TierInputType },
   }),
 });
 

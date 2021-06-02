@@ -15,18 +15,17 @@ import FEATURE from '../../../constants/feature';
 import status from '../../../constants/order_status';
 import roles from '../../../constants/roles';
 import { VAT_OPTIONS } from '../../../constants/vat';
-import { canRefund } from '../../../graphql/common/transactions';
 import cache, { purgeCacheForCollective } from '../../../lib/cache';
 import * as github from '../../../lib/github';
 import { getOrCreateGuestProfile } from '../../../lib/guest-accounts';
 import logger from '../../../lib/logger';
 import * as libPayments from '../../../lib/payments';
-import { handleHostPlanAddedFundsLimit, handleHostPlanBankTransfersLimit } from '../../../lib/plans';
 import recaptcha from '../../../lib/recaptcha';
 import { getChargeRetryCount, getNextChargeAndPeriodStartDates } from '../../../lib/recurring-contributions';
 import { canUseFeature } from '../../../lib/user-permissions';
-import { capitalize, formatCurrency, md5, parseToBoolean, sleep } from '../../../lib/utils';
+import { formatCurrency, md5, parseToBoolean, sleep } from '../../../lib/utils';
 import models from '../../../models';
+import { canRefund } from '../../common/transactions';
 import {
   BadRequest,
   FeatureNotAllowedForUser,
@@ -245,7 +244,18 @@ const getTaxInfo = async (order, collective, host, tier, loaders) => {
   }
 };
 
-export async function createOrder(order, loaders, remoteUser, reqIp) {
+const hasPaymentMethod = order => {
+  const { paymentMethod } = order;
+  if (!paymentMethod) {
+    return false;
+  } else if (paymentMethod.service === 'paypal' && paymentMethod.data?.isNewApi) {
+    return Boolean(paymentMethod.data.orderId);
+  } else {
+    return Boolean(paymentMethod.uuid || paymentMethod.token || paymentMethod.type === 'manual');
+  }
+};
+
+export async function createOrder(order, loaders, remoteUser, reqIp, userAgent) {
   debug('Beginning creation of order', order);
 
   if (remoteUser && !canUseFeature(remoteUser, FEATURE.ORDER)) {
@@ -352,15 +362,8 @@ export async function createOrder(order, loaders, remoteUser, reqIp) {
 
     const paymentRequired = (order.totalAmount > 0 || (tier && tier.amount > 0)) && collective.isActive;
     debug('paymentRequired', paymentRequired, 'total amount:', order.totalAmount, 'isActive', collective.isActive);
-    if (
-      paymentRequired &&
-      (!order.paymentMethod ||
-        !(order.paymentMethod.uuid || order.paymentMethod.token || order.paymentMethod.type === 'manual'))
-    ) {
+    if (paymentRequired && !hasPaymentMethod(order)) {
       throw new Error('This order requires a payment method');
-    }
-    if (paymentRequired && order.paymentMethod && order.paymentMethod.type === 'manual') {
-      await handleHostPlanBankTransfersLimit(host);
     }
 
     if (tier) {
@@ -408,7 +411,8 @@ export async function createOrder(order, loaders, remoteUser, reqIp) {
         fromCollective = await models.Collective.createOrganization(order.fromCollective, remoteUser, remoteUser);
       } else {
         // Create or retrieve guest profile from GUEST_TOKEN
-        const guestProfile = await getOrCreateGuestProfile(order.guestInfo);
+        const creationRequest = { ip: reqIp, userAgent };
+        const guestProfile = await getOrCreateGuestProfile(order.guestInfo, creationRequest);
         remoteUser = guestProfile.user;
         fromCollective = guestProfile.collective;
         isGuest = true;
@@ -469,17 +473,7 @@ export async function createOrder(order, loaders, remoteUser, reqIp) {
       }
     }
 
-    const tierNameInfo = tier && tier.name ? ` (${tier.name})` : '';
-    let defaultDescription;
-    if (order.interval) {
-      defaultDescription = `${capitalize(order.interval)}ly financial contribution to ${
-        collective.name
-      }${tierNameInfo}`;
-    } else {
-      defaultDescription = `${
-        order.totalAmount === 0 || collective.type === types.EVENT ? 'Registration' : 'Financial contribution'
-      } to ${collective.name}${tierNameInfo}`;
-    }
+    const defaultDescription = models.Order.generateDescription(collective, order.totalAmount, order.interval, tier);
     debug('defaultDescription', defaultDescription, 'collective.type', collective.type);
 
     // Default status, will get updated after the order is processed
@@ -547,11 +541,12 @@ export async function createOrder(order, loaders, remoteUser, reqIp) {
       if (get(order, 'paymentMethod.type') === 'manual') {
         orderCreated.paymentMethod = order.paymentMethod;
       } else {
-        // Ideally, we should always save CollectiveId
-        // but this is breaking some conventions elsewhere
-        // Always link the payment method to the collective for guests but make sure `save` is false
-        if (orderCreated.data.savePaymentMethod || isGuest) {
-          order.paymentMethod.CollectiveId = orderCreated.FromCollectiveId;
+        order.paymentMethod.CollectiveId = orderCreated.FromCollectiveId;
+        if (get(order, 'paymentMethod.service') === 'stripe') {
+          // For Stripe `save` will be manually set to `true`, in `processOrder` if the order succeed
+          order.paymentMethod.saved = null;
+        } else {
+          order.paymentMethod.saved = Boolean(orderCreated.data.savePaymentMethod);
         }
 
         if (isGuest) {
@@ -591,7 +586,11 @@ export async function createOrder(order, loaders, remoteUser, reqIp) {
     purgeCacheForCollective(collective.slug);
     purgeCacheForCollective(fromCollective.slug);
 
-    cleanOrdersLimit(order, reqIp);
+    const skipCleanOrdersLimitSlugs = config.limits.skipCleanOrdersLimitSlugs;
+
+    if (!skipCleanOrdersLimitSlugs || !skipCleanOrdersLimitSlugs.includes(collective.slug)) {
+      cleanOrdersLimit(order, reqIp);
+    }
 
     order = await models.Order.findByPk(orderCreated.id);
 
@@ -729,7 +728,7 @@ export async function refundTransaction(_, args, req) {
 
   // 2. Refund via payment method
   // 3. Create new transactions with the refund value in our database
-  const result = await libPayments.refundTransaction(transaction, req.remoteUser);
+  const result = await libPayments.refundTransaction(transaction, req.remoteUser, args.message);
 
   // Return the transaction passed to the `refundTransaction` method
   // after it was updated.
@@ -884,9 +883,6 @@ export async function addFundsToCollective(order, remoteUser) {
     throw new Error('Only an site admin or collective host admin can add fund');
   }
 
-  // Check limits
-  await handleHostPlanAddedFundsLimit(host, { throwException: true });
-
   order.collective = collective;
   let fromCollective, user;
 
@@ -962,9 +958,6 @@ export async function addFundsToCollective(order, remoteUser) {
   // Invalidate Cloudflare cache for the collective pages
   purgeCacheForCollective(collective.slug);
   purgeCacheForCollective(fromCollective.slug);
-
-  // Check if the maximum fund limit has been reached after execution
-  await handleHostPlanAddedFundsLimit(host, { notifyAdmins: true });
 
   return models.Order.findByPk(orderCreated.id);
 }

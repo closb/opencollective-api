@@ -2,7 +2,7 @@ import crypto from 'crypto';
 
 import config from 'config';
 import express from 'express';
-import { find, has, pick, toNumber } from 'lodash';
+import { compact, find, has, pick, split, toNumber } from 'lodash';
 import moment from 'moment';
 import { v4 as uuid } from 'uuid';
 
@@ -13,12 +13,14 @@ import * as transferwise from '../../lib/transferwise';
 import models from '../../models';
 import PayoutMethod from '../../models/PayoutMethod';
 import { ConnectedAccount } from '../../types/ConnectedAccount';
-import { Balance, Quote, RecipientAccount, Transfer } from '../../types/transferwise';
+import { Balance, QuoteV2, QuoteV2PaymentOption, RecipientAccount, Transfer } from '../../types/transferwise';
 
 const hashObject = obj => crypto.createHash('sha1').update(JSON.stringify(obj)).digest('hex').slice(0, 7);
+const splitCSV = string => compact(split(string, /,\s*/));
 
-export const blockedCurrencies = ['NGN'];
-export const blockedCurrenciesForBusinesProfiles = ['BRL', 'PKR'];
+export const blockedCurrencies = splitCSV(config.transferwise.blockedCurrencies);
+export const blockedCurrenciesForBusinessProfiles = splitCSV(config.transferwise.blockedCurrenciesForBusinessProfiles);
+export const blockedCurrenciesForNonProfits = splitCSV(config.transferwise.blockedCurrenciesForNonProfits);
 export const currenciesThatRequireReference = ['RUB'];
 
 async function populateProfileId(connectedAccount: typeof models.ConnectedAccount, profileId?: number): Promise<void> {
@@ -40,7 +42,7 @@ async function getTemporaryQuote(
   connectedAccount: typeof models.ConnectedAccount,
   payoutMethod: PayoutMethod,
   expense: typeof models.Expense,
-): Promise<Quote> {
+): Promise<QuoteV2> {
   const token = await getToken(connectedAccount);
   return await transferwise.getTemporaryQuote(token, {
     sourceCurrency: expense.currency,
@@ -53,7 +55,8 @@ async function quoteExpense(
   connectedAccount: typeof models.ConnectedAccount,
   payoutMethod: PayoutMethod,
   expense: typeof models.Expense,
-): Promise<Quote> {
+  targetAccount?: number,
+): Promise<QuoteV2> {
   await populateProfileId(connectedAccount);
 
   const token = await getToken(connectedAccount);
@@ -66,6 +69,7 @@ async function quoteExpense(
     sourceCurrency: expense.currency,
     targetCurrency: <string>payoutMethod.unfilteredData.currency,
     targetAmount,
+    targetAccount,
   });
 
   return quote;
@@ -76,13 +80,22 @@ async function payExpense(
   payoutMethod: PayoutMethod,
   expense: typeof models.Expense,
 ): Promise<{
-  quote: Quote;
+  quote: QuoteV2;
   recipient: RecipientAccount;
   fund: { status: string; errorCode: string };
   transfer: Transfer;
+  paymentOption: QuoteV2PaymentOption;
 }> {
   const token = await getToken(connectedAccount);
-  const quote = await quoteExpense(connectedAccount, payoutMethod, expense);
+  const recipient = await transferwise.createRecipientAccount(token, {
+    profileId: connectedAccount.data.id,
+    ...(<RecipientAccount>payoutMethod.data),
+  });
+
+  const quote = await quoteExpense(connectedAccount, payoutMethod, expense, recipient.id);
+  const paymentOption = quote.paymentOptions.find(
+    p => p.disabled === false && p.payIn === 'BALANCE' && p.payOut === quote.payOut,
+  );
 
   const account = await transferwise.getBorderlessAccount(token, <number>connectedAccount.data.id);
   if (!account) {
@@ -91,24 +104,19 @@ async function payExpense(
       'transferwise.error.accountnotfound',
     );
   }
-  const balance = account.balances.find(b => b.currency === quote.source);
+  const balance = account.balances.find(b => b.currency === quote.sourceCurrency);
   if (!balance || balance.amount.value < quote.sourceAmount) {
     throw new TransferwiseError(
-      `You don't have enough funds in your ${quote.source} balance. Please top up your account considering the source amount of ${quote.sourceAmount} (includes the fee ${quote.fee}) and try again.`,
+      `You don't have enough funds in your ${quote.sourceCurrency} balance. Please top up your account considering the source amount of ${quote.sourceAmount} (includes the fee ${paymentOption.fee.total}) and try again.`,
       'transferwise.error.insufficientFunds',
-      { currency: quote.source },
+      { currency: quote.sourceCurrency },
     );
   }
 
-  const recipient = await transferwise.createRecipientAccount(token, {
-    profileId: connectedAccount.data.id,
-    ...(<RecipientAccount>payoutMethod.data),
-  });
-
   const transferOptions: transferwise.CreateTransfer = {
     accountId: recipient.id,
-    quoteId: quote.id,
-    uuid: uuid(),
+    quoteUuid: quote.id,
+    customerTransactionId: uuid(),
   };
   // Append reference to currencies that require it.
   if (currenciesThatRequireReference.includes(<string>payoutMethod.unfilteredData.currency)) {
@@ -127,7 +135,7 @@ async function payExpense(
     throw e;
   }
 
-  return { quote, recipient, transfer, fund };
+  return { quote, recipient, transfer, fund, paymentOption };
 }
 
 async function getAvailableCurrencies(
@@ -145,7 +153,13 @@ async function getAvailableCurrencies(
   if (ignoreBlockedCurrencies) {
     currencyBlockList = blockedCurrencies;
     if (connectedAccount.data?.type === 'business') {
-      currencyBlockList = [...currencyBlockList, ...blockedCurrenciesForBusinesProfiles];
+      currencyBlockList = [...currencyBlockList, ...blockedCurrenciesForBusinessProfiles];
+    }
+    if (connectedAccount.data?.details?.companyType === 'NON_PROFIT_CORPORATION') {
+      currencyBlockList = [...currencyBlockList, ...blockedCurrenciesForNonProfits];
+    }
+    if (connectedAccount.data?.blockedCurrencies) {
+      currencyBlockList = [...currencyBlockList, ...connectedAccount.data.blockedCurrencies];
     }
   }
 
@@ -229,7 +243,7 @@ async function getToken(connectedAccount: ConnectedAccount): Promise<string> {
   if (isOutdated) {
     const newToken = await transferwise.getOrRefreshToken({ refreshToken: connectedAccount.refreshToken });
     const { access_token: token, refresh_token: refreshToken, ...data } = newToken;
-    await connectedAccount.update({ token, refreshToken, data: { ...connectedAccount.data, data } });
+    await connectedAccount.update({ token, refreshToken, data: { ...connectedAccount.data, ...data } });
     return token;
   } else {
     return connectedAccount.token;
@@ -278,7 +292,7 @@ const oauth = {
         await existingConnectedAccount.update({
           token,
           refreshToken,
-          data: { ...existingConnectedAccount.data, data },
+          data: { ...existingConnectedAccount.data, ...data },
         });
       } else {
         const connectedAccount = await models.ConnectedAccount.create({

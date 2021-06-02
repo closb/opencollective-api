@@ -123,6 +123,10 @@ const ExpensesQuery = {
       type: ISODateTime,
       description: 'Only return expenses that were created after this date',
     },
+    dateTo: {
+      type: ISODateTime,
+      description: 'Only return expenses that were created after this date',
+    },
     searchTerm: {
       type: GraphQLString,
       description: 'The term to search',
@@ -202,6 +206,10 @@ const ExpensesQuery = {
     if (args.dateFrom) {
       where['createdAt'] = { [Op.gte]: args.dateFrom };
     }
+    if (args.dateTo) {
+      where['createdAt'] = where['createdAt'] || {};
+      where['createdAt'][Op.lte] = args.dateTo;
+    }
     if (args.payoutMethodType) {
       include.push({
         association: 'PayoutMethod',
@@ -225,12 +233,13 @@ const ExpensesQuery = {
       if (req.remoteUser) {
         where[Op.and].push({
           [Op.or]: [
-            { status: { [Op.notIn]: [expenseStatus.DRAFT] } },
+            { status: { [Op.notIn]: [expenseStatus.DRAFT, expenseStatus.SPAM] } },
             { status: expenseStatus.DRAFT, UserId: req.remoteUser.id },
+            // TODO: we should ideally display SPAM expenses in some circumstances
           ],
         });
       } else {
-        where['status'] = { [Op.notIn]: [expenseStatus.DRAFT] };
+        where['status'] = { [Op.notIn]: [expenseStatus.DRAFT, expenseStatus.SPAM] };
       }
     }
 

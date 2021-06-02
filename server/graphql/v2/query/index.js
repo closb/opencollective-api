@@ -11,6 +11,7 @@ import HostQuery from './HostQuery';
 import IndividualQuery from './IndividualQuery';
 import OrderQuery from './OrderQuery';
 import OrdersQuery from './OrdersQuery';
+import PaypalPlanQuery from './PaypalPlanQuery';
 import TierQuery from './TierQuery';
 import TransactionsQuery from './TransactionsQuery';
 import UpdateQuery from './UpdateQuery';
@@ -30,6 +31,7 @@ const query = {
   // transaction: TransactionQuery,
   transactions: TransactionsQuery,
   update: UpdateQuery,
+  paypalPlan: PaypalPlanQuery,
   loggedInAccount: {
     type: Account,
     resolve(_, args, req) {

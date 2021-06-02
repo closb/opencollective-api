@@ -2,8 +2,10 @@ import { GraphQLInt, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLStri
 import GraphQLJSON from 'graphql-type-json';
 import { get, pick } from 'lodash';
 
-import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE, PAYMENT_METHOD_TYPES } from '../../../constants/paymentMethods';
-import { getPaymentMethodType, PaymentMethodType } from '../enum/PaymentMethodType';
+import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE } from '../../../constants/paymentMethods';
+import { getLegacyPaymentMethodType, PaymentMethodLegacyType } from '../enum/PaymentMethodLegacyType';
+import { PaymentMethodService } from '../enum/PaymentMethodService';
+import { PaymentMethodType } from '../enum/PaymentMethodType';
 import { idEncode } from '../identifiers';
 import { Account } from '../interface/Account';
 import { Amount } from '../object/Amount';
@@ -30,28 +32,32 @@ export const PaymentMethod = new GraphQLObjectType({
       name: {
         type: GraphQLString,
         resolve(paymentMethod, _, req) {
+          const publicProviders = [
+            [PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE, PAYMENT_METHOD_TYPE.GIFT_CARD],
+            [PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE, PAYMENT_METHOD_TYPE.PREPAID],
+          ];
+
           if (
-            paymentMethod.service === PAYMENT_METHOD_SERVICE.PAYPAL &&
-            paymentMethod.type === PAYMENT_METHOD_TYPES.ADAPTIVE
+            (paymentMethod.CollectiveId && req.remoteUser?.isAdmin(paymentMethod.CollectiveId)) ||
+            publicProviders.some(([service, type]) => paymentMethod.service === service && paymentMethod.type === type)
           ) {
-            return req.remoteUser?.isAdmin(paymentMethod.CollectiveId) ? paymentMethod.name : null;
-          } else {
             return paymentMethod.name;
+          } else {
+            return null;
           }
         },
       },
       service: {
-        type: GraphQLString,
-        deprecationReason: '2020-08-18: This field is being deprecated in favor of providerType',
+        type: PaymentMethodService,
       },
       type: {
-        type: GraphQLString,
-        deprecationReason: '2020-08-18: This field is being deprecated in favor of providerType',
+        type: PaymentMethodType,
       },
       providerType: {
         description: 'Defines the type of the payment method. Meant to be moved to "type" in the future.',
-        type: PaymentMethodType,
-        resolve: getPaymentMethodType,
+        deprecationReason: '2021-03-02: Please use service + type',
+        type: PaymentMethodLegacyType,
+        resolve: getLegacyPaymentMethodType,
       },
       balance: {
         type: new GraphQLNonNull(Amount),
@@ -81,23 +87,19 @@ export const PaymentMethod = new GraphQLObjectType({
       data: {
         type: GraphQLJSON,
         resolve(paymentMethod, _, req) {
-          if (!paymentMethod.data) {
+          if (!req.remoteUser?.isAdmin(paymentMethod.CollectiveId)) {
             return null;
           }
 
-          // Protect and whitelist fields for gift cards
+          // Protect and limit fields
+          let allowedFields = [];
           if (paymentMethod.type === PAYMENT_METHOD_TYPE.GIFT_CARD) {
-            if (!req.remoteUser || !req.remoteUser.isAdminOfCollective(paymentMethod.CollectiveId)) {
-              return null;
-            }
-            return pick(paymentMethod.data, ['email']);
+            allowedFields = ['email'];
+          } else if (paymentMethod.type === PAYMENT_METHOD_TYPE.CREDITCARD) {
+            allowedFields = ['fullName', 'expMonth', 'expYear', 'brand', 'country', 'last4'];
           }
 
-          const data = paymentMethod.data;
-          // white list fields to send back; removes fields like CustomerIdForHost
-          const dataSubset = pick(data, ['fullName', 'expMonth', 'expYear', 'brand', 'country', 'last4']);
-
-          return dataSubset;
+          return pick(paymentMethod.data, allowedFields);
         },
       },
       limitedToHosts: {
@@ -121,6 +123,13 @@ export const PaymentMethod = new GraphQLObjectType({
       },
       expiryDate: {
         type: ISODateTime,
+        resolve(paymentMethod, _, req) {
+          if (!req.remoteUser?.isAdmin(paymentMethod.CollectiveId)) {
+            return null;
+          } else {
+            return paymentMethod.expiryDate;
+          }
+        },
       },
       createdAt: {
         type: ISODateTime,

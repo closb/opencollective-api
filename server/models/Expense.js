@@ -102,6 +102,9 @@ function defineModel() {
       description: {
         type: DataTypes.STRING,
         allowNull: false,
+        set(description) {
+          this.setDataValue('description', description.replace(/\s+/g, ' ').trim());
+        },
       },
 
       longDescription: {
@@ -137,6 +140,14 @@ function defineModel() {
       PayoutMethodId: {
         type: DataTypes.INTEGER,
         references: { key: 'id', model: 'PayoutMethods' },
+        onDelete: 'SET NULL',
+        onUpdate: 'CASCADE',
+        allowNull: true,
+      },
+
+      VirtualCardId: {
+        type: DataTypes.STRING,
+        references: { key: 'id', model: 'VirtualCards' },
         onDelete: 'SET NULL',
         onUpdate: 'CASCADE',
         allowNull: true,
@@ -285,7 +296,7 @@ function defineModel() {
    * @param {object} user: the user who triggered the activity. Leave blank for system activities.
    */
   Expense.prototype.createActivity = async function (type, user, data) {
-    const submittedByUser = this.user || (await models.User.findByPk(this.UserId));
+    const submittedByUser = await this.getSubmitterUser();
     const submittedByUserCollective = await models.Collective.findByPk(submittedByUser.CollectiveId);
     const fromCollective = this.fromCollective || (await models.Collective.findByPk(this.FromCollectiveId));
     if (!this.collective) {
@@ -299,7 +310,7 @@ function defineModel() {
       (await models.Transaction.findOne({
         where: { type: 'DEBIT', ExpenseId: this.id },
       }));
-    await models.Activity.create({
+    return models.Activity.create({
       type,
       UserId: user?.id,
       CollectiveId: this.collective.id,
@@ -311,7 +322,7 @@ function defineModel() {
         user: submittedByUserCollective.minimal,
         fromCollective: fromCollective.minimal,
         expense: this.info,
-        transaction: transaction.info,
+        transaction: transaction?.info,
         payoutMethod: payoutMethod && pick(payoutMethod.dataValues, ['id', 'type', 'data']),
         items:
           !isEmpty(items) &&
@@ -324,6 +335,13 @@ function defineModel() {
           })),
       },
     });
+  };
+
+  Expense.prototype.getSubmitterUser = async function () {
+    if (!this.user) {
+      this.user = await models.User.findByPk(this.UserId);
+    }
+    return this.user;
   };
 
   Expense.prototype.setApproved = function (lastEditedById) {

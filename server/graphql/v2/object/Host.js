@@ -1,14 +1,18 @@
 import { GraphQLBoolean, GraphQLInt, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
-import { find, get, keyBy, mapValues } from 'lodash';
+import { find, get, isEmpty, keyBy, mapValues } from 'lodash';
 
-import { types as CollectiveType } from '../../../constants/collectives';
+import { types as CollectiveType, types as CollectiveTypes } from '../../../constants/collectives';
 import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE } from '../../../constants/paymentMethods';
 import models, { Op, sequelize } from '../../../models';
 import { PayoutMethodTypes } from '../../../models/PayoutMethod';
 import TransferwiseLib from '../../../paymentProviders/transferwise';
+import { allowContextPermission, PERMISSION_TYPE } from '../../common/context-permissions';
 import { Unauthorized } from '../../errors';
+import { AccountCollection } from '../collection/AccountCollection';
 import { HostApplicationCollection } from '../collection/HostApplicationCollection';
-import { PaymentMethodType, PayoutMethodType } from '../enum';
+import { VirtualCardCollection } from '../collection/VirtualCardCollection';
+import { PaymentMethodLegacyType, PayoutMethodType } from '../enum';
+import { AccountReferenceInput, fetchAccountWithReference } from '../input/AccountReferenceInput';
 import { ChronologicalOrderInput } from '../input/ChronologicalOrderInput';
 import { Account, AccountFields } from '../interface/Account';
 import { AccountWithContributions, AccountWithContributionsFields } from '../interface/AccountWithContributions';
@@ -78,7 +82,7 @@ export const Host = new GraphQLObjectType({
         },
       },
       supportedPaymentMethods: {
-        type: new GraphQLList(PaymentMethodType),
+        type: new GraphQLList(PaymentMethodLegacyType),
         description:
           'The list of payment methods (Stripe, Paypal, manual bank transfer, etc ...) the Host can accept for its Collectives',
         async resolve(collective, _, req) {
@@ -107,7 +111,13 @@ export const Host = new GraphQLObjectType({
         type: PayoutMethod,
         async resolve(collective, _, req) {
           const payoutMethods = await req.loaders.PayoutMethod.byCollectiveId.load(collective.id);
-          return payoutMethods.find(c => c.type === 'BANK_ACCOUNT' && c.data?.isManualBankTransfer);
+          const payoutMethod = payoutMethods.find(c => c.type === 'BANK_ACCOUNT' && c.data?.isManualBankTransfer);
+          if (payoutMethod && get(collective, 'settings.paymentMethods.manual')) {
+            // Make bank account's data public if manual payment method is enabled
+            allowContextPermission(req, PERMISSION_TYPE.SEE_PAYOUT_METHOD_DATA, payoutMethod.id);
+          }
+
+          return payoutMethod;
         },
       },
       paypalPreApproval: {
@@ -123,17 +133,30 @@ export const Host = new GraphQLObjectType({
           });
         },
       },
+      paypalClientId: {
+        type: GraphQLString,
+        description: 'If the host supports PayPal, this will contain the client ID to use in the frontend',
+        resolve: async (host, _, req) => {
+          const connectedAccounts = await req.loaders.Collective.connectedAccounts.load(host.id);
+          const paypalAccount = connectedAccounts.find(c => c.service === 'paypal');
+          return paypalAccount?.clientId || null;
+        },
+      },
       supportedPayoutMethods: {
         type: new GraphQLList(PayoutMethodType),
         description: 'The list of payout methods this Host accepts for its expenses',
         async resolve(collective, _, req) {
           const connectedAccounts = await req.loaders.Collective.connectedAccounts.load(collective.id);
-          const supportedPayoutMethods = [PayoutMethodTypes.OTHER, PayoutMethodTypes.ACCOUNT_BALANCE];
-          if (connectedAccounts?.find?.(c => c.service === 'transferwise')) {
-            supportedPayoutMethods.push(PayoutMethodTypes.BANK_ACCOUNT);
-          }
+          const supportedPayoutMethods = [
+            PayoutMethodTypes.OTHER,
+            PayoutMethodTypes.ACCOUNT_BALANCE,
+            PayoutMethodTypes.BANK_ACCOUNT,
+          ];
           if (connectedAccounts?.find?.(c => c.service === 'paypal') || !collective.settings?.disablePaypalPayouts) {
             supportedPayoutMethods.push(PayoutMethodTypes.PAYPAL);
+          }
+          if (connectedAccounts?.find?.(c => c.service === 'privacy')) {
+            supportedPayoutMethods.push(PayoutMethodTypes.CREDIT_CARD);
           }
 
           return supportedPayoutMethods;
@@ -150,7 +173,7 @@ export const Host = new GraphQLObjectType({
           if (transferwiseAccount) {
             return TransferwiseLib.getAccountBalances(transferwiseAccount).then(balances => {
               return balances.map(balance => ({
-                value: Math.round(balance.amount.value * 100),
+                value: Math.round((balance.amount.value - Math.abs(balance.reservedAmount?.value || 0)) * 100),
                 currency: balance.amount.currency,
               }));
             });
@@ -226,6 +249,156 @@ export const Host = new GraphQLObjectType({
           });
 
           return { totalCount: result.count, limit: args.limit, offset: args.offset, nodes };
+        },
+      },
+      hostedVirtualCards: {
+        type: new GraphQLNonNull(VirtualCardCollection),
+        args: {
+          limit: { type: GraphQLInt, defaultValue: 100 },
+          offset: { type: GraphQLInt, defaultValue: 0 },
+          state: { type: GraphQLString, defaultValue: null },
+          merchantAccount: { type: AccountReferenceInput, defaultValue: null },
+          collectiveAccountIds: { type: GraphQLList(AccountReferenceInput), defaultValue: null },
+        },
+        async resolve(host, args, req) {
+          if (!req.remoteUser?.isAdmin(host.id)) {
+            throw new Unauthorized('You need to be logged in as an admin of the host to see its hosted virtual cards');
+          }
+
+          let merchantId;
+          if (!isEmpty(args.merchantAccount)) {
+            merchantId = (
+              await fetchAccountWithReference(args.merchantAccount, { throwIfMissing: true, loaders: req.loaders })
+            ).id;
+          }
+
+          const collectiveIds = isEmpty(args.collectiveAccountIds)
+            ? undefined
+            : await Promise.all(
+                args.collectiveAccountIds.map(collectiveAccountId =>
+                  fetchAccountWithReference(collectiveAccountId, { throwIfMissing: true, loaders: req.loaders }),
+                ),
+              ).then(collectives => collectives.map(collective => collective.id));
+
+          const query = {
+            group: 'VirtualCard.id',
+            where: {
+              HostCollectiveId: host.id,
+            },
+            limit: args.limit,
+            offset: args.offset,
+          };
+
+          if (args.state) {
+            query.where.data = { state: args.state };
+          }
+
+          if (collectiveIds) {
+            query.where.CollectiveId = { [Op.in]: collectiveIds };
+          }
+
+          if (merchantId) {
+            if (!query.where.data) {
+              query.where.data = {};
+            }
+            query.where.data.type = 'MERCHANT_LOCKED';
+            query.include = [
+              {
+                attributes: [],
+                association: 'expenses',
+                required: true,
+                where: {
+                  CollectiveId: merchantId,
+                },
+              },
+            ];
+          }
+
+          const result = await models.VirtualCard.findAndCountAll(query);
+
+          return {
+            nodes: result.rows,
+            totalCount: result.count.length, // See https://github.com/sequelize/sequelize/issues/9109
+            limit: args.limit,
+            offset: args.offset,
+          };
+        },
+      },
+      hostedVirtualCardMerchants: {
+        type: new GraphQLNonNull(AccountCollection),
+        args: {
+          limit: { type: GraphQLInt, defaultValue: 100 },
+          offset: { type: GraphQLInt, defaultValue: 0 },
+        },
+        async resolve(host, args, req) {
+          if (!req.remoteUser?.isAdmin(host.id)) {
+            throw new Unauthorized('You need to be logged in as an admin to see the virtual card merchants');
+          }
+
+          const result = await models.Collective.findAndCountAll({
+            group: 'Collective.id',
+            where: {
+              type: CollectiveTypes.VENDOR,
+            },
+            include: [
+              {
+                attributes: [],
+                association: 'submittedExpenses',
+                required: true,
+                include: [
+                  {
+                    attributes: [],
+                    association: 'virtualCard',
+                    required: true,
+                    where: {
+                      HostCollectiveId: host.id,
+                      data: { type: 'MERCHANT_LOCKED' },
+                    },
+                  },
+                ],
+              },
+            ],
+          });
+
+          return {
+            nodes: result.rows,
+            totalCount: result.count.length, // See https://github.com/sequelize/sequelize/issues/9109
+            limit: args.limit,
+            offset: args.offset,
+          };
+        },
+      },
+      hostedVirtualCardCollectives: {
+        type: new GraphQLNonNull(AccountCollection),
+        args: {
+          limit: { type: GraphQLInt, defaultValue: 100 },
+          offset: { type: GraphQLInt, defaultValue: 0 },
+        },
+        async resolve(host, args, req) {
+          if (!req.remoteUser?.isAdmin(host.id)) {
+            throw new Unauthorized('You need to be logged in as an admin to see the virtual card merchants');
+          }
+
+          const result = await models.Collective.findAndCountAll({
+            group: 'Collective.id',
+            include: [
+              {
+                attributes: [],
+                association: 'virtualCardCollectives',
+                required: true,
+                where: {
+                  HostCollectiveId: host.id,
+                },
+              },
+            ],
+          });
+
+          return {
+            nodes: result.rows,
+            totalCount: result.count.length, // See https://github.com/sequelize/sequelize/issues/9109
+            limit: args.limit,
+            offset: args.offset,
+          };
         },
       },
     };

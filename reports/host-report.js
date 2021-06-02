@@ -152,13 +152,14 @@ async function HostReport(year, month, hostId) {
           return users.map(u => u.email);
         }
 
-        const members = models.Member.findAll({
+        const members = await models.Member.findAll({
           where: {
             CollectiveId: host.id,
             role: { [Op.or]: [MemberRoles.ADMIN, MemberRoles.ACCOUNTANT] },
           },
         });
-        return members.map(
+        return Promise.map(
+          members,
           admin => {
             return models.User.findOne({
               attributes: ['email'],
@@ -237,7 +238,7 @@ async function HostReport(year, month, hostId) {
         ],
       });
 
-      if (!transactions || transactions.length == 0) {
+      if (!transactions || transactions.length === 0) {
         throw new Error('No transaction found');
       }
       console.log(`>>> processing ${transactions.length} transactions`);
@@ -270,7 +271,9 @@ async function HostReport(year, month, hostId) {
       const stats = await getHostStats(host, Object.keys(collectivesById));
 
       const groupedTransactions = groupBy(data.transactions, t => {
-        if (t.OrderId && t.type === 'CREDIT') {
+        if (t.isDebt && t.kind === 'PLATFORM_TIP') {
+          return 'otherCredits';
+        } else if (t.OrderId && t.type === 'CREDIT') {
           return 'donations';
         } else if (t.ExpenseId && t.type === 'DEBIT') {
           return 'expenses';
@@ -298,6 +301,13 @@ async function HostReport(year, month, hostId) {
       const totalAmountOtherDebits = sumBy(otherDebits, 'amountInHostCurrency');
       const paymentProcessorFeesOtherDebits = sumBy(otherDebits, 'paymentProcessorFeeInHostCurrency');
       const platformFeesOtherDebits = sumBy(otherDebits, 'platformFeeInHostCurrency');
+
+      const totalOwedPlatformTips = sumByWhen(
+        otherCredits,
+        'amountInHostCurrency',
+        t => t.isDebt && t.kind === 'PLATFORM_TIP',
+      );
+
       const payoutProcessorFeesPaypal = sumByWhen(
         expenses,
         'paymentProcessorFeeInHostCurrency',
@@ -323,7 +333,8 @@ async function HostReport(year, month, hostId) {
       const totalTaxAmountCollected = sumByWhen(transactions, 'taxAmount', t => t.type === 'CREDIT');
       const totalAmountPaidExpenses = sumByWhen(expenses, 'netAmountInHostCurrency');
       const totalHostFees = sumBy([...donations, ...otherCredits], 'hostFeeInHostCurrency');
-      const totalNetAmountReceivedForCollectives = sumBy([...donations, ...otherCredits], 'netAmountInHostCurrency');
+      const totalNetAmountReceivedForCollectives =
+        sumBy([...donations, ...otherCredits], 'netAmountInHostCurrency') - totalOwedPlatformTips;
       const totalAmountSpent =
         totalAmountPaidExpenses +
         payoutProcessorFeesOther +
@@ -369,6 +380,7 @@ async function HostReport(year, month, hostId) {
         totalTaxAmountCollected,
         totalSharedRevenue,
         hostNetRevenue,
+        totalOwedPlatformTips,
       };
 
       summary.hosts.push({

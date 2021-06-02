@@ -5,8 +5,7 @@ import GraphQLJSON from 'graphql-type-json';
 import { activities } from '../../../constants';
 import { types as CollectiveType } from '../../../constants/collectives';
 import { purgeCacheForCollective } from '../../../lib/cache';
-import emailLib from '../../../lib/email';
-import { handleHostCollectivesLimit } from '../../../lib/plans';
+import emailLib, { NO_REPLY_EMAIL } from '../../../lib/email';
 import { stripHTML } from '../../../lib/sanitize-html';
 import models from '../../../models';
 import { HostApplicationStatus } from '../../../models/HostApplication';
@@ -14,14 +13,13 @@ import { NotFound, Unauthorized, ValidationFailed } from '../../errors';
 import { ProcessHostApplicationAction } from '../enum/ProcessHostApplicationAction';
 import { AccountReferenceInput, fetchAccountWithReference } from '../input/AccountReferenceInput';
 import { Account } from '../interface/Account';
-import { Collective } from '../object/Collective';
 import Conversation from '../object/Conversation';
 
 const ProcessHostApplicationResponse = new GraphQLObjectType({
   name: 'ProcessHostApplicationResponse',
   fields: () => ({
     account: {
-      type: new GraphQLNonNull(Collective),
+      type: new GraphQLNonNull(Account),
       description: 'The account that applied to the host',
     },
     conversation: {
@@ -136,8 +134,6 @@ const HostApplicationMutations = {
 };
 
 const approveApplication = async (host, collective, remoteUser) => {
-  await handleHostCollectivesLimit(host, { throwHostException: true, notifyAdmins: true });
-
   await models.Activity.create({
     type: activities.COLLECTIVE_APPROVED,
     UserId: remoteUser.id,
@@ -193,7 +189,7 @@ const sendPrivateMessage = async (host, collective, message: string): Promise<vo
   const adminUsers = await collective.getAdminUsers();
   await emailLib.send(
     'host.application.contact',
-    'no-reply@opencollective.com',
+    NO_REPLY_EMAIL,
     {
       host: host.info,
       collective: collective.info,

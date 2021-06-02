@@ -12,7 +12,7 @@ If you see a step below that could be improved (or is outdated), please update t
 
 ### Prerequisite
 
-1. Make sure you have Node.js version >= 10.
+1. Make sure you have Node.js version >= 14.
 
 - We recommend using [nvm](https://github.com/creationix/nvm): `nvm use`.
 
@@ -68,3 +68,7 @@ See: [docs/deployment.md](docs/deployment.md)
 If you have any questions, ping us on Slack
 (https://slack.opencollective.com) or on Twitter
 ([@opencollect](https://twitter.com/opencollect)).
+
+## License
+
+[MIT](LICENSE)

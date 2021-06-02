@@ -6,13 +6,14 @@
 // This lib is a superset of `utils.data` that generates values that are random and safe
 // to use in loops and repeted tests.
 
-import { get, sample } from 'lodash';
+import { get, padStart, sample } from 'lodash';
 import { v4 as uuid } from 'uuid';
 
-import { roles } from '../../server/constants';
+import { activities, channels, roles } from '../../server/constants';
 import { types as CollectiveType } from '../../server/constants/collectives';
 import { PAYMENT_METHOD_SERVICES, PAYMENT_METHOD_TYPES } from '../../server/constants/paymentMethods';
 import { REACTION_EMOJI } from '../../server/constants/reaction-emoji';
+import { TransactionKind } from '../../server/constants/transaction-kind';
 import models from '../../server/models';
 import { PayoutMethodTypes } from '../../server/models/PayoutMethod';
 import { randEmail, randUrl } from '../stores';
@@ -26,6 +27,14 @@ export const multiple = (fn, n, args) => Promise.all([...Array(n).keys()].map(()
 export const randArray = (generateFunc, min = 1, max = 1) => {
   const arrayLength = randNumber(min, max);
   return [...Array(arrayLength)].map((_, idx) => generateFunc(idx, arrayLength));
+};
+
+/**
+ * Allows to generate an UUID with the first 8 characters hardcoded. This is useful to generate
+ * random but identifiable valid UUIDs.
+ */
+export const fakeUUID = firstHeightChars => {
+  return `${firstHeightChars}-${uuid().substr(9)}`;
 };
 
 /**
@@ -122,6 +131,16 @@ export const fakeCollective = async (collectiveData = {}) => {
   return collective;
 };
 
+export const fakeOrganization = (organizationData = {}) => {
+  return fakeCollective({
+    HostCollectiveId: null,
+    name: organizationData.isHostAccount ? randStr('Test Host ') : randStr('Test Organization '),
+    slug: organizationData.isHostAccount ? randStr('host-') : randStr('org-'),
+    ...organizationData,
+    type: 'ORGANIZATION',
+  });
+};
+
 /**
  * Creates a fake update. All params are optionals.
  */
@@ -142,7 +161,7 @@ export const fakeEvent = async (collectiveData = {}) => {
  * Creates a fake update. All params are optionals.
  */
 export const fakeUpdate = async (updateData = {}) => {
-  return models.Update.create({
+  const update = await models.Update.create({
     slug: randStr('update-'),
     title: randStr('Update '),
     html: '<div><strong>Hello</strong> Test!</div>',
@@ -151,6 +170,10 @@ export const fakeUpdate = async (updateData = {}) => {
     CollectiveId: updateData.CollectiveId || (await fakeCollective()).id,
     CreatedByUserId: updateData.CreatedByUserId || (await fakeUser()).id,
   });
+
+  update.collective = await models.Collective.findByPk(update.CollectiveId);
+  update.fromCollective = await models.Collective.findByPk(update.FromCollectiveId);
+  return update;
 };
 
 /**
@@ -361,13 +384,16 @@ export const fakeOrder = async (orderData = {}, { withSubscription = false, with
   }
 
   if (withSubscription) {
-    const subscription = await models.Subscription.create({
+    const subscription = await fakeSubscription({
       amount: order.totalAmount,
       interval: 'month',
       currency: order.currency,
       isActive: true,
+      quantity: order.quantity,
+      ...orderData.subscription,
     });
     await order.update({ SubscriptionId: subscription.id });
+    order.Subscription = subscription;
   }
 
   if (withTransactions) {
@@ -395,6 +421,41 @@ export const fakeOrder = async (orderData = {}, { withSubscription = false, with
   return order;
 };
 
+export const fakeSubscription = (params = {}) => {
+  return models.Subscription.create({
+    amount: randAmount(),
+    currency: sample(['USD', 'EUR']),
+    interval: sample(['month', 'year']),
+    isActive: true,
+    quantity: 1,
+    ...params,
+  });
+};
+
+export const fakeNotification = async (data = {}) => {
+  return models.Notification.create({
+    channel: sample(Object.values(channels)),
+    type: sample(Object.values(activities)),
+    active: true,
+    CollectiveId: data.CollectiveId || (await fakeCollective()).id,
+    UserId: data.UserId || (await fakeUser()).id,
+    webhookUrl: randUrl('test.opencollective.com/webhooks'),
+    ...data,
+  });
+};
+
+export const fakeActivity = async (data = {}, sequelizeParams) => {
+  return models.Activity.create(
+    {
+      CollectiveId: data.CollectiveId || (await fakeCollective()).id,
+      UserId: data.UserId || (await fakeUser()).id,
+      type: sample(Object.values(activities)),
+      ...data,
+    },
+    sequelizeParams,
+  );
+};
+
 /**
  * Creates a fake connectedAccount. All params are optionals.
  */
@@ -412,12 +473,16 @@ export const fakeConnectedAccount = async (connectedAccountData = {}) => {
 /**
  * Creates a fake transaction. All params are optionals.
  */
-export const fakeTransaction = async (transactionData = {}) => {
+export const fakeTransaction = async (
+  transactionData = {},
+  { settlementStatus = undefined, createDoubleEntry = false } = {},
+) => {
   const amount = transactionData.amount || randAmount(10, 100) * 100;
   const CreatedByUserId = transactionData.CreatedByUserId || (await fakeUser()).id;
   const FromCollectiveId = transactionData.FromCollectiveId || (await fakeCollective()).id;
   const CollectiveId = transactionData.CollectiveId || (await fakeCollective()).id;
-  return models.Transaction.create({
+  const createMethod = createDoubleEntry ? 'createDoubleEntry' : 'create';
+  const transaction = await models.Transaction[createMethod]({
     type: amount < 0 ? 'DEBIT' : 'CREDIT',
     currency: 'USD',
     hostCurrency: 'USD',
@@ -425,12 +490,27 @@ export const fakeTransaction = async (transactionData = {}) => {
     netAmountInCollectiveCurrency: amount,
     amountInHostCurrency: amount,
     TransactionGroup: uuid(),
+    kind: transactionData.ExpenseId ? TransactionKind.EXPENSE : null,
+    isDebt: Boolean(settlementStatus),
+    hostFeeInHostCurrency: 0,
+    platformFeeInHostCurrency: 0,
+    paymentProcessorFeeInHostCurrency: 0,
     ...transactionData,
     amount,
     CreatedByUserId,
     FromCollectiveId,
     CollectiveId,
   });
+
+  if (settlementStatus) {
+    await models.TransactionSettlement.create({
+      TransactionGroup: transaction.TransactionGroup,
+      kind: transaction.kind,
+      status: settlementStatus,
+    });
+  }
+
+  return transaction;
 };
 
 /**
@@ -454,6 +534,7 @@ export const fakeMember = async data => {
  */
 export const fakePaymentMethod = async data => {
   return models.PaymentMethod.create({
+    token: randStr(),
     ...data,
     type: data.type || sample(PAYMENT_METHOD_TYPES),
     service: data.service || sample(PAYMENT_METHOD_SERVICES),
@@ -468,5 +549,63 @@ export const fakeLegalDocument = async (data = {}) => {
     requestStatus: 'REQUESTED',
     ...data,
     CollectiveId: data.CollectiveId || (await fakeCollective().then(c => c.id)),
+  });
+};
+
+export const fakeCurrencyExchangeRate = async (data = {}) => {
+  const currencies = ['USD', 'NSG', 'EUR', 'CZK', 'JPY', 'MYR', 'AUD'];
+  const rate = await models.CurrencyExchangeRate.create({
+    from: sample(currencies),
+    to: sample(currencies),
+    rate: randNumber(0, 100) / 100.0,
+    ...data,
+  });
+
+  if (data.insertedAt) {
+    rate.createdAt = data.insertedAt;
+    rate.changed('createdAt', true);
+    return rate.save();
+  } else {
+    return rate;
+  }
+};
+
+export const fakeVirtualCard = async (virtualCardData = {}) => {
+  const CollectiveId = virtualCardData.CollectiveId || (await fakeCollective()).id;
+  const HostCollectiveId =
+    virtualCardData.HostCollectiveId || (await models.Collective.getHostCollectiveId(CollectiveId));
+
+  return models.VirtualCard.create({
+    id: uuid(),
+    last4: padStart(randNumber(0, 9999).toString(), 4, '0'),
+    name: randStr('card'),
+    ...virtualCardData,
+    CollectiveId,
+    HostCollectiveId,
+  });
+};
+
+export const fakePaypalProduct = async (data = {}) => {
+  const CollectiveId = data.CollectiveId || (await fakeCollective()).id;
+  return models.PaypalProduct.create({
+    id: randStr('PaypalProduct-'),
+    ...data,
+    CollectiveId,
+  });
+};
+
+export const fakePaypalPlan = async (data = {}) => {
+  const product = data.ProductId
+    ? await models.PaypalProduct.findByPk(data.ProductId)
+    : await fakePaypalProduct(data.product || {});
+
+  const collective = await models.Collective.findByPk(product.CollectiveId);
+  return models.PaypalPlan.create({
+    currency: collective.currency || 'USD',
+    interval: sample(['month', 'year']),
+    amount: randAmount(),
+    id: randStr('PaypalPlan-'),
+    ...data,
+    ProductId: product.id,
   });
 };

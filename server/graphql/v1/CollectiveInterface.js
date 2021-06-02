@@ -60,6 +60,7 @@ export const TypeOfCollectiveType = new GraphQLEnumType({
     BOT: {},
     PROJECT: {},
     FUND: {},
+    VENDOR: {},
   },
 });
 
@@ -291,6 +292,9 @@ export const PlanType = new GraphQLObjectType({
     },
     hostFeeSharePercent: {
       type: GraphQLInt,
+    },
+    platformTips: {
+      type: GraphQLBoolean,
     },
   },
 });
@@ -584,6 +588,9 @@ export const CollectiveInterfaceType = new GraphQLInterfaceType({
       case types.FUND:
         return FundCollectiveType;
 
+      case types.VENDOR:
+        return VendorCollectiveType;
+
       default:
         return null;
     }
@@ -645,6 +652,10 @@ export const CollectiveInterfaceType = new GraphQLInterfaceType({
         type: GraphQLJSON,
         deprecationReason: '2020-10-08: This field is not provided anymore and will return an empty object',
       },
+      privateInstructions: {
+        type: GraphQLString,
+        description: 'Private instructions related to an event',
+      },
       githubContributors: { type: new GraphQLNonNull(GraphQLJSON) },
       slug: { type: GraphQLString },
       path: { type: GraphQLString },
@@ -656,6 +667,7 @@ export const CollectiveInterfaceType = new GraphQLInterfaceType({
       isArchived: { type: GraphQLBoolean },
       isApproved: { type: GraphQLBoolean },
       isDeletable: { type: GraphQLBoolean },
+      hasVirtualCards: { type: GraphQLBoolean },
       host: { type: CollectiveInterfaceType },
       hostCollective: { type: CollectiveInterfaceType },
       members: {
@@ -697,7 +709,7 @@ export const CollectiveInterfaceType = new GraphQLInterfaceType({
             type: GraphQLBoolean,
             defaultValue: true,
             description:
-              'Wether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.',
+              'Whether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.',
           },
         },
       },
@@ -741,7 +753,7 @@ export const CollectiveInterfaceType = new GraphQLInterfaceType({
           active: { type: GraphQLBoolean },
         },
       },
-      maxQuantity: { type: GraphQLInt },
+      maxQuantity: { type: GraphQLInt, deprecationReason: 'Not supported anymore' },
       tiers: {
         type: new GraphQLList(TierType),
         args: {
@@ -861,7 +873,7 @@ export const CollectiveInterfaceType = new GraphQLInterfaceType({
           batch: { type: GraphQLString },
           isConfirmed: {
             type: GraphQLBoolean,
-            description: 'Wether the gift card has been claimed or not',
+            description: 'Whether the gift card has been claimed or not',
           },
         },
       },
@@ -1100,6 +1112,18 @@ const CollectiveFields = () => {
         return {};
       },
     },
+    privateInstructions: {
+      type: GraphQLString,
+      description: 'Private instructions related to an event',
+      resolve(collective, _, req) {
+        if (
+          collective.type === types.EVENT &&
+          (req.remoteUser?.isAdminOfCollective(collective) || req.remoteUser?.hasRole(roles.PARTICIPANT, collective))
+        ) {
+          return collective.data?.privateInstructions;
+        }
+      },
+    },
     githubContributors: {
       type: new GraphQLNonNull(GraphQLJSON),
       resolve(collective) {
@@ -1191,7 +1215,7 @@ const CollectiveFields = () => {
           },
         });
         const expenseCount = await models.Expense.count({
-          where: { CollectiveId: collective.id, status: 'PAID' },
+          where: { [Op.or]: [{ CollectiveId: collective.id }, { FromCollectiveId: collective.id }], status: 'PAID' },
         });
         const eventCount = await models.Collective.count({
           where: { ParentCollectiveId: collective.id, type: types.EVENT },
@@ -1297,7 +1321,7 @@ const CollectiveFields = () => {
           type: GraphQLBoolean,
           defaultValue: true,
           description:
-            'Wether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.',
+            'Whether incognito profiles should be included in the result. Only works if requesting user is an admin of the account.',
         },
       },
       resolve(collective, args, req) {
@@ -1448,8 +1472,9 @@ const CollectiveFields = () => {
     },
     maxQuantity: {
       type: GraphQLInt,
-      resolve(collective) {
-        return collective.maxQuantity;
+      deprecationReason: 'Not supported anymore',
+      resolve() {
+        return null;
       },
     },
     tiers: {
@@ -1807,7 +1832,7 @@ const CollectiveFields = () => {
         batch: { type: GraphQLString },
         isConfirmed: {
           type: GraphQLBoolean,
-          description: 'Wether the gift card has been claimed or not',
+          description: 'Whether the gift card has been claimed or not',
         },
       },
       resolve: async (collective, args, req) => {
@@ -1888,6 +1913,12 @@ const CollectiveFields = () => {
       type: new GraphQLNonNull(new GraphQLList(GraphQLString)),
       resolve(collective) {
         return get(collective.data, 'categories', []);
+      },
+    },
+    hasVirtualCards: {
+      type: new GraphQLNonNull(GraphQLBoolean),
+      resolve(collective) {
+        return models.VirtualCard.count({ where: { CollectiveId: collective.id } });
       },
     },
   };
@@ -2023,6 +2054,13 @@ export const ProjectCollectiveType = new GraphQLObjectType({
 export const FundCollectiveType = new GraphQLObjectType({
   name: 'Fund',
   description: 'This represents a Fund',
+  interfaces: [CollectiveInterfaceType],
+  fields: CollectiveFields,
+});
+
+export const VendorCollectiveType = new GraphQLObjectType({
+  name: 'Vendor',
+  description: 'This represents a Vendor',
   interfaces: [CollectiveInterfaceType],
   fields: CollectiveFields,
 });

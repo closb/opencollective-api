@@ -17,8 +17,8 @@ export const Event = new GraphQLObjectType({
       ...AccountWithHostFields,
       ...AccountWithContributionsFields,
       parent: {
-        description: 'The Collective hosting this Event',
-        type: Collective,
+        description: 'The Account hosting this Event',
+        type: Account,
         async resolve(event, _, req) {
           if (!event.ParentCollectiveId) {
             return null;
