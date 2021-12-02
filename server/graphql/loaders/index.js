@@ -15,7 +15,9 @@ import conversationLoaders from './conversation';
 import * as expenseLoaders from './expenses';
 import { createDataLoaderWithOptions, sortResults } from './helpers';
 import { generateCollectivePayoutMethodsLoader, generateCollectivePaypalPayoutMethodsLoader } from './payout-method';
-import { generateCanSeeUserPrivateInfoLoader } from './user';
+import * as transactionLoaders from './transactions';
+import updatesLoader from './updates';
+import { generateCanSeeUserPrivateInfoLoader, generateUserByCollectiveIdLoader } from './user';
 import { generateCollectiveVirtualCardLoader, generateHostCollectiveVirtualCardLoader } from './virtual-card';
 
 export const loaders = req => {
@@ -28,6 +30,10 @@ export const loaders = req => {
   // Comment Reactions
   context.loaders.Comment.reactionsByCommentId = commentsLoader.reactionsByCommentId(req, cache);
   context.loaders.Comment.remoteUserReactionsByCommentId = commentsLoader.remoteUserReactionsByCommentId(req, cache);
+
+  // Update Reactions
+  context.loaders.Update.reactionsByUpdateId = updatesLoader.reactionsByUpdateId(req, cache);
+  context.loaders.Update.remoteUserReactionsByUpdateId = updatesLoader.remoteUserReactionsByUpdateId(req, cache);
 
   // Conversation
   context.loaders.Conversation.followers = conversationLoaders.followers(req, cache);
@@ -53,6 +59,7 @@ export const loaders = req => {
 
   // User
   context.loaders.User.canSeeUserPrivateInfo = generateCanSeeUserPrivateInfoLoader(req, cache);
+  context.loaders.User.byCollectiveId = generateUserByCollectiveIdLoader(req, cache);
 
   /** *** Collective *****/
 
@@ -177,7 +184,15 @@ export const loaders = req => {
         attributes: [
           'Order.CollectiveId',
           'Subscription.interval',
-          [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('Subscription.amount')), 0), 'total'],
+          [
+            sequelize.fn(
+              'SUM',
+              sequelize.literal(
+                `COALESCE("Order"."totalAmount", 0) - COALESCE(("Order"."data"->>'platformFee')::integer, 0)`,
+              ),
+            ),
+            'total',
+          ],
         ],
         where: {
           CollectiveId: { [Op.in]: ids },
@@ -209,18 +224,7 @@ export const loaders = req => {
     ),
   };
 
-  // getUserDetailsByCollectiveId
-  context.loaders.getUserDetailsByCollectiveId = new DataLoader(UserCollectiveIds =>
-    getListOfAccessibleMembers(req.remoteUser, UserCollectiveIds)
-      .then(accessibleUserCollectiveIds =>
-        models.User.findAll({
-          where: { CollectiveId: { [Op.in]: accessibleUserCollectiveIds } },
-        }),
-      )
-      .then(results => sortResults(UserCollectiveIds, results, 'CollectiveId', {})),
-  );
-
-  // getOrgDetailsByCollectiveId
+  // @deprecated Getting orgs emails by `CreatedByUserId` is unreliable. See https://github.com/opencollective/opencollective/issues/3415
   context.loaders.getOrgDetailsByCollectiveId = new DataLoader(OrgCollectiveIds =>
     getListOfAccessibleMembers(req.remoteUser, OrgCollectiveIds)
       .then(accessibleOrgCollectiveIds =>
@@ -559,6 +563,7 @@ export const loaders = req => {
 
   /** *** Transaction *****/
   context.loaders.Transaction = {
+    ...context.loaders.Transaction,
     byOrderId: new DataLoader(async keys => {
       const where = { OrderId: { [Op.in]: keys } };
       const order = [['createdAt', 'ASC']];
@@ -639,6 +644,8 @@ export const loaders = req => {
         });
       }),
     ),
+    hostFeeAmountForTransaction: transactionLoaders.generateHostFeeAmountForTransactionLoader(),
+    relatedTransactions: transactionLoaders.generateRelatedTransactionsLoader(),
   };
 
   return context.loaders;

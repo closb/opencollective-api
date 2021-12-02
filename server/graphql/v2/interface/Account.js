@@ -4,8 +4,10 @@ import GraphQLJSON from 'graphql-type-json';
 import { assign, get, invert, isEmpty } from 'lodash';
 
 import { types as CollectiveTypes } from '../../../constants/collectives';
+import { canSeeLegalName } from '../../../lib/user-permissions';
 import models, { Op } from '../../../models';
-import { NotFound, Unauthorized } from '../../errors';
+import { getContextPermission, PERMISSION_TYPE } from '../../common/context-permissions';
+import { BadRequest, NotFound, Unauthorized } from '../../errors';
 import { CollectiveFeatures } from '../../v1/CollectiveInterface.js';
 import { AccountCollection } from '../collection/AccountCollection';
 import { ConversationCollection } from '../collection/ConversationCollection';
@@ -23,9 +25,12 @@ import {
   OrderStatus,
   TransactionType,
 } from '../enum';
+import { PaymentMethodService } from '../enum/PaymentMethodService';
+import { PaymentMethodType } from '../enum/PaymentMethodType';
 import { idEncode } from '../identifiers';
 import { AccountReferenceInput, fetchAccountWithReference } from '../input/AccountReferenceInput';
 import { ChronologicalOrderInput } from '../input/ChronologicalOrderInput';
+import { ORDER_BY_PSEUDO_FIELDS, OrderByInput } from '../input/OrderByInput';
 import { AccountStats } from '../object/AccountStats';
 import { ConnectedAccount } from '../object/ConnectedAccount';
 import { Location } from '../object/Location';
@@ -34,7 +39,6 @@ import PayoutMethod from '../object/PayoutMethod';
 import { TagStats } from '../object/TagStats';
 import { TransferWise } from '../object/TransferWise';
 import EmailAddress from '../scalar/EmailAddress';
-import ISODateTime from '../scalar/ISODateTime';
 
 import { CollectionArgs } from './Collection';
 import { HasMembersFields } from './HasMembers';
@@ -60,6 +64,21 @@ const accountFieldsDefinition = () => ({
   },
   name: {
     type: GraphQLString,
+    description: 'Public name',
+  },
+  legalName: {
+    type: GraphQLString,
+    description: 'Private, legal name. Used for expense receipts, taxes, etc.',
+    resolve: (account, _, req) => {
+      if (
+        canSeeLegalName(req.remoteUser, account) ||
+        getContextPermission(req, PERMISSION_TYPE.SEE_ACCOUNT_LEGAL_NAME, account.id)
+      ) {
+        return account.legalName;
+      } else {
+        return null;
+      }
+    },
   },
   description: {
     type: GraphQLString,
@@ -131,11 +150,21 @@ const accountFieldsDefinition = () => ({
     type: new GraphQLNonNull(GraphQLBoolean),
     description: 'Returns true if the remote user is an admin of this account',
   },
+  parentAccount: {
+    type: Account,
+    async resolve(collective, _, req) {
+      if (!collective.ParentCollectiveId) {
+        return null;
+      } else {
+        return req.loaders.Collective.byId.load(collective.ParentCollectiveId);
+      }
+    },
+  },
   members: {
-    type: MemberCollection,
+    type: new GraphQLNonNull(MemberCollection),
     args: {
-      limit: { type: GraphQLInt, defaultValue: 100 },
-      offset: { type: GraphQLInt, defaultValue: 0 },
+      limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 100 },
+      offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
       role: { type: new GraphQLList(MemberRole) },
       email: {
         type: EmailAddress,
@@ -150,8 +179,8 @@ const accountFieldsDefinition = () => ({
   memberOf: {
     type: MemberOfCollection,
     args: {
-      limit: { type: GraphQLInt, defaultValue: 100 },
-      offset: { type: GraphQLInt, defaultValue: 0 },
+      limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 100 },
+      offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
       role: { type: new GraphQLList(MemberRole) },
       isApproved: {
         type: GraphQLBoolean,
@@ -170,16 +199,20 @@ const accountFieldsDefinition = () => ({
         description: 'Specific account to query the membership of.',
       },
       orderBy: {
-        type: new GraphQLNonNull(ChronologicalOrderInput),
-        defaultValue: ChronologicalOrderInput.defaultValue,
+        type: new GraphQLNonNull(OrderByInput),
+        defaultValue: { field: ORDER_BY_PSEUDO_FIELDS.CREATED_AT, direction: 'DESC' },
+      },
+      orderByRoles: {
+        type: GraphQLBoolean,
+        description: 'Order the query by requested role order',
       },
     },
   },
   transactions: {
-    type: TransactionCollection,
+    type: new GraphQLNonNull(TransactionCollection),
     args: {
-      limit: { type: GraphQLInt, defaultValue: 100 },
-      offset: { type: GraphQLInt, defaultValue: 0 },
+      limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 100 },
+      offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
       type: {
         type: TransactionType,
         description: 'Type of transaction (DEBIT/CREDIT)',
@@ -198,8 +231,8 @@ const accountFieldsDefinition = () => ({
   orders: {
     type: new GraphQLNonNull(OrderCollection),
     args: {
-      limit: { type: GraphQLInt, defaultValue: 100 },
-      offset: { type: GraphQLInt, defaultValue: 0 },
+      limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 100 },
+      offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
       filter: { type: AccountOrdersFilter },
       status: { type: new GraphQLList(OrderStatus) },
       tierSlug: { type: GraphQLString },
@@ -220,10 +253,10 @@ const accountFieldsDefinition = () => ({
     type: new GraphQLNonNull(GraphQLJSON),
   },
   conversations: {
-    type: ConversationCollection,
+    type: new GraphQLNonNull(ConversationCollection),
     args: {
-      limit: { type: GraphQLInt },
-      offset: { type: GraphQLInt },
+      limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 15 },
+      offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
       tag: {
         type: GraphQLString,
         description: 'Only return conversations matching this tag',
@@ -234,14 +267,14 @@ const accountFieldsDefinition = () => ({
     type: new GraphQLList(TagStats),
     description: "Returns conversation's tags for collective sorted by popularity",
     args: {
-      limit: { type: GraphQLInt, defaultValue: 30 },
+      limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 30 },
     },
   },
   expensesTags: {
     type: new GraphQLList(TagStats),
     description: 'Returns expense tags for collective sorted by popularity',
     args: {
-      limit: { type: GraphQLInt, defaultValue: 30 },
+      limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 30 },
     },
   },
   transferwise: {
@@ -265,9 +298,18 @@ const accountFieldsDefinition = () => ({
     type: new GraphQLList(PaymentMethod),
     description: 'The list of payment methods that this account can use to pay for Orders',
     args: {
-      types: {
-        type: new GraphQLList(GraphQLString),
-        description: 'Filter on given types (creditcard, giftcard...)',
+      type: {
+        type: new GraphQLList(PaymentMethodType),
+        description: 'Filter on given types (CREDITCARD, GIFTCARD...)',
+      },
+      enumType: {
+        type: new GraphQLList(PaymentMethodType),
+        description: 'Filter on given types (CREDITCARD, GIFTCARD...)',
+        deprecationReason: '2021-08-20: use type instead from now',
+      },
+      service: {
+        type: new GraphQLList(PaymentMethodService),
+        description: 'Filter on the given service types (opencollective, stripe, paypal...)',
       },
       includeExpired: {
         type: GraphQLBoolean,
@@ -298,18 +340,61 @@ const accountFieldsDefinition = () => ({
     type: new GraphQLNonNull(UpdateCollection),
     args: {
       ...CollectionArgs,
-      onlyPublishedUpdates: { type: GraphQLBoolean },
+      onlyPublishedUpdates: {
+        type: GraphQLBoolean,
+        defaultValue: false,
+        description: 'Only return published updates. You must be an admin of the account to see unpublished updates.',
+      },
+      onlyChangelogUpdates: { type: GraphQLBoolean },
+      orderBy: {
+        type: new GraphQLNonNull(ChronologicalOrderInput),
+        defaultValue: ChronologicalOrderInput.defaultValue,
+      },
+      searchTerm: { type: GraphQLString },
     },
-    async resolve(collective, { limit, offset, onlyPublishedUpdates }) {
+    async resolve(collective, { limit, offset, onlyPublishedUpdates, onlyChangelogUpdates, orderBy, searchTerm }, req) {
       let where = {
         CollectiveId: collective.id,
+        [Op.and]: [],
       };
-      if (onlyPublishedUpdates) {
+      if (onlyPublishedUpdates || !req.remoteUser?.isAdminOfCollective(collective)) {
         where = assign(where, { publishedAt: { [Op.ne]: null } });
       }
+      if (onlyChangelogUpdates) {
+        where = assign(where, { isChangelog: true });
+      }
+      const orderByFilter = [orderBy.field, orderBy.direction];
+
+      // Add search filter
+      let include;
+      if (searchTerm) {
+        const searchConditions = [];
+        include = [{ association: 'fromCollective', required: true, attributes: [] }];
+        const searchedId = searchTerm.match(/^#?(\d+)$/)?.[1];
+
+        // If search term starts with a `#`, only search by ID
+        if (searchTerm[0] !== '#' || !searchedId) {
+          const sanitizedTerm = searchTerm.replace(/(_|%|\\)/g, '\\$1');
+          const ilikeQuery = `%${sanitizedTerm}%`;
+          searchConditions.push(
+            { '$fromCollective.slug$': { [Op.iLike]: ilikeQuery } },
+            { '$fromCollective.name$': { [Op.iLike]: ilikeQuery } },
+            { $title$: { [Op.iLike]: ilikeQuery } },
+            { $html$: { [Op.iLike]: ilikeQuery } },
+          );
+        }
+
+        if (searchedId) {
+          searchConditions.push({ id: parseInt(searchedId) });
+        }
+
+        where[Op.and].push({ [Op.or]: searchConditions });
+      }
+
       const query = {
         where,
-        order: [['createdAt', 'DESC']],
+        include,
+        order: [orderByFilter],
         limit,
         offset,
       };
@@ -320,7 +405,7 @@ const accountFieldsDefinition = () => ({
   },
   features: {
     type: new GraphQLNonNull(CollectiveFeatures),
-    description: 'Describes the features enabled and available for this collective',
+    description: 'Describes the features enabled and available for this account',
     resolve(collective) {
       return collective;
     },
@@ -328,19 +413,23 @@ const accountFieldsDefinition = () => ({
   virtualCards: {
     type: new GraphQLNonNull(VirtualCardCollection),
     args: {
-      limit: { type: GraphQLInt, defaultValue: 100 },
-      offset: { type: GraphQLInt, defaultValue: 0 },
+      limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 100 },
+      offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
       state: { type: GraphQLString, defaultValue: null },
       merchantAccount: { type: AccountReferenceInput, defaultValue: null },
       dateFrom: {
-        type: ISODateTime,
+        type: GraphQLDateTime,
         defaultValue: null,
         description: 'Only return expenses that were created after this date',
       },
       dateTo: {
-        type: ISODateTime,
+        type: GraphQLDateTime,
         defaultValue: null,
         description: 'Only return expenses that were created before this date',
+      },
+      orderBy: {
+        type: ChronologicalOrderInput,
+        defaultValue: ChronologicalOrderInput.defaultValue,
       },
     },
     async resolve(account, args, req) {
@@ -360,6 +449,7 @@ const accountFieldsDefinition = () => ({
         },
         limit: args.limit,
         offset: args.offset,
+        order: [[args.orderBy.field, args.orderBy.direction]],
       };
 
       if (args.dateFrom) {
@@ -403,8 +493,8 @@ const accountFieldsDefinition = () => ({
   virtualCardMerchants: {
     type: new GraphQLNonNull(AccountCollection),
     args: {
-      limit: { type: GraphQLInt, defaultValue: 100 },
-      offset: { type: GraphQLInt, defaultValue: 0 },
+      limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 100 },
+      offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
     },
     async resolve(account, args, req) {
       if (!req.remoteUser?.isAdminOfCollective(account)) {
@@ -446,6 +536,43 @@ const accountFieldsDefinition = () => ({
       };
     },
   },
+  childrenAccounts: {
+    type: new GraphQLNonNull(AccountCollection),
+    args: {
+      limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 100 },
+      offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
+      accountType: {
+        type: new GraphQLList(AccountType),
+      },
+    },
+    async resolve(account, args) {
+      if (args.limit > 100) {
+        throw new BadRequest('Cannot fetch more than 100 accounts at the same time, please adjust the limit');
+      }
+
+      const where = {
+        ParentCollectiveId: account.id,
+      };
+      if (args.accountType && args.accountType.length > 0) {
+        where.type = {
+          [Op.in]: args.accountType.map(value => AccountTypeToModelMapping[value]),
+        };
+      }
+
+      const result = await models.Collective.findAndCountAll({
+        where,
+        limit: args.limit,
+        offset: args.offset,
+      });
+
+      return {
+        nodes: result.rows,
+        totalCount: result.count,
+        limit: args.limit,
+        offset: args.offset,
+      };
+    },
+  },
 });
 
 export const Account = new GraphQLInterfaceType({
@@ -458,8 +585,8 @@ const accountTransactions = {
   type: new GraphQLNonNull(TransactionCollection),
   args: {
     type: { type: TransactionType },
-    limit: { type: GraphQLInt, defaultValue: 100 },
-    offset: { type: GraphQLInt, defaultValue: 0 },
+    limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 100 },
+    offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
     orderBy: {
       type: ChronologicalOrderInput,
       defaultValue: ChronologicalOrderInput.defaultValue,
@@ -500,8 +627,8 @@ const accountTransactions = {
 const accountOrders = {
   type: new GraphQLNonNull(OrderCollection),
   args: {
-    limit: { type: GraphQLInt, defaultValue: 100 },
-    offset: { type: GraphQLInt, defaultValue: 0 },
+    limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 100 },
+    offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
     filter: { type: AccountOrdersFilter },
     status: { type: new GraphQLList(OrderStatus) },
     tierSlug: { type: GraphQLString },
@@ -654,10 +781,10 @@ export const AccountFields = {
   transactions: accountTransactions,
   orders: accountOrders,
   conversations: {
-    type: ConversationCollection,
+    type: new GraphQLNonNull(ConversationCollection),
     args: {
-      limit: { type: GraphQLInt },
-      offset: { type: GraphQLInt },
+      limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 15 },
+      offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
       tag: {
         type: GraphQLString,
         description: 'Only return conversations matching this tag',
@@ -682,7 +809,7 @@ export const AccountFields = {
     type: new GraphQLList(TagStats),
     description: "Returns conversation's tags for collective sorted by popularity",
     args: {
-      limit: { type: GraphQLInt, defaultValue: 30 },
+      limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 30 },
     },
     async resolve(collective, _, { limit }) {
       return models.Conversation.getMostPopularTagsForCollective(collective.id, limit);
@@ -692,7 +819,7 @@ export const AccountFields = {
     type: new GraphQLList(TagStats),
     description: 'Returns expense tags for collective sorted by popularity',
     args: {
-      limit: { type: GraphQLInt, defaultValue: 30 },
+      limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 30 },
     },
     async resolve(collective, _, { limit }) {
       return models.Expense.getMostPopularExpenseTagsForCollective(collective.id, limit);
@@ -712,8 +839,14 @@ export const AccountFields = {
   paymentMethods: {
     type: new GraphQLNonNull(new GraphQLList(PaymentMethod)),
     args: {
-      // TODO: Should filter by providerType
-      types: { type: new GraphQLList(GraphQLString) },
+      type: {
+        type: new GraphQLList(PaymentMethodType),
+      },
+      enumType: {
+        type: new GraphQLList(PaymentMethodType),
+        deprecationReason: '2021-08-20: use type instead from now',
+      },
+      service: { type: new GraphQLList(PaymentMethodService) },
       includeExpired: {
         type: GraphQLBoolean,
         description:
@@ -730,7 +863,11 @@ export const AccountFields = {
       const paymentMethods = await req.loaders.PaymentMethod.findByCollectiveId.load(collective.id);
 
       return paymentMethods.filter(pm => {
-        if (args.types && !args.types.includes(pm.type)) {
+        if (args.enumType && !args.enumType.map(t => t.toLowerCase()).includes(pm.type)) {
+          return false;
+        } else if (args.type && !args.type.map(t => t.toLowerCase()).includes(pm.type)) {
+          return false;
+        } else if (args.service && !args.service.map(s => s.toLowerCase()).includes(pm.service)) {
           return false;
         } else if (pm.data?.hidden) {
           return false;

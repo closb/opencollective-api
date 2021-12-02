@@ -4,11 +4,12 @@ import { get } from 'lodash';
 import Temporal from 'sequelize-temporal';
 
 import { roles } from '../constants';
-import { types as CollectiveType } from '../constants/collectives';
 import status from '../constants/order_status';
+import TierType from '../constants/tiers';
 import { PLATFORM_TIP_TRANSACTION_PROPERTIES, TransactionTypes } from '../constants/transactions';
 import * as libPayments from '../lib/payments';
 import sequelize, { DataTypes } from '../lib/sequelize';
+import { sanitizeTags, validateTags } from '../lib/tags';
 import { capitalize } from '../lib/utils';
 
 import CustomDataTypes from './DataTypes';
@@ -78,6 +79,22 @@ function defineModel() {
       },
 
       currency: CustomDataTypes(DataTypes).currency,
+
+      tags: {
+        type: DataTypes.ARRAY(DataTypes.STRING),
+        allowNull: true,
+        validate: {
+          validateTags,
+        },
+        set(tags) {
+          const sanitizedTags = sanitizeTags(tags);
+          if (!sanitizedTags?.length) {
+            this.setDataValue('tags', null);
+          } else {
+            this.setDataValue('tags', sanitizedTags);
+          }
+        },
+      },
 
       totalAmount: {
         type: DataTypes.INTEGER, // Total amount of the order in cents
@@ -226,7 +243,7 @@ function defineModel() {
     if (interval) {
       return `${capitalize(interval)}ly financial contribution to ${collective.name}${tierNameInfo}`;
     } else {
-      const isRegistration = amount === 0 || collective.type === CollectiveType.EVENT;
+      const isRegistration = tier?.type === TierType.TICKET;
       return `${isRegistration ? 'Registration' : 'Financial contribution'} to ${collective.name}${tierNameInfo}`;
     }
   };
@@ -288,11 +305,14 @@ function defineModel() {
   Order.prototype.getOrCreateMembers = async function () {
     // Preload data
     this.collective = this.collective || (await this.getCollective());
-
-    // Register user as collective backer
+    let tier;
+    if (this.TierId) {
+      tier = await this.getTier();
+    }
+    // Register user as collective backer or an attendee (for events)
     const member = await this.collective.findOrAddUserWithRole(
       { id: this.CreatedByUserId, CollectiveId: this.FromCollectiveId },
-      roles.BACKER,
+      tier?.type === TierType.TICKET ? roles.ATTENDEE : roles.BACKER,
       { TierId: this.TierId },
       { order: this },
     );

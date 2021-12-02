@@ -1,8 +1,14 @@
-import { GraphQLFloat, GraphQLInt, GraphQLInterfaceType, GraphQLObjectType, GraphQLString } from 'graphql';
+import {
+  GraphQLBoolean,
+  GraphQLFloat,
+  GraphQLInt,
+  GraphQLInterfaceType,
+  GraphQLObjectType,
+  GraphQLString,
+} from 'graphql';
 import { get } from 'lodash';
 
 import models from '../../models';
-import { idEncode } from '../v2/identifiers';
 
 import { CollectiveInterfaceType, UserCollectiveType } from './CollectiveInterface';
 import { DateString, ExpenseType, OrderType, PaymentMethodType, SubscriptionType, UserType } from './types';
@@ -29,8 +35,28 @@ export const TransactionInterfaceType = new GraphQLInterfaceType({
       currency: { type: GraphQLString },
       hostCurrency: { type: GraphQLString },
       hostCurrencyFxRate: { type: GraphQLFloat },
-      netAmountInCollectiveCurrency: { type: GraphQLInt },
-      hostFeeInHostCurrency: { type: GraphQLInt },
+      netAmountInCollectiveCurrency: {
+        type: GraphQLInt,
+        description: 'Amount after fees received by the collective in the lowest unit of its own currency (ie. cents)',
+        args: {
+          fetchHostFee: {
+            type: GraphQLBoolean,
+            defaultValue: false,
+            description: 'Fetch HOST_FEE transaction and integrate in calculation for retro-compatiblity.',
+          },
+        },
+      },
+      hostFeeInHostCurrency: {
+        type: GraphQLInt,
+        description: 'Fee kept by the host in the lowest unit of the currency of the host (ie. in cents)',
+        args: {
+          fetchHostFee: {
+            type: GraphQLBoolean,
+            defaultValue: false,
+            description: 'Fetch HOST_FEE transaction for retro-compatiblity.',
+          },
+        },
+      },
       platformFeeInHostCurrency: { type: GraphQLInt },
       paymentProcessorFeeInHostCurrency: { type: GraphQLInt },
       taxAmount: { type: GraphQLInt },
@@ -41,6 +67,7 @@ export const TransactionInterfaceType = new GraphQLInterfaceType({
       usingGiftCardFromCollective: { type: CollectiveInterfaceType },
       collective: { type: CollectiveInterfaceType },
       type: { type: GraphQLString },
+      kind: { type: GraphQLString },
       description: { type: GraphQLString },
       createdAt: { type: DateString },
       updatedAt: { type: DateString },
@@ -60,7 +87,7 @@ const TransactionFields = () => {
     idV2: {
       type: GraphQLString,
       resolve(transaction) {
-        return idEncode(transaction.id, 'transaction');
+        return transaction.uuid;
       },
     },
     refundTransaction: {
@@ -87,6 +114,12 @@ const TransactionFields = () => {
       type: GraphQLString,
       resolve(transaction) {
         return transaction.type;
+      },
+    },
+    kind: {
+      type: GraphQLString,
+      resolve(transaction) {
+        return transaction.kind;
       },
     },
     amount: {
@@ -118,7 +151,17 @@ const TransactionFields = () => {
     hostFeeInHostCurrency: {
       type: GraphQLInt,
       description: 'Fee kept by the host in the lowest unit of the currency of the host (ie. in cents)',
-      resolve(transaction) {
+      args: {
+        fetchHostFee: {
+          type: GraphQLBoolean,
+          defaultValue: false,
+          description: 'Fetch HOST_FEE transaction for retro-compatiblity.',
+        },
+      },
+      resolve(transaction, args, req) {
+        if (args.fetchHostFee && !transaction.hostFeeInHostCurrency) {
+          return req.loaders.Transaction.hostFeeAmountForTransaction.load(transaction);
+        }
         return transaction.hostFeeInHostCurrency;
       },
     },
@@ -144,7 +187,20 @@ const TransactionFields = () => {
     netAmountInCollectiveCurrency: {
       type: GraphQLInt,
       description: 'Amount after fees received by the collective in the lowest unit of its own currency (ie. cents)',
-      resolve(transaction) {
+      args: {
+        fetchHostFee: {
+          type: GraphQLBoolean,
+          defaultValue: false,
+          description: 'Fetch HOST_FEE transaction and integrate in calculation for retro-compatiblity.',
+        },
+      },
+      async resolve(transaction, args, req) {
+        if (args.fetchHostFee && !transaction.hostFeeInHostCurrency) {
+          transaction.hostFeeInHostCurrency = await req.loaders.Transaction.hostFeeAmountForTransaction.load(
+            transaction,
+          );
+          return models.Transaction.calculateNetAmountInCollectiveCurrency(transaction);
+        }
         return transaction.netAmountInCollectiveCurrency;
       },
     },
@@ -178,10 +234,10 @@ const TransactionFields = () => {
         if (transaction && transaction.getCreatedByUser) {
           const collective = await transaction.getCollective();
           const fromCollective = await transaction.getFromCollective();
-          if (fromCollective.isIncognito && (!req.remoteUser || !req.remoteUser.isAdminOfCollective(collective))) {
+          if (fromCollective.isIncognito && !req.remoteUser?.isAdminOfCollectiveOrHost(collective)) {
             return {};
           }
-          if (collective.isIncognito && (!req.remoteUser || !req.remoteUser.isAdminOfCollective(fromCollective))) {
+          if (collective.isIncognito && !req.remoteUser?.isAdminOfCollectiveOrHost(fromCollective)) {
             return {};
           }
           return transaction.getCreatedByUser();

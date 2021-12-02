@@ -13,7 +13,7 @@ export const getTransactionPdf = async (transaction, user) => {
   if (parseToBoolean(config.pdfService.fetchTransactionsReceipts) === false) {
     return;
   }
-  const pdfUrl = `${config.host.pdf}/transactions/${transaction.uuid}/invoice.pdf`;
+  const pdfUrl = `${config.host.pdf}/receipts/transactions/${transaction.uuid}/receipt.pdf`;
   const accessToken = user.jwt({}, TOKEN_EXPIRATION_PDF);
   const headers = {
     Authorization: `Bearer ${accessToken}`,
@@ -23,7 +23,7 @@ export const getTransactionPdf = async (transaction, user) => {
     .then(response => {
       const { status } = response;
       if (status >= 200 && status < 300) {
-        return response.body;
+        return response.arrayBuffer().then(ab => Buffer.from(ab));
       } else {
         logger.warn('Failed to fetch PDF');
         return null;
@@ -35,19 +35,25 @@ export const getTransactionPdf = async (transaction, user) => {
 };
 
 export const getConsolidatedInvoicesData = async fromCollective => {
+  const fromAccountCondition = [fromCollective.id];
+
+  const fromUser = await fromCollective.getUser();
+  if (fromUser) {
+    const incognitoProfile = await fromUser.getIncognitoProfile();
+    if (incognitoProfile) {
+      fromAccountCondition.push(incognitoProfile.id);
+    }
+  }
+
+  const where = {
+    kind: ['CONTRIBUTION', 'PLATFORM_TIP'],
+    createdAt: { [Op.lt]: moment().startOf('month') },
+    [Op.or]: [{ FromCollectiveId: fromAccountCondition }, { UsingGiftCardFromCollectiveId: fromCollective.id }],
+  };
+
   const transactions = await models.Transaction.findAll({
-    attributes: ['createdAt', 'HostCollectiveId', 'amountInHostCurrency', 'hostCurrency', 'CollectiveId'],
-    where: {
-      CollectiveId: { [Op.not]: fromCollective.id },
-      ExpenseId: { [Op.eq]: null },
-      createdAt: { [Op.lt]: moment().startOf('month') },
-      [Op.or]: [
-        { FromCollectiveId: fromCollective.id, type: 'DEBIT', isRefund: true },
-        { FromCollectiveId: fromCollective.id, type: 'CREDIT' },
-        { FromCollectiveId: fromCollective.id, UsingGiftCardFromCollectiveId: null },
-        { UsingGiftCardFromCollectiveId: fromCollective.id },
-      ],
-    },
+    attributes: ['createdAt', 'HostCollectiveId'],
+    where,
   });
 
   const hostsById = {};
@@ -71,9 +77,6 @@ export const getConsolidatedInvoicesData = async fromCollective => {
     const month = createdAt.getMonth() + 1;
     const monthToDigit = month < 10 ? `0${month}` : `${month}`;
     const slug = `${year}${monthToDigit}.${hostsById[HostCollectiveId].slug}.${fromCollective.slug}`;
-    const totalAmount = invoicesByKey[slug]
-      ? invoicesByKey[slug].totalAmount + transaction.amountInHostCurrency
-      : transaction.amountInHostCurrency;
     const totalTransactions = invoicesByKey[slug] ? invoicesByKey[slug].totalTransactions + 1 : 1;
 
     invoicesByKey[slug] = {
@@ -82,9 +85,7 @@ export const getConsolidatedInvoicesData = async fromCollective => {
       slug,
       year,
       month,
-      totalAmount,
       totalTransactions,
-      currency: transaction.hostCurrency,
     };
   }
 
@@ -125,7 +126,7 @@ export const getConsolidatedInvoicePdfs = async fromCollective => {
     });
 
     // Call PDF service for the invoice
-    const pdfUrl = `${config.host.pdf}/collectives/${fromCollectiveSlug}/${toOrgCollectiveSlug}/${startOfMonth}/${endOfMonth}.pdf`;
+    const pdfUrl = `${config.host.pdf}/receipts/collectives/${fromCollectiveSlug}/${toOrgCollectiveSlug}/${startOfMonth}/${endOfMonth}/receipt.pdf`;
     const accessToken = fromCollectiveUser.jwt({}, TOKEN_EXPIRATION_PDF);
     const headers = {
       Authorization: `Bearer ${accessToken}`,
@@ -137,7 +138,7 @@ export const getConsolidatedInvoicePdfs = async fromCollective => {
 
       const { status } = response;
       if (status >= 200 && status < 300) {
-        invoicePdf = response.body;
+        invoicePdf = await response.text();
       } else {
         logger.warn('Failed to fetch PDF');
       }

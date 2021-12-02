@@ -1,23 +1,30 @@
 import assert from 'assert';
 
 import Promise from 'bluebird';
+import config from 'config';
 import debugLib from 'debug';
-import { defaultsDeep, get, isNil, isNull, isUndefined, omit, pick } from 'lodash';
+import { get, isNil, isNull, isUndefined, omit, pick } from 'lodash';
 import moment from 'moment';
 import { v4 as uuid } from 'uuid';
 
 import activities from '../constants/activities';
 import { TransactionKind } from '../constants/transaction-kind';
-import { PLATFORM_TIP_TRANSACTION_PROPERTIES, TransactionTypes } from '../constants/transactions';
+import {
+  HOST_FEE_SHARE_TRANSACTION_PROPERTIES,
+  PLATFORM_TIP_TRANSACTION_PROPERTIES,
+  TransactionTypes,
+} from '../constants/transactions';
 import { getFxRate } from '../lib/currency';
 import { toNegative } from '../lib/math';
-import { calcFee } from '../lib/payments';
+import { calcFee, getHostFeeSharePercent, getPlatformTip } from '../lib/payments';
 import { stripHTML } from '../lib/sanitize-html';
 import sequelize, { DataTypes, Op } from '../lib/sequelize';
-import { exportToCSV } from '../lib/utils';
+import { exportToCSV, parseToBoolean } from '../lib/utils';
 
 import CustomDataTypes from './DataTypes';
 import { TransactionSettlementStatus } from './TransactionSettlement';
+
+const { CREDIT, DEBIT } = TransactionTypes;
 
 const debug = debugLib('models:Transaction');
 
@@ -157,6 +164,10 @@ function defineModel() {
       hostFeeInHostCurrency: DataTypes.INTEGER,
       paymentProcessorFeeInHostCurrency: DataTypes.INTEGER,
       taxAmount: { type: DataTypes.INTEGER },
+
+      /**
+       * TODO: Rename this field, as it's always expressed with `currency`. It should just be `netAmount`
+       */
       netAmountInCollectiveCurrency: DataTypes.INTEGER, // stores the net amount received by the collective (after fees) or removed from the collective (including fees)
 
       data: DataTypes.JSONB,
@@ -205,12 +216,7 @@ function defineModel() {
 
       getterMethods: {
         netAmountInHostCurrency() {
-          return (
-            this.amountInHostCurrency +
-            this.paymentProcessorFeeInHostCurrency +
-            this.platformFeeInHostCurrency +
-            this.hostFeeInHostCurrency
-          );
+          return Transaction.calculateNetAmountInHostCurrency(this);
         },
 
         amountSentToHostInHostCurrency() {
@@ -251,8 +257,8 @@ function defineModel() {
       },
 
       hooks: {
-        afterCreate: (transaction, options) => {
-          Transaction.createActivity(transaction, { transaction: options.transaction });
+        afterCreate: transaction => {
+          Transaction.createActivity(transaction);
           // intentionally returns null, needs to be async (https://github.com/petkaantonov/bluebird/blob/master/docs/docs/warning-explanations.md#warning-a-promise-was-created-in-a-handler-but-was-not-returned-from-it)
           return null;
         },
@@ -328,34 +334,46 @@ function defineModel() {
   };
 
   Transaction.prototype.hasPlatformTip = function () {
-    return Boolean(this.data?.isFeesOnTop && this.kind !== TransactionKind.PLATFORM_TIP);
+    return Boolean(
+      this.data?.isFeesOnTop &&
+        this.kind !== TransactionKind.PLATFORM_TIP &&
+        this.kind !== TransactionKind.PLATFORM_TIP_DEBT,
+    );
+  };
+
+  Transaction.prototype.getRelatedTransaction = function (options) {
+    return models.Transaction.findOne({
+      where: {
+        TransactionGroup: this.TransactionGroup,
+        type: options.type || this.type,
+        kind: options.kind || this.kind,
+        isDebt: options.isDebt || { [Op.not]: true },
+      },
+    });
   };
 
   Transaction.prototype.getPlatformTipTransaction = function () {
-    if (this.hasPlatformTip()) {
-      return models.Transaction.findOne({
-        where: {
-          ...pick(PLATFORM_TIP_TRANSACTION_PROPERTIES, ['CollectiveId']),
-          type: this.type,
-          TransactionGroup: this.TransactionGroup,
-          kind: TransactionKind.PLATFORM_TIP,
-          isDebt: { [Op.not]: true },
-        },
-      });
-    }
+    return this.getRelatedTransaction({ kind: TransactionKind.PLATFORM_TIP });
+  };
+
+  Transaction.prototype.getPlatformTipDebtTransaction = function () {
+    return this.getRelatedTransaction({ kind: TransactionKind.PLATFORM_TIP_DEBT, isDebt: true });
+  };
+
+  Transaction.prototype.getHostFeeTransaction = function () {
+    return this.getRelatedTransaction({ kind: TransactionKind.HOST_FEE });
+  };
+
+  Transaction.prototype.getHostFeeShareTransaction = function () {
+    return this.getRelatedTransaction({ kind: TransactionKind.HOST_FEE_SHARE });
+  };
+
+  Transaction.prototype.getHostFeeShareDebtTransaction = function () {
+    return this.getRelatedTransaction({ kind: TransactionKind.HOST_FEE_SHARE_DEBT, isDebt: true });
   };
 
   Transaction.prototype.getOppositeTransaction = async function () {
-    return models.Transaction.findOne({
-      where: {
-        type: this.type === 'CREDIT' ? 'DEBIT' : 'CREDIT',
-        CollectiveId: this.FromCollectiveId,
-        FromCollectiveId: this.CollectiveId,
-        TransactionGroup: this.TransactionGroup,
-        kind: this.kind,
-        isDebt: this.isDebt,
-      },
-    });
+    return this.getRelatedTransaction({ type: this.type === CREDIT ? DEBIT : CREDIT, isDebt: this.isDebt });
   };
 
   Transaction.prototype.setCurrency = async function (currency) {
@@ -418,6 +436,7 @@ function defineModel() {
           'platformFeeInHostCurrency',
           'netAmountInHostCurrency',
           'amountInHostCurrency',
+          'taxAmount',
         ].indexOf(attr) !== -1
       ) {
         return value / 100; // converts cents
@@ -446,8 +465,9 @@ function defineModel() {
       'isRefund',
     ];
 
-    // We only add tax amount for european hosts
-    if (transactions[0].hostCurrency === 'EUR') {
+    // We only add tax amount for relevant hosts (subject to VAT or GST)
+    const mightHaveTaxes = transaction => transaction.taxAmount || ['NZD', 'EUR'].includes(transaction.hostCurrency);
+    if (transactions.some(mightHaveTaxes)) {
       attributes.splice(5, 0, 'taxAmount');
     }
 
@@ -492,6 +512,11 @@ function defineModel() {
     transaction.netAmountInCollectiveCurrency = transaction.netAmountInCollectiveCurrency || transaction.amount;
     transaction.TransactionGroup = transaction.TransactionGroup || uuid();
     transaction.hostCurrencyFxRate = transaction.hostCurrencyFxRate || 1;
+
+    // If FromCollectiveId = CollectiveId, we only create one transaction (DEBIT or CREDIT)
+    if (transaction.FromCollectiveId === transaction.CollectiveId) {
+      return Transaction.create(transaction, opts);
+    }
 
     if (!isUndefined(transaction.amountInHostCurrency)) {
       // ensure this is always INT
@@ -566,10 +591,7 @@ function defineModel() {
     if (transaction.amount < 0) {
       index = 0;
       transactions.push(transaction);
-      // Skip CREDIT when inserting a DEBIT to itself
-      if (transaction.CollectiveId !== transaction.FromCollectiveId) {
-        transactions.push(oppositeTransaction);
-      }
+      transactions.push(oppositeTransaction);
     } else {
       index = 1;
       transactions.push(oppositeTransaction);
@@ -582,41 +604,46 @@ function defineModel() {
   /**
    * Record a debt transaction and its associated settlement
    */
-  Transaction.createPlatformTipDebtTransactions = async (tipCreditTransactionData, host) => {
-    if (tipCreditTransactionData.type === 'DEBIT') {
-      throw new Error('createPlatformTipDebtTransactions must be given a CREDIT');
+  Transaction.createPlatformTipDebtTransactions = async ({ platformTipTransaction }, host) => {
+    if (platformTipTransaction.type === DEBIT) {
+      throw new Error('createPlatformTipDebtTransactions must be given a CREDIT transaction');
     }
 
-    const hostToPlatformFxRate = tipCreditTransactionData.data?.hostToPlatformFxRate || 1;
-    const amountInHostCurrency = Math.round(
-      tipCreditTransactionData.netAmountInCollectiveCurrency / hostToPlatformFxRate,
-    );
-
     // Create debt transaction
-    const debtTransactionData = {
-      ...omit(tipCreditTransactionData, ['id', 'uuid', 'PaymentMethodId', 'data']), // TODO: We may want to remove the OrderId here
-      type: 'CREDIT',
-      description: 'Platform Tip collected for Open Collective',
-      amountInHostCurrency,
-      amount: amountInHostCurrency,
-      netAmountInCollectiveCurrency: amountInHostCurrency,
-      currency: host.currency,
-      hostCurrency: host.currency,
-      data: { hostToPlatformFxRate },
-      CollectiveId: host.id,
-      FromCollectiveId: PLATFORM_TIP_TRANSACTION_PROPERTIES.CollectiveId,
-      HostCollectiveId: host.id,
-      kind: TransactionKind.PLATFORM_TIP,
+    const platformTipDebtTransactionData = {
+      // Copy base values from the original CREDIT PLATFORM_TIP
+      ...pick(platformTipTransaction.dataValues, [
+        'TransactionGroup',
+        'CollectiveId',
+        'HostCollectiveId',
+        'OrderId',
+        'createdAt',
+        'currency',
+        'hostCurrency',
+        'hostCurrencyFxRate',
+      ]),
+      type: DEBIT,
+      kind: TransactionKind.PLATFORM_TIP_DEBT,
       isDebt: true,
+      description: 'Platform Tip collected for Open Collective',
+      FromCollectiveId: host.id,
+      // Opposite amounts
+      amount: -platformTipTransaction.amount,
+      netAmountInCollectiveCurrency: -platformTipTransaction.netAmountInCollectiveCurrency,
+      amountInHostCurrency: -platformTipTransaction.amountInHostCurrency,
+      // No fees
+      platformFeeInHostCurrency: 0,
+      hostFeeInHostCurrency: 0,
+      paymentProcessorFeeInHostCurrency: 0,
     };
 
-    const debtTransaction = await Transaction.createDoubleEntry(debtTransactionData);
+    const platformTipDebtTransaction = await Transaction.createDoubleEntry(platformTipDebtTransactionData);
 
     // Create settlement
     const settlementStatus = TransactionSettlementStatus.OWED;
-    await models.TransactionSettlement.createForTransaction(debtTransaction, settlementStatus);
+    await models.TransactionSettlement.createForTransaction(platformTipDebtTransaction, settlementStatus);
 
-    return debtTransaction;
+    return platformTipDebtTransaction;
   };
 
   /**
@@ -625,122 +652,333 @@ function defineModel() {
    * @param {models.Collective} The host
    * @param {boolean} Whether tip has been collected already (no debt needed)
    */
-  Transaction.createPlatformTipTransactions = async (transaction, host, isDirectlyCollected = false) => {
-    if (!transaction.data?.isFeesOnTop) {
-      throw new Error('This transaction does not have fees on top');
-    } else if (!transaction.platformFeeInHostCurrency) {
+  Transaction.createPlatformTipTransactions = async (transactionData, host, isDirectlyCollected = false) => {
+    const platformTip = getPlatformTip(transactionData);
+    if (!platformTip) {
       return;
     }
 
-    // Calculate the paymentProcessorFee proportional to the feeOnTop amount
-    const feeOnTopPercent = Math.abs(transaction.platformFeeInHostCurrency / transaction.amountInHostCurrency);
-    const feeOnTopPaymentProcessorFee = host?.data?.reimbursePaymentProcessorFeeOnTips
-      ? toNegative(Math.round(transaction.paymentProcessorFeeInHostCurrency * feeOnTopPercent))
-      : 0;
-    const platformCurrencyFxRate = await getFxRate(transaction.currency, PLATFORM_TIP_TRANSACTION_PROPERTIES.currency);
-    const platformTipTransactionData = defaultsDeep(
-      {},
-      PLATFORM_TIP_TRANSACTION_PROPERTIES,
-      {
-        description: 'Financial contribution to Open Collective',
-        amount: Math.round(Math.abs(transaction.platformFeeInHostCurrency) * platformCurrencyFxRate),
-        amountInHostCurrency: Math.round(Math.abs(transaction.platformFeeInHostCurrency) * platformCurrencyFxRate),
-        platformFeeInHostCurrency: 0,
-        hostFeeInHostCurrency: 0,
-        kind: TransactionKind.PLATFORM_TIP,
-        // Represent the paymentProcessorFee in USD
-        paymentProcessorFeeInHostCurrency: Math.round(feeOnTopPaymentProcessorFee * platformCurrencyFxRate),
-        // Calculate the netAmount by deducting the proportional paymentProcessorFee
-        netAmountInCollectiveCurrency: Math.round(
-          (Math.abs(transaction.platformFeeInHostCurrency) + feeOnTopPaymentProcessorFee) * platformCurrencyFxRate,
-        ),
-        // This is always 1 because OpenCollective and OpenCollective Inc (Host) are in USD.
-        hostCurrencyFxRate: 1,
-        TransactionGroup: transaction.TransactionGroup,
-        isDebt: false,
-        data: {
-          hostToPlatformFxRate: await getFxRate(transaction.hostCurrency, PLATFORM_TIP_TRANSACTION_PROPERTIES.currency),
-          feeOnTopPaymentProcessorFee,
-          settled: transaction.data?.settled,
-        },
-      },
-      transaction,
+    // amount of the CREDIT should be in the same currency as the original transaction
+    const amount = platformTip;
+    const currency = transactionData.currency;
+
+    // amountInHostCurrency of the CREDIT should be in platform currency
+    const hostCurrency = PLATFORM_TIP_TRANSACTION_PROPERTIES.currency;
+    const hostCurrencyFxRate = await Transaction.getFxRate(currency, hostCurrency, transactionData);
+    const amountInHostCurrency = Math.round(amount * hostCurrencyFxRate);
+
+    // we compute the Fx Rate between the original hostCurrency and the platform currency
+    // it might be used later
+    const hostToPlatformFxRate = await Transaction.getFxRate(
+      transactionData.hostCurrency,
+      PLATFORM_TIP_TRANSACTION_PROPERTIES.currency,
+      transactionData,
     );
+
+    const platformTipTransactionData = {
+      ...pick(transactionData, [
+        'TransactionGroup',
+        'FromCollectiveId',
+        'OrderId',
+        'CreatedByUserId',
+        'PaymentMethodId',
+        'UsingGiftCardFromCollectiveId',
+      ]),
+      type: CREDIT,
+      kind: TransactionKind.PLATFORM_TIP,
+      description: 'Financial contribution to Open Collective',
+      CollectiveId: PLATFORM_TIP_TRANSACTION_PROPERTIES.CollectiveId,
+      HostCollectiveId: PLATFORM_TIP_TRANSACTION_PROPERTIES.HostCollectiveId,
+      // Compute Amounts
+      amount,
+      netAmountInCollectiveCurrency: amount,
+      currency,
+      amountInHostCurrency,
+      hostCurrency,
+      hostCurrencyFxRate,
+      // No fees
+      platformFeeInHostCurrency: 0,
+      hostFeeInHostCurrency: 0,
+      paymentProcessorFeeInHostCurrency: 0,
+      // Extra data
+      isDebt: false,
+      data: {
+        hostToPlatformFxRate,
+        settled: transactionData.data?.settled,
+      },
+    };
 
     const platformTipTransaction = await Transaction.createDoubleEntry(platformTipTransactionData);
     let platformTipDebtTransaction;
     if (!isDirectlyCollected) {
       platformTipDebtTransaction = await Transaction.createPlatformTipDebtTransactions(
-        platformTipTransactionData,
+        { transaction: transactionData, platformTipTransaction },
         host,
       );
     }
 
-    // Deduct the paymentProcessorFee we considered part of the feeOnTop donation
-    transaction.paymentProcessorFeeInHostCurrency =
-      transaction.paymentProcessorFeeInHostCurrency - feeOnTopPaymentProcessorFee;
-    // Recalculate amount
-    transaction.amountInHostCurrency = transaction.amountInHostCurrency + transaction.platformFeeInHostCurrency;
-    transaction.amount = Math.round(
-      transaction.amount + transaction.platformFeeInHostCurrency / (transaction.hostCurrencyFxRate || 1),
-    );
-    // Reset the platformFee because we're accounting for this value in a separate set of transactions
-    transaction.platformFeeInHostCurrency = 0;
+    // If we have platformTipInHostCurrency available, we trust it, otherwise we compute it
+    const platformTipInHostCurrency =
+      transactionData.data?.platformTipInHostCurrency || Math.round(platformTip * transactionData.hostCurrencyFxRate);
 
-    return { transaction, platformTipTransaction, platformTipDebtTransaction };
+    // Recalculate amount
+    transactionData.amountInHostCurrency = Math.round(transactionData.amountInHostCurrency - platformTipInHostCurrency);
+    transactionData.amount = Math.round(transactionData.amount - platformTip);
+
+    // Reset the platformFee because we're accounting for this value in a separate set of transactions
+    // This way of passing tips is deprecated but still used in some older tests
+    transactionData.platformFeeInHostCurrency = 0;
+
+    return { transaction: transactionData, platformTipTransaction, platformTipDebtTransaction };
+  };
+
+  Transaction.validateContributionPayload = payload => {
+    if (!payload.amount || payload.amount < 0) {
+      throw new Error('amount should be set and positive');
+    }
+    if (!payload.currency) {
+      throw new Error('currency should be set');
+    }
+    if (payload.hostCurrency && (!payload.amountInHostCurrency || payload.amountInHostCurrency < 0)) {
+      throw new Error('amountInHostCurrency should be set and positive');
+    }
+    if (payload.amountInHostCurrency && !payload.hostCurrency) {
+      throw new Error('hostCurrency should be set');
+    }
+    if (payload.type && payload.type !== 'CREDIT') {
+      throw new Error('type should be null or CREDIT');
+    }
+    if (!isNil(payload.netAmountInCollectiveCurrency)) {
+      throw new Error('netAmountInCollectiveCurrency should not be set');
+    }
+  };
+
+  Transaction.createHostFeeTransactions = async (transaction, host, data) => {
+    if (!transaction.hostFeeInHostCurrency) {
+      return;
+    }
+
+    // The reference value is currently passed as "hostFeeInHostCurrency"
+    const amountInHostCurrency = Math.abs(transaction.hostFeeInHostCurrency);
+    const hostCurrency = transaction.hostCurrency;
+    const hostCurrencyFxRate = transaction.hostCurrencyFxRate;
+
+    // For the Collective/Fund, we calculate the matching amount using the hostCurrencyFxRate
+    const amount = Math.round(amountInHostCurrency / transaction.hostCurrencyFxRate);
+    const currency = transaction.currency;
+
+    const hostFeeTransactionData = {
+      type: CREDIT,
+      kind: TransactionKind.HOST_FEE,
+      description: 'Host Fee',
+      TransactionGroup: transaction.TransactionGroup,
+      FromCollectiveId: transaction.CollectiveId,
+      CollectiveId: host.id,
+      HostCollectiveId: host.id,
+      // Compute amounts
+      amount,
+      netAmountInCollectiveCurrency: amount,
+      currency: currency,
+      amountInHostCurrency: amountInHostCurrency,
+      hostCurrency: hostCurrency,
+      hostCurrencyFxRate: hostCurrencyFxRate,
+      // No fees
+      platformFeeInHostCurrency: 0,
+      hostFeeInHostCurrency: 0,
+      paymentProcessorFeeInHostCurrency: 0,
+      OrderId: transaction.OrderId,
+      createdAt: transaction.createdAt,
+      data,
+    };
+
+    const hostFeeTransaction = await Transaction.createDoubleEntry(hostFeeTransactionData);
+
+    // Reset the original host fee because we're now accounting for this value in a separate set of transactions
+    transaction.hostFeeInHostCurrency = 0;
+
+    return { transaction, hostFeeTransaction };
+  };
+
+  Transaction.createHostFeeShareTransactions = async (
+    { transaction, hostFeeTransaction },
+    host,
+    isDirectlyCollected = false,
+  ) => {
+    let order;
+    if (transaction.OrderId) {
+      order = await Transaction.findByPk(transaction.OrderId);
+    }
+    const hostFeeSharePercent = await getHostFeeSharePercent(order, host);
+    if (!hostFeeSharePercent) {
+      return;
+    }
+
+    // We use the Host Fee amountInHostCurrency/hostCurrency as a basis
+    const amount = calcFee(hostFeeTransaction.amountInHostCurrency, hostFeeSharePercent);
+    const currency = hostFeeTransaction.hostCurrency;
+
+    // Skip if the amount is zero (e.g.: 15% * 0.03 = 0.0045 and rounded to 0)
+    if (amount === 0) {
+      return;
+    }
+
+    // This is a credit to Open Collective and needs to be inserted in USD
+    const hostCurrency = HOST_FEE_SHARE_TRANSACTION_PROPERTIES.hostCurrency;
+    const hostCurrencyFxRate = await Transaction.getFxRate(currency, hostCurrency, transaction);
+    const amountInHostCurrency = Math.round(amount * hostCurrencyFxRate);
+
+    const hostFeeShareTransactionData = {
+      type: CREDIT,
+      kind: TransactionKind.HOST_FEE_SHARE,
+      description: 'Host Fee Share',
+      TransactionGroup: hostFeeTransaction.TransactionGroup,
+      FromCollectiveId: host.id,
+      CollectiveId: HOST_FEE_SHARE_TRANSACTION_PROPERTIES.CollectiveId,
+      HostCollectiveId: HOST_FEE_SHARE_TRANSACTION_PROPERTIES.HostCollectiveId,
+      // Compute amounts
+      amount,
+      netAmountInCollectiveCurrency: amount,
+      currency,
+      amountInHostCurrency,
+      hostCurrency,
+      hostCurrencyFxRate,
+      // No fees
+      platformFeeInHostCurrency: 0,
+      hostFeeInHostCurrency: 0,
+      paymentProcessorFeeInHostCurrency: 0,
+      OrderId: hostFeeTransaction.OrderId,
+      createdAt: hostFeeTransaction.createdAt,
+    };
+
+    const hostFeeShareTransaction = await Transaction.createDoubleEntry(hostFeeShareTransactionData);
+
+    let hostFeeShareDebtTransaction;
+    if (!isDirectlyCollected) {
+      hostFeeShareDebtTransaction = await Transaction.creatHostFeeShareDebtTransactions(
+        { transaction, hostFeeTransaction, hostFeeShareTransaction },
+        host,
+      );
+    }
+
+    return { hostFeeShareTransaction, hostFeeShareDebtTransaction };
+  };
+
+  Transaction.creatHostFeeShareDebtTransactions = async ({ hostFeeShareTransaction }) => {
+    if (hostFeeShareTransaction.type === DEBIT) {
+      throw new Error('creatHostFeeShareDebtTransactions must be given a CREDIT transaction');
+    }
+
+    // Create debt transaction
+    const hostFeeShareDebtTransactionData = {
+      // Copy base values from the original CREDIT HOST_FEE_SHARE
+      ...pick(hostFeeShareTransaction.dataValues, [
+        'TransactionGroup',
+        'FromCollectiveId',
+        'CollectiveId',
+        'HostCollectiveId',
+        'OrderId',
+        'createdAt',
+        'currency',
+        'hostCurrency',
+        'hostCurrencyFxRate',
+      ]),
+      type: DEBIT,
+      kind: TransactionKind.HOST_FEE_SHARE_DEBT,
+      isDebt: true,
+      description: 'Host Fee Share owed to Open Collective',
+      // Opposite amounts
+      amount: -hostFeeShareTransaction.amount,
+      netAmountInCollectiveCurrency: -hostFeeShareTransaction.netAmountInCollectiveCurrency,
+      amountInHostCurrency: -hostFeeShareTransaction.amountInHostCurrency,
+      // No fees
+      platformFeeInHostCurrency: 0,
+      hostFeeInHostCurrency: 0,
+      paymentProcessorFeeInHostCurrency: 0,
+    };
+
+    const hostFeeShareDebtTransaction = await Transaction.createDoubleEntry(hostFeeShareDebtTransactionData);
+
+    // Create settlement
+    const settlementStatus = TransactionSettlementStatus.OWED;
+    await models.TransactionSettlement.createForTransaction(hostFeeShareDebtTransaction, settlementStatus);
+
+    return hostFeeShareDebtTransaction;
   };
 
   /**
    * Creates a transaction pair from given payload. Defaults to `CONTRIBUTION` kind unless
    * specified otherwise.
    */
-  Transaction.createFromPayload = async (
-    { CreatedByUserId, FromCollectiveId, CollectiveId, transaction, PaymentMethodId },
-    opts = { isPlatformTipDirectlyCollected: false },
+  Transaction.createFromContributionPayload = async (
+    transaction,
+    opts = { isPlatformRevenueDirectlyCollected: false },
   ) => {
-    if (!transaction.amount) {
-      throw new Error('transaction.amount cannot be null or zero');
+    try {
+      Transaction.validateContributionPayload(transaction);
+    } catch (error) {
+      throw new Error(`createFromContributionPayload: ${error.message}`);
     }
 
-    const collective = await models.Collective.findByPk(CollectiveId);
+    // Retrieve Host
+    const collective = await models.Collective.findByPk(transaction.CollectiveId);
     const host = await collective.getHostCollective();
-    const HostCollectiveId = collective.isHostAccount ? collective.id : host.id;
-    if (!HostCollectiveId && !transaction.HostCollectiveId) {
-      throw new Error(`Cannot create a transaction: collective id ${CollectiveId} doesn't have a host`);
+    transaction.HostCollectiveId = collective.isHostAccount ? collective.id : host.id;
+    if (!transaction.HostCollectiveId) {
+      throw new Error(
+        `Cannot create transaction: Collective with id '${transaction.CollectiveId}' doesn't have a Host`,
+      );
     }
-    transaction.HostCollectiveId = HostCollectiveId || transaction.HostCollectiveId;
-    // attach other objects manually. Needed for afterCreate hook to work properly
-    transaction.CreatedByUserId = CreatedByUserId;
-    transaction.FromCollectiveId = FromCollectiveId;
-    transaction.CollectiveId = CollectiveId;
-    transaction.PaymentMethodId = transaction.PaymentMethodId || PaymentMethodId;
 
     // Compute these values, they will eventually be checked again by createDoubleEntry
     transaction.TransactionGroup = uuid();
-    transaction.type = transaction.amount > 0 ? TransactionTypes.CREDIT : TransactionTypes.DEBIT;
+    transaction.type = TransactionTypes.CREDIT;
+    transaction.kind = transaction.kind || TransactionKind.CONTRIBUTION;
 
-    transaction.hostFeeInHostCurrency = toNegative(transaction.hostFeeInHostCurrency);
-    transaction.platformFeeInHostCurrency = toNegative(transaction.platformFeeInHostCurrency);
+    // Some test may skip amountInHostCurrency and hostCurrency
+    if (!transaction.hostCurrency && !transaction.amountInHostCurrency) {
+      transaction.amountInHostCurrency = transaction.amount;
+      transaction.hostCurrency = transaction.currency;
+    }
+
+    transaction.hostFeeInHostCurrency = toNegative(transaction.hostFeeInHostCurrency) || 0;
+    transaction.platformFeeInHostCurrency = toNegative(transaction.platformFeeInHostCurrency) || 0;
+    transaction.paymentProcessorFeeInHostCurrency = toNegative(transaction.paymentProcessorFeeInHostCurrency) || 0;
     transaction.taxAmount = toNegative(transaction.taxAmount);
-    transaction.paymentProcessorFeeInHostCurrency = toNegative(transaction.paymentProcessorFeeInHostCurrency);
 
-    // TODO: createFromPayload is only used by payment methods, for contributions. So it sounds right to do
-    // that here, but we should probably rename the function to something clearer (createFromContributionPayload?)
-    transaction.kind = isUndefined(transaction.kind) ? TransactionKind.CONTRIBUTION : transaction.kind;
-
-    // Separate donation transaction and remove platformFee from the main transaction
-    if (transaction.data?.isFeesOnTop && transaction.platformFeeInHostCurrency) {
-      const isTipAlreadyCollected = Boolean(opts?.isPlatformTipDirectlyCollected);
-      const result = await Transaction.createPlatformTipTransactions(transaction, host, isTipAlreadyCollected);
-      // Transaction was modified by createPlatformTipTransactions, we get it from the result
+    // Separate donation transaction and remove platformTip from the main transaction
+    const result = await Transaction.createPlatformTipTransactions(
+      transaction,
+      host,
+      Boolean(opts?.isPlatformRevenueDirectlyCollected),
+    );
+    // Transaction was modified by createPlatformTipTransactions, we get it from the result
+    if (result && result.transaction) {
       transaction = result.transaction;
     }
 
-    // populate netAmountInCollectiveCurrency for financial contributions
-    // TODO: why not for other transactions?
-    if (transaction.amount > 0) {
-      transaction.netAmountInCollectiveCurrency = Transaction.calculateNetAmountInCollectiveCurrency(transaction);
+    // Create Host Fee transaction
+    if (transaction.hostFeeInHostCurrency && parseToBoolean(config.ledger.separateHostFees) === true) {
+      const result = await Transaction.createHostFeeTransactions(transaction, host);
+      if (result) {
+        if (result.hostFeeTransaction) {
+          const isAlreadyCollected = Boolean(opts?.isPlatformRevenueDirectlyCollected);
+          await Transaction.createHostFeeShareTransactions(
+            {
+              transaction: result.transaction,
+              hostFeeTransaction: result.hostFeeTransaction,
+            },
+            host,
+            isAlreadyCollected,
+          );
+        }
+        // Transaction was modified by createHostFeeTransaction, we get it from the result
+        if (result.transaction) {
+          transaction = result.transaction;
+        }
+      }
     }
+
+    transaction.netAmountInCollectiveCurrency = Transaction.calculateNetAmountInCollectiveCurrency(transaction);
 
     return Transaction.createDoubleEntry(transaction);
   };
@@ -757,7 +995,7 @@ function defineModel() {
           { model: models.User, as: 'createdByUser' },
           { model: models.PaymentMethod },
         ],
-        transaction: options.transaction,
+        transaction: options?.transaction,
       })
         // Create activity.
         .then(transaction => {
@@ -779,7 +1017,7 @@ function defineModel() {
           if (transaction.PaymentMethod) {
             activityPayload.data.paymentMethod = transaction.PaymentMethod.info;
           }
-          return models.Activity.create(activityPayload, { transaction: options.transaction });
+          return models.Activity.create(activityPayload, { transaction: options?.transaction });
         })
         .catch(err =>
           console.error(
@@ -788,36 +1026,6 @@ function defineModel() {
           ),
         )
     );
-  };
-
-  Transaction.creditHost = (order, collective) => {
-    // Special Case, adding funds to itself
-    const amount = order.totalAmount;
-    const platformFeePercent = get(order, 'data.platformFeePercent', 0);
-    const platformFee = calcFee(order.totalAmount, platformFeePercent);
-    const payload = {
-      type: 'CREDIT',
-      kind: TransactionKind.ADDED_FUNDS,
-      amount,
-      description: order.description,
-      currency: order.currency,
-      CollectiveId: order.CollectiveId,
-      FromCollectiveId: order.CollectiveId,
-      CreatedByUserId: order.CreatedByUserId,
-      PaymentMethodId: order.PaymentMethodId,
-      OrderId: order.id,
-      platformFeeInHostCurrency: -platformFee,
-      hostFeeInHostCurrency: 0,
-      paymentProcessorFeeInHostCurrency: 0,
-      HostCollectiveId: collective.id,
-      hostCurrency: collective.currency,
-      hostCurrencyFxRate: 1,
-      amountInHostCurrency: amount,
-      netAmountInCollectiveCurrency: amount - platformFee,
-      TransactionGroup: uuid(),
-    };
-
-    return models.Transaction.create(payload);
   };
 
   Transaction.calculateNetAmountInCollectiveCurrency = function (transaction) {
@@ -833,9 +1041,30 @@ function defineModel() {
     return Math.round((transaction.amountInHostCurrency + transactionFees) / hostCurrencyFxRate + transactionTaxes);
   };
 
+  Transaction.calculateNetAmountInHostCurrency = function (transaction) {
+    const transactionFees =
+      transaction.platformFeeInHostCurrency +
+      transaction.hostFeeInHostCurrency +
+      transaction.paymentProcessorFeeInHostCurrency;
+
+    const transactionTaxes = transaction.taxAmount || 0;
+
+    const hostCurrencyFxRate = transaction.hostCurrencyFxRate || 1;
+
+    return transaction.amountInHostCurrency + transactionFees + Math.round(transactionTaxes * hostCurrencyFxRate);
+  };
+
   Transaction.getFxRate = async function (fromCurrency, toCurrency, transaction) {
     if (fromCurrency === toCurrency) {
       return 1;
+    }
+
+    // Simple Case
+    if (fromCurrency === transaction.currency && toCurrency === transaction.hostCurrency) {
+      return transaction.hostCurrencyFxRate;
+    }
+    if (fromCurrency === transaction.hostCurrency && toCurrency === transaction.currency) {
+      return 1 / transaction.hostCurrencyFxRate;
     }
 
     // For platform tips, we store the FX rate of the host<>currency
@@ -845,8 +1074,8 @@ function defineModel() {
       if (
         toCurrency === PLATFORM_TIP_TRANSACTION_PROPERTIES.currency &&
         fromCurrency === transaction.hostCurrency &&
-        transaction.type === 'CREDIT' &&
-        transaction.kind === 'PLATFORM_TIP' &&
+        transaction.type === CREDIT &&
+        transaction.kind === TransactionKind.PLATFORM_TIP &&
         transaction.FromCollectiveId === PLATFORM_TIP_TRANSACTION_PROPERTIES.CollectiveId
       ) {
         return transaction.data.hostToPlatformFxRate;

@@ -20,6 +20,7 @@ export const IDENTIFIER_TYPES = {
   COMMENT_REACTION: 'comment-reaction',
   CONVERSATION: 'conversation',
   HOST_APPLICATION: 'host-application',
+  MEMBER_INVITATION: 'member-invitation',
   PAYOUT_METHOD: 'payout-method',
   PAYMENT_METHOD: 'paymentMethod',
   EXPENSE: 'expense',
@@ -27,7 +28,6 @@ export const IDENTIFIER_TYPES = {
   EXPENSE_ATTACHED_FILE: 'expense-attached-file',
   EXPENSE_ITEM: 'expense-item',
   ORDER: 'order',
-  TRANSACTION: 'transaction',
   UPDATE: 'update',
 };
 

@@ -1,5 +1,5 @@
 import config from 'config';
-import { get, isEmpty, times } from 'lodash';
+import { get, isEmpty, sum, times } from 'lodash';
 import moment from 'moment';
 import sanitize from 'sanitize-html';
 import { v4 as uuid } from 'uuid';
@@ -56,7 +56,7 @@ async function getBalance(paymentMethod) {
   });
   let spent = 0;
   for (const transaction of allTransactions) {
-    if (transaction.currency != paymentMethod.currency) {
+    if (transaction.currency !== paymentMethod.currency) {
       const fxRate = await currency.getFxRate(transaction.currency, paymentMethod.currency);
       spent += transaction.netAmountInCollectiveCurrency * fxRate;
     } else {
@@ -89,7 +89,7 @@ async function processOrder(order) {
   }
   // converting(or keeping if it's the same currency) order amount to the payment method currency
   let orderAmountInPaymentMethodCurrency = order.totalAmount;
-  if (order.currency != paymentMethod.currency) {
+  if (order.currency !== paymentMethod.currency) {
     const fxRate = await currency.getFxRate(order.currency, paymentMethod.currency);
     orderAmountInPaymentMethodCurrency = order.totalAmount * fxRate;
   }
@@ -131,12 +131,12 @@ async function processOrder(order) {
       UsingGiftCardFromCollectiveId: sourcePaymentMethod.CollectiveId,
     },
     {
-      where: { TransactionGroup: creditTransaction.TransactionGroup },
+      where: { TransactionGroup: creditTransaction.TransactionGroup, kind: ['CONTRIBUTION', 'PLATFORM_TIP'] },
       returning: true,
     },
   );
   // updating creditTransaction with latest data
-  creditTransaction = updatedTransactions[1].filter(t => t.type === 'CREDIT')[0];
+  creditTransaction = updatedTransactions[1].filter(t => t.type === 'CREDIT' && t.kind === 'CONTRIBUTION')[0];
   return creditTransaction;
 }
 
@@ -296,8 +296,8 @@ async function checkSourcePaymentMethodBalance(paymentMethod, amount, giftCardCu
   }
 
   // Convert amounts if not the same currency
-  const fxrate = await currency.getFxRate(giftCardCurrency, balance.currency);
-  const totalAmountInPaymentMethodCurrency = amount * fxrate;
+  const fxRate = await currency.getFxRate(giftCardCurrency, balance.currency);
+  const totalAmountInPaymentMethodCurrency = Math.round(amount * fxRate);
 
   // Check balance
   if (totalAmountInPaymentMethodCurrency > balance.amount) {
@@ -306,7 +306,7 @@ async function checkSourcePaymentMethodBalance(paymentMethod, amount, giftCardCu
   }
 
   // Total gift cards sum cannot be more than the initial balance
-  const existingTotal = await paymentMethod.getChildrenPMTotalSum();
+  const existingTotal = await getTotalAmountAllocatedForGiftCards(paymentMethod, balance.currency);
   if (existingTotal + totalAmountInPaymentMethodCurrency > paymentMethod.initialBalance) {
     const initialBalanceStr = formatCurrency(paymentMethod.initialBalance, paymentMethod.currency);
     const alreadyCreatedAmountStr = formatCurrency(existingTotal, balance.currency);
@@ -316,6 +316,83 @@ async function checkSourcePaymentMethodBalance(paymentMethod, amount, giftCardCu
       `There is not enough funds on this PaymentMethod for new gift cards. ${currentBalanceDetails} and ${alreadyCreatedDetails}.`,
     );
   }
+}
+
+/**
+ * For a given payment method, returns the total amount allocated by the gift gift cards that use it as
+ * a source payment method, which consists of the total amount that could be spent (non-expired) + the total amount already spent.
+ *
+ * @param {number} sourcePaymentMethodId
+ * @returns {number} The total amount allocated
+ */
+async function getTotalAmountAllocatedForGiftCards(sourcePaymentMethod) {
+  const results = await Promise.all([
+    // Sum of the number of months left multiplied by the monthly limit = total amount left to spend
+    getAmountLeftToSpendForMonthlyLimits(sourcePaymentMethod),
+    // Sum of the total amount already spent with expired gift cards and monthly limited ones
+    getAmountSpentWithExpiredOrMonthlyLimitedGiftCards(sourcePaymentMethod),
+    // Initial balance sum for all non-expired gift card's with a fixed limit (not monthly)
+    models.PaymentMethod.sum('initialBalance', {
+      where: {
+        SourcePaymentMethodId: sourcePaymentMethod.id,
+        expiryDate: { [Op.gt]: new Date() },
+        monthlyLimitPerMember: { [Op.or]: [null, 0] },
+        initialBalance: { [Op.not]: null },
+      },
+    }),
+  ]);
+
+  return Math.round(sum(results.filter(Boolean)));
+}
+
+async function getAmountLeftToSpendForMonthlyLimits(sourcePaymentMethod) {
+  return sequelize
+    .query(
+      `SELECT SUM(EXTRACT('month' FROM age("expiryDate", NOW())) * "monthlyLimitPerMember") AS "totalAmountLeftToSpend"
+       FROM "PaymentMethods" 
+       WHERE "SourcePaymentMethodId" = :sourcePaymentMethodId
+       AND "monthlyLimitPerMember" > 0
+       AND "deletedAt" IS NULL
+       AND "expiryDate" > NOW()`,
+      {
+        replacements: { sourcePaymentMethodId: sourcePaymentMethod.id },
+        type: sequelize.QueryTypes.SELECT,
+      },
+    )
+    .then(results => results[0].totalAmountLeftToSpend);
+}
+
+async function getAmountSpentWithExpiredOrMonthlyLimitedGiftCards(sourcePaymentMethod) {
+  const amountsByCurrency = await models.Transaction.findAll({
+    raw: true,
+    attributes: [[sequelize.fn('SUM', sequelize.col('amount')), 'amount'], 'currency'],
+    group: [`Transaction.currency`],
+    where: {
+      type: 'CREDIT',
+      RefundTransactionId: null,
+      isRefund: false,
+    },
+    include: [
+      {
+        attributes: [],
+        model: models.PaymentMethod,
+        required: true,
+        where: {
+          SourcePaymentMethodId: sourcePaymentMethod.id,
+          [Op.or]: [
+            { expiryDate: { [Op.lte]: new Date() } }, // Either with expired gift cards
+            { monthlyLimitPerMember: { [Op.not]: [null, 0] } }, // Or the ones that have a monthly limit
+          ],
+        },
+      },
+    ],
+  });
+
+  const now = new Date(); // TODO: Not ideal to use now, but it's the simplest approximation we can do
+  const targetCurrency = sourcePaymentMethod.currency;
+  const convertAmount = res => currency.convertToCurrency(res.amount, res.currency, targetCurrency, now);
+  const convertedAmounts = await Promise.all(amountsByCurrency.map(convertAmount));
+  return sum(convertedAmounts.filter(Boolean));
 }
 
 /** Get currency from args, or returns default currency. Throws if currency is invalid */
@@ -420,7 +497,7 @@ function getCreateParams(args, collective, sourcePaymentMethod, remoteUser) {
     limitedToHostCollectiveIds: isEmpty(args.limitedToHostCollectiveIds) ? null : args.limitedToHostCollectiveIds,
     uuid: uuid(),
     service: PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE,
-    type: PAYMENT_METHOD_TYPE.GIFT_CARD,
+    type: PAYMENT_METHOD_TYPE.GIFTCARD,
     createdAt: new Date(),
     updatedAt: new Date(),
     batch: args.batch,
@@ -473,7 +550,7 @@ async function claim(args, remoteUser) {
         [Op.like]: `${args.code}%`,
       }),
       { service: PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE },
-      { type: PAYMENT_METHOD_TYPE.GIFT_CARD },
+      { type: PAYMENT_METHOD_TYPE.GIFTCARD },
     ),
   });
   if (!giftCardPaymentMethod) {

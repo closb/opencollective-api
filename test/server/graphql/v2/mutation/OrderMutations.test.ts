@@ -15,7 +15,7 @@ import {
   fakeTier,
   fakeUser,
 } from '../../../../test-helpers/fake-data';
-import { graphqlQueryV2 } from '../../../../utils';
+import { graphqlQueryV2, resetTestDB } from '../../../../utils';
 
 const CREATE_ORDER_MUTATION = gqlV2/* GraphQL */ `
   mutation CreateOrder($order: OrderCreateInput!) {
@@ -26,6 +26,8 @@ const CREATE_ORDER_MUTATION = gqlV2/* GraphQL */ `
         status
         quantity
         frequency
+        tags
+        customData
         tier {
           legacyId
         }
@@ -40,6 +42,7 @@ const CREATE_ORDER_MUTATION = gqlV2/* GraphQL */ `
           legacyId
           slug
           name
+          legalName
           ... on Individual {
             isGuest
           }
@@ -117,6 +120,7 @@ describe('server/graphql/v2/mutation/OrderMutations', () => {
     let fromUser, toCollective, host, validOrderParams, sandbox;
 
     before(async () => {
+      await resetTestDB();
       fromUser = await fakeUser();
 
       // Stub the payment
@@ -134,7 +138,8 @@ describe('server/graphql/v2/mutation/OrderMutations', () => {
         toAccount: { legacyId: toCollective.id },
         frequency: 'ONETIME',
         paymentMethod: {
-          type: 'CREDIT_CARD',
+          service: 'STRIPE',
+          type: 'CREDITCARD',
           name: '4242',
           creditCardInfo: {
             token: 'tok_123456781234567812345678',
@@ -181,6 +186,10 @@ describe('server/graphql/v2/mutation/OrderMutations', () => {
               frequency: 'MONTHLY',
               tier: { legacyId: tier.id },
               quantity: 3,
+              tags: ['wow', 'it', 'supports', 'tags!'],
+              customData: {
+                message: 'Hello world',
+              },
             },
           },
           fromUser,
@@ -195,6 +204,8 @@ describe('server/graphql/v2/mutation/OrderMutations', () => {
         expect(order.toAccount.legacyId).to.eq(toCollective.id);
         expect(order.quantity).to.eq(3);
         expect(order.tier.legacyId).to.eq(tier.id);
+        expect(order.tags).to.deep.eq(['wow', 'it', 'supports', 'tags!']);
+        expect(order.customData).to.deep.eq({ message: 'Hello world' });
       });
 
       it('can add platform contribution', async () => {
@@ -215,7 +226,7 @@ describe('server/graphql/v2/mutation/OrderMutations', () => {
         result.errors && console.error(result.errors);
         expect(result.errors).to.not.exist;
         const order = result.data.createOrder.order;
-        expect(order.amount.valueInCents).to.eq(7500);
+        expect(order.amount.valueInCents).to.eq(5000);
         expect(order.platformContributionAmount.valueInCents).to.eq(2500);
       });
 
@@ -279,20 +290,39 @@ describe('server/graphql/v2/mutation/OrderMutations', () => {
 
       it('Works with a small order', async () => {
         const email = randEmail();
-        const orderData = { ...validOrderParams, fromAccount: null, guestInfo: { email } };
+        const orderData = {
+          ...validOrderParams,
+          fromAccount: null,
+          guestInfo: {
+            email,
+            legalName: 'Real name',
+            captcha: { token: '10000000-aaaa-bbbb-cccc-000000000001', provider: 'HCAPTCHA' },
+          },
+        };
         const result = await callCreateOrder({ order: orderData });
         result.errors && console.error(result.errors);
         expect(result.errors).to.not.exist;
 
         const order = result.data.createOrder.order;
         expect(order.fromAccount.isGuest).to.eq(true);
+        expect(order.fromAccount.legalName).to.eq(null); // For security reasons
         expect(order.paymentMethod.account.id).to.eq(order.fromAccount.id);
         expect(order.status).to.eq('PAID');
+
+        const fromCollective = await models.Collective.findByPk(order.fromAccount.legacyId);
+        expect(fromCollective.legalName).to.eq('Real name');
       });
 
       it('Works with an email that already exists (unverified)', async () => {
         const user = await fakeUser({ confirmedAt: null }, { data: { isGuest: true } });
-        const orderData = { ...validOrderParams, fromAccount: null, guestInfo: { email: user.email } };
+        const orderData = {
+          ...validOrderParams,
+          fromAccount: null,
+          guestInfo: {
+            email: user.email,
+            captcha: { token: '10000000-aaaa-bbbb-cccc-000000000001', provider: 'HCAPTCHA' },
+          },
+        };
         const result = await callCreateOrder({ order: orderData });
         result.errors && console.error(result.errors);
         expect(result.errors).to.not.exist;
@@ -314,7 +344,14 @@ describe('server/graphql/v2/mutation/OrderMutations', () => {
 
       it('Works with an email that already exists (verified)', async () => {
         const user = await fakeUser({ confirmedAt: new Date() });
-        const orderData = { ...validOrderParams, fromAccount: null, guestInfo: { email: user.email } };
+        const orderData = {
+          ...validOrderParams,
+          fromAccount: null,
+          guestInfo: {
+            email: user.email,
+            captcha: { token: '10000000-aaaa-bbbb-cccc-000000000001', provider: 'HCAPTCHA' },
+          },
+        };
         const result = await callCreateOrder({ order: orderData });
         result.errors && console.error(result.errors);
         expect(result.errors).to.not.exist;
@@ -334,7 +371,10 @@ describe('server/graphql/v2/mutation/OrderMutations', () => {
           ...validOrderParams,
           paymentMethod: { id: idEncode(paymentMethod.id, IDENTIFIER_TYPES.PAYMENT_METHOD) },
           fromAccount: null,
-          guestInfo: { email: user.email },
+          guestInfo: {
+            email: user.email,
+            captcha: { token: '10000000-aaaa-bbbb-cccc-000000000001', provider: 'HCAPTCHA' },
+          },
         };
         const result = await callCreateOrder({ order: orderData });
         expect(result.errors).to.exist;
@@ -349,7 +389,10 @@ describe('server/graphql/v2/mutation/OrderMutations', () => {
         const orderData = {
           ...validOrderParams,
           fromAccount: { legacyId: fromCollective.id },
-          guestInfo: { email: user.email },
+          guestInfo: {
+            email: user.email,
+            captcha: { token: '10000000-aaaa-bbbb-cccc-000000000001', provider: 'HCAPTCHA' },
+          },
         };
         const result = await callCreateOrder({ order: orderData });
         expect(result.errors).to.exist;
@@ -361,7 +404,10 @@ describe('server/graphql/v2/mutation/OrderMutations', () => {
           ...validOrderParams,
           fromAccount: null,
           paymentMethod: { ...validOrderParams.paymentMethod, isSavedForLater: true },
-          guestInfo: { email: randEmail() },
+          guestInfo: {
+            email: randEmail(),
+            captcha: { token: '10000000-aaaa-bbbb-cccc-000000000001', provider: 'HCAPTCHA' },
+          },
         };
 
         const result = await callCreateOrder({ order: orderData });
@@ -370,6 +416,19 @@ describe('server/graphql/v2/mutation/OrderMutations', () => {
         const order = result.data.createOrder.order;
         const orderFromDb = await models.Order.findByPk(order.legacyId);
         expect(orderFromDb.data.savePaymentMethod).to.be.false;
+      });
+
+      it('Fails if captcha is not provided', async () => {
+        const orderData = {
+          ...validOrderParams,
+          fromAccount: null,
+          guestInfo: {
+            email: randEmail(),
+          },
+        };
+        const result = await callCreateOrder({ order: orderData });
+        expect(result.errors).to.exist;
+        expect(result.errors[0].message).to.equal('You need to inform a valid captcha token');
       });
     });
   });

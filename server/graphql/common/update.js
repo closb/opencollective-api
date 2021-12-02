@@ -1,42 +1,31 @@
 import { get } from 'lodash';
 
-import { purgeCacheForCollective } from '../../lib/cache';
+import cache, { purgeCacheForCollective } from '../../lib/cache';
 import models from '../../models';
 import { Forbidden, NotFound, Unauthorized, ValidationFailed } from '../errors';
 import { idDecode, IDENTIFIER_TYPES } from '../v2/identifiers';
-
-function requireArgs(args, paths) {
-  paths.forEach(path => {
-    if (!get(args, path)) {
-      throw new ValidationFailed(`${path} required`);
-    }
-  });
-}
+import { fetchAccountWithReference } from '../v2/input/AccountReferenceInput';
 
 export async function createUpdate(_, args, req) {
   if (!req.remoteUser) {
     throw new Unauthorized('You must be logged in to create an update');
   }
 
-  let CollectiveId = get(args, 'update.collective.id');
-  if (!CollectiveId) {
-    CollectiveId = get(args, 'update.account.legacyId');
-  }
-
-  requireArgs(args, ['update.title', 'update.html']);
-  const collective = await models.Collective.findByPk(CollectiveId);
-
+  const collective = await fetchAccountWithReference(args.update.account);
   if (!collective) {
     throw new Error('This collective does not exist');
   } else if (!req.remoteUser.isAdminOfCollective(collective)) {
     throw new Forbidden("You don't have sufficient permissions to create an update");
+  } else if (args.update.isChangelog && !req.remoteUser.isRoot()) {
+    throw new Forbidden('Only root users can create changelog updates.');
   }
 
   const update = await models.Update.create({
     title: args.update.title,
     html: args.update.html,
-    CollectiveId,
+    CollectiveId: collective.id,
     isPrivate: args.update.isPrivate,
+    isChangelog: args.update.isChangelog,
     TierId: get(args, 'update.tier.id'),
     CreatedByUserId: req.remoteUser.id,
     FromCollectiveId: req.remoteUser.CollectiveId,
@@ -79,6 +68,9 @@ export async function editUpdate(_, args, req) {
 export async function publishUpdate(_, args, req) {
   let update = await fetchUpdateForEdit(args.id, req.remoteUser);
   update = await update.publish(req.remoteUser, args.notificationAudience);
+  if (update.isChangelog) {
+    cache.del('latest_changelog_publish_date');
+  }
   purgeCacheForCollective(update.collective.slug);
   return update;
 }

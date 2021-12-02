@@ -4,11 +4,11 @@ import Activity from './Activity';
 import Application from './Application';
 import Collective from './Collective';
 import Comment from './Comment';
-import CommentReaction from './CommentReaction';
 import ConnectedAccount from './ConnectedAccount';
 import Conversation from './Conversation';
 import ConversationFollower from './ConversationFollower';
 import CurrencyExchangeRate from './CurrencyExchangeRate';
+import EmojiReaction from './EmojiReaction';
 import Expense from './Expense';
 import ExpenseAttachedFile from './ExpenseAttachedFile';
 import ExpenseItem from './ExpenseItem';
@@ -16,6 +16,7 @@ import HostApplication from './HostApplication';
 import LegalDocument from './LegalDocument';
 import Member from './Member';
 import MemberInvitation from './MemberInvitation';
+import MigrationLog from './MigrationLog';
 import Notification from './Notification';
 import Order from './Order';
 import PaymentMethod from './PaymentMethod';
@@ -45,7 +46,7 @@ export function setupModels() {
   m['Application'] = Application;
   m['Collective'] = Collective;
   m['Comment'] = Comment;
-  m['CommentReaction'] = CommentReaction;
+  m['EmojiReaction'] = EmojiReaction;
   m['ConnectedAccount'] = ConnectedAccount;
   m['Conversation'] = Conversation;
   m['ConversationFollower'] = ConversationFollower;
@@ -57,6 +58,7 @@ export function setupModels() {
   m['LegalDocument'] = LegalDocument;
   m['Member'] = Member;
   m['MemberInvitation'] = MemberInvitation;
+  m['MigrationLog'] = MigrationLog;
   m['Notification'] = Notification;
   m['Order'] = Order;
   m['PaymentMethod'] = PaymentMethod;
@@ -244,8 +246,8 @@ export function setupModels() {
   m.Comment.belongsTo(m.User, { foreignKey: 'CreatedByUserId', as: 'user' });
 
   // Comment reactions
-  m.CommentReaction.belongsTo(m.Comment);
-  m.CommentReaction.belongsTo(m.User);
+  m.EmojiReaction.belongsTo(m.Comment);
+  m.EmojiReaction.belongsTo(m.User);
 
   // Order.
   m.Order.belongsTo(m.User, {
@@ -262,6 +264,7 @@ export function setupModels() {
   });
   m.Order.belongsTo(m.Tier);
   // m.Collective.hasMany(m.Order); // makes the test `mocha test/graphql.transaction.test.js -g "insensitive" fail
+  m.Collective.hasMany(m.Collective, { foreignKey: 'ParentCollectiveId', as: 'children' });
   m.Collective.hasMany(m.Member, { foreignKey: 'CollectiveId', as: 'members' });
   m.Collective.hasMany(m.Order, { foreignKey: 'CollectiveId', as: 'orders' });
   m.Collective.hasMany(m.LegalDocument, { foreignKey: 'CollectiveId', as: 'legalDocuments' });

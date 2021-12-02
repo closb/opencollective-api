@@ -9,8 +9,15 @@ import * as connectedAccounts from './controllers/connectedAccounts';
 import helloworks from './controllers/helloworks';
 import uploadImage from './controllers/images';
 import * as email from './controllers/services/email';
+import * as transferwise from './controllers/transferwise';
 import * as users from './controllers/users';
-import { paypalWebhook, stripeWebhook, transferwiseWebhook } from './controllers/webhooks';
+import {
+  paypalWebhook,
+  privacyWebhook,
+  stripeWebhook,
+  thegivingblockWebhook,
+  transferwiseWebhook,
+} from './controllers/webhooks';
 import { getGraphqlCacheKey } from './graphql/cache';
 import graphqlSchemaV1 from './graphql/v1/schema';
 import graphqlSchemaV2 from './graphql/v2/schema';
@@ -23,7 +30,7 @@ import errorHandler from './middleware/error_handler';
 import * as params from './middleware/params';
 import required from './middleware/required_param';
 import sanitizer from './middleware/sanitizer';
-import * as paypal from './paymentProviders/paypal/payment';
+import alipay from './paymentProviders/stripe/alipay';
 
 const upload = multer();
 
@@ -32,7 +39,7 @@ const noCache = (req, res, next) => {
   next();
 };
 
-export default app => {
+export default async app => {
   /**
    * Extract GraphQL API Key
    */
@@ -47,7 +54,11 @@ export default app => {
 
   // Setup rate limiter
   if (get(config, 'redis.serverUrl')) {
-    const client = redis.createClient(get(config, 'redis.serverUrl'));
+    const redisOptions = {};
+    if (get(config, 'redis.serverUrl').includes('rediss://')) {
+      redisOptions.tls = { rejectUnauthorized: false };
+    }
+    const client = redis.createClient(get(config, 'redis.serverUrl'), redisOptions);
     const rateLimiter = expressLimiter(
       app,
       client,
@@ -110,7 +121,6 @@ export default app => {
   app.param('expenseid', params.expenseid);
 
   const isDevelopment = config.env === 'development';
-  const isProduction = config.env === 'production';
 
   /**
    * GraphQL caching
@@ -176,13 +186,10 @@ export default app => {
    */
   const graphqlServerV1 = new ApolloServer({
     schema: graphqlSchemaV1,
-    engine: {
-      reportSchema: isProduction,
-      variant: 'current',
-      apiKey: get(config, 'graphql.apolloEngineAPIKey'),
-    },
     ...graphqlServerOptions,
   });
+
+  await graphqlServerV1.start();
 
   graphqlServerV1.applyMiddleware({ app, path: '/graphql/v1' });
 
@@ -191,13 +198,10 @@ export default app => {
    */
   const graphqlServerV2 = new ApolloServer({
     schema: graphqlSchemaV2,
-    engine: {
-      reportSchema: isProduction,
-      variant: 'current',
-      apiKey: get(config, 'graphql.apolloEngineAPIKeyV2'),
-    },
     ...graphqlServerOptions,
   });
+
+  await graphqlServerV2.start();
 
   graphqlServerV2.applyMiddleware({ app, path: '/graphql/v2' });
 
@@ -211,7 +215,9 @@ export default app => {
    */
   app.post('/webhooks/stripe', stripeWebhook); // when it gets a new subscription invoice
   app.post('/webhooks/transferwise', transferwiseWebhook); // when it gets a new subscription invoice
-  app.post('/webhooks/paypal', paypalWebhook);
+  app.post('/webhooks/privacy', privacyWebhook); // when it gets a new subscription invoice
+  app.post('/webhooks/paypal/:hostId?', paypalWebhook);
+  app.post('/webhooks/thegivingblock', thegivingblockWebhook);
   app.post('/webhooks/mailgun', email.webhook); // when receiving an email
   app.get('/connected-accounts/:service/callback', noCache, authentication.authenticateServiceCallback); // oauth callback
   app.delete(
@@ -248,13 +254,15 @@ export default app => {
     connectedAccounts.verify,
   );
 
-  /* PayPal Payment Method Helpers */
-  app.post('/services/paypal/create-payment', paypal.createPayment);
+  /* AliPay Payment Callback */
+  app.get('/services/stripe/alipay/callback', noCache, alipay.confirmOrder);
+
+  /* TransferWise OTT Request Endpoint */
+  app.post('/services/transferwise/pay-batch', noCache, transferwise.payBatch);
 
   /**
    * External services
    */
-  app.get('/services/email/approve', email.approve);
   app.get('/services/email/unsubscribe/:email/:slug/:type/:token', email.unsubscribe);
 
   /**

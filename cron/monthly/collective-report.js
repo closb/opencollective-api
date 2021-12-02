@@ -3,12 +3,14 @@ import '../../server/env';
 
 import Promise from 'bluebird';
 import config from 'config';
-import { isEmpty, pick } from 'lodash';
+import { omit, pick } from 'lodash';
 import moment from 'moment';
 
+import { TransactionKind } from '../../server/constants/transaction-kind';
+import { generateHostFeeAmountForTransactionLoader } from '../../server/graphql/loaders/transactions';
+import { getCollectiveTransactionsCsv } from '../../server/lib/csv';
 import { notifyAdminsOfCollective } from '../../server/lib/notifications';
-import { getConsolidatedInvoicePdfs } from '../../server/lib/pdf';
-import { getTiersStats } from '../../server/lib/utils';
+import { getTiersStats, parseToBoolean } from '../../server/lib/utils';
 import models, { Op } from '../../server/models';
 
 // Only run on the first of the month
@@ -16,9 +18,14 @@ const today = new Date();
 if (config.env === 'production' && today.getDate() !== 1 && !process.env.OFFCYCLE) {
   console.log('OC_ENV is production and today is not the first of month, script aborted!');
   process.exit();
+} else if (parseToBoolean(process.env.SKIP_COLLECTIVE_REPORT)) {
+  console.log('Skipping because SKIP_COLLECTIVE_REPORT is set.');
+  process.exit();
 }
 
 process.env.PORT = 3066;
+
+const CONCURRENCY = process.env.CONCURRENCY || 1;
 
 const d = process.env.START_DATE ? new Date(process.env.START_DATE) : new Date();
 d.setMonth(d.getMonth() - 1);
@@ -32,7 +39,22 @@ const endDate = new Date(d.getFullYear(), d.getMonth() + 1, 1);
 console.log('startDate', startDate, 'endDate', endDate);
 
 const processCollectives = collectives => {
-  return Promise.map(collectives, processCollective, { concurrency: 1 });
+  return Promise.mapSeries(collectives, processCollective, { concurrency: CONCURRENCY });
+};
+
+const hostFeeAmountForTransactionLoader = generateHostFeeAmountForTransactionLoader();
+
+const enrichTransactionsWithHostFee = async transactions => {
+  const hostFees = await hostFeeAmountForTransactionLoader.loadMany(transactions);
+  transactions.forEach((transaction, idx) => {
+    const hostFeeInHostCurrency = hostFees[idx];
+    if (hostFeeInHostCurrency && hostFeeInHostCurrency !== transaction.hostFeeInHostCurrency) {
+      transaction.hostFeeInHostCurrency = hostFees[idx];
+      transaction.netAmountInCollectiveCurrency =
+        models.Transaction.calculateNetAmountInCollectiveCurrency(transaction);
+    }
+  });
+  return transactions;
 };
 
 const init = async () => {
@@ -44,6 +66,7 @@ const init = async () => {
       type: { [Op.in]: ['COLLECTIVE', 'ORGANIZATION'] },
       isActive: true,
     },
+    order: [['id', 'ASC']],
   };
 
   let slugs;
@@ -67,6 +90,15 @@ const init = async () => {
     query.where.slug = { [Op.in]: slugs };
   }
 
+  if (process.env.SKIP_SLUGS) {
+    const skipSlugs = process.env.SKIP_SLUGS.split(',');
+    query.where.slug = { [Op.notIn]: skipSlugs };
+  }
+
+  if (process.env.AFTER_ID) {
+    query.where.id = { [Op.gt]: Number(process.env.AFTER_ID) };
+  }
+
   const collectives = await models.Collective.findAll(query);
 
   console.log(`Preparing the ${month} report for ${collectives.length} collectives`);
@@ -78,7 +110,7 @@ const init = async () => {
   });
 };
 
-const processCollective = collective => {
+const processCollective = async collective => {
   const promises = [
     collective.getTiersWithUsers({
       attributes: ['id', 'slug', 'name', 'image', 'firstDonation', 'lastDonation', 'totalDonations', 'tier'],
@@ -94,11 +126,21 @@ const processCollective = collective => {
     collective.getCancelledOrders(startDate, endDate),
     collective.getUpdates('published', startDate, endDate),
     collective.getNextGoal(endDate),
-    collective.getTransactions({ startDate, endDate }),
+    collective.getTransactions({
+      startDate,
+      endDate,
+      kinds: Object.values(
+        omit(TransactionKind, [
+          'HOST_FEE', // Host fee is loaded separately and added as a column
+          'HOST_FEE_SHARE', // Not surfaced yet, to keep the report as close to the previous version as possible
+          'HOST_FEE_SHARE_DEBT', // Not surfaced yet, to keep the report as close to the previous version as possible
+        ]),
+      ),
+    }),
   ];
 
   let emailData = {};
-  const options = {};
+  const options = { attachments: [] };
   const csvFilename = `${collective.slug}-${moment(d).format(dateFormat)}-transactions.csv`;
 
   return Promise.all(promises)
@@ -110,7 +152,7 @@ const processCollective = collective => {
         year,
         collective: {},
       };
-      return getTiersStats(results[0], startDate, endDate).then(res => {
+      return getTiersStats(results[0], startDate, endDate).then(async res => {
         data.collective = pick(collective, ['id', 'name', 'slug', 'currency', 'publicUrl']);
         data.collective.tiers = res.tiers.map(tier => ({
           ...tier.info,
@@ -127,7 +169,7 @@ const processCollective = collective => {
         data.collective.expenses = results[4].map(expense => expense.info);
         data.relatedCollectives = results[5] || [];
         data.collective.updates = results[9].map(u => u.info);
-        data.collective.transactions = results[11];
+        data.collective.transactions = await enrichTransactionsWithHostFee(results[11]);
         const nextGoal = results[10];
         if (nextGoal) {
           nextGoal.tweet = `🚀 ${collective.twitterHandle ? `@${collective.twitterHandle}` : collective.name} is at ${
@@ -142,12 +184,10 @@ const processCollective = collective => {
           const collectivesById = { [collective.id]: collective };
           const csv = models.Transaction.exportCSV(data.collective.transactions, collectivesById);
 
-          options.attachments = [
-            {
-              filename: csvFilename,
-              content: csv,
-            },
-          ];
+          options.attachments.push({
+            filename: csvFilename,
+            content: csv,
+          });
         }
 
         emailData = data;
@@ -155,14 +195,20 @@ const processCollective = collective => {
       });
     })
     .then(async collective => {
-      if (collective.type === 'ORGANIZATION') {
-        const monthlyConsolidatedInvoices = await getConsolidatedInvoicePdfs(collective);
-
-        if (!isEmpty(monthlyConsolidatedInvoices)) {
-          options.attachments.push(...monthlyConsolidatedInvoices);
-          emailData.consolidatedPdfs = true;
+      if (emailData.collective.transactions && emailData.collective.transactions.length > 0) {
+        const transactionsCsvV2 = await getCollectiveTransactionsCsv(collective, { startDate, endDate });
+        if (transactionsCsvV2) {
+          const csvFilenameV2 = `${collective.slug}-${moment(d).format(dateFormat)}-transactions-v2.csv`;
+          options.attachments.push({
+            filename: csvFilenameV2,
+            content: transactionsCsvV2,
+          });
+          emailData.csvV2 = true;
         }
       }
+      return collective;
+    })
+    .then(async collective => {
       const activity = {
         type: 'collective.monthlyreport',
         data: emailData,

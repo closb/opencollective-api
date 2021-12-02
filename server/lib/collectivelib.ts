@@ -1,13 +1,13 @@
 import * as LibTaxes from '@opencollective/taxes';
 import config from 'config';
-import { get, isEmpty, pick } from 'lodash';
+import { get, pick } from 'lodash';
+import { isURL } from 'validator';
 
 import { types as CollectiveTypes } from '../constants/collectives';
 import { MODERATION_CATEGORIES } from '../constants/moderation-categories';
 import { VAT_OPTIONS } from '../constants/vat';
-import models, { sequelize } from '../models';
+import models from '../models';
 
-import { DEFAULT_GUEST_NAME } from './guest-accounts';
 import logger from './logger';
 import { md5 } from './utils';
 
@@ -53,8 +53,10 @@ export const COLLECTIVE_SETTINGS_KEYS_LIST = [
   'bitcoin',
   'categories',
   'collectivePage',
+  'cryptoEnabled',
   'disableCustomContributions',
   'dismissedHelpMessages',
+  'disableCryptoContributions',
   'editor',
   'enableWebhooks',
   'features',
@@ -65,6 +67,7 @@ export const COLLECTIVE_SETTINGS_KEYS_LIST = [
   'githubRepo',
   'githubUsers',
   'goals',
+  'goalsInterpolation',
   'hideCreditCardPostalCode',
   'hostCollective',
   'hostFeePercent',
@@ -89,6 +92,7 @@ export const COLLECTIVE_SETTINGS_KEYS_LIST = [
   'W9',
   'virtualcards',
   'transferwise',
+  'expenseTypes',
 ];
 
 /**
@@ -147,6 +151,10 @@ export function validateSettings(settings: any): string | boolean {
         return 'Invalid filtering category';
       }
     }
+  }
+
+  if (settings?.tos && !isURL(settings.tos)) {
+    return 'Enter a valid URL. The URL should have the format https://opencollective.com/';
   }
 
   if (settings) {
@@ -217,6 +225,7 @@ export const collectiveSlugReservedList = [
   'redeemed',
   'redirect',
   'register',
+  'root-actions',
   'search',
   'signin',
   'signup',
@@ -226,6 +235,7 @@ export const collectiveSlugReservedList = [
   'tos',
   'transactions',
   'updates',
+  'website',
   'widgets',
 ];
 
@@ -241,104 +251,6 @@ export const collectiveSlugReservedList = [
 export function isCollectiveSlugReserved(slug: string): boolean {
   return collectiveSlugReservedList.includes(slug);
 }
-
-const mergeCollectiveFields = async (from, into, transaction) => {
-  const fieldsToUpdate = {};
-  const isTmpName = name => !name || name === DEFAULT_GUEST_NAME || name === 'Incognito';
-  if (isTmpName(into.name) && !isTmpName(from.name)) {
-    fieldsToUpdate['name'] = from.name;
-  }
-
-  if (from.countryISO && !into.countryISO) {
-    fieldsToUpdate['countryISO'] = from.countryISO;
-  }
-
-  if (from.address && !into.address) {
-    fieldsToUpdate['address'] = from.address;
-  }
-
-  return isEmpty(fieldsToUpdate) ? into : into.update(fieldsToUpdate, { transaction });
-};
-
-/**
- * An helper to merge a collective with another one, with some limitations.
- */
-export const mergeCollectives = async (
-  from: typeof models.Collective,
-  into: typeof models.Collective,
-): Promise<void> => {
-  if (!from || !into) {
-    throw new Error('Cannot merge profiles, one of them does not exist');
-  } else if (from.type !== into.type) {
-    throw new Error('Cannot merge accounts with different types');
-  } else if (from.id === into.id) {
-    throw new Error('Cannot merge an account into itself');
-  }
-
-  return sequelize.transaction(async transaction => {
-    // Update collective
-    await mergeCollectiveFields(from, into, transaction);
-
-    // Update orders (FROM)
-    await models.Order.update({ FromCollectiveId: into.id }, { where: { FromCollectiveId: from.id } }, { transaction });
-
-    // Update orders (TO)
-    await models.Order.update({ CollectiveId: into.id }, { where: { CollectiveId: from.id } }, { transaction });
-
-    // Update transactions
-    // ... CREDIT
-    await models.Transaction.update(
-      { FromCollectiveId: into.id },
-      { where: { FromCollectiveId: from.id } },
-      { transaction },
-    );
-
-    // ... DEBIT
-    await models.Transaction.update({ CollectiveId: into.id }, { where: { CollectiveId: from.id } }, { transaction });
-
-    // Update payment methods
-    await models.PaymentMethod.update({ CollectiveId: into.id }, { where: { CollectiveId: from.id } }, { transaction });
-
-    // Update members
-    await models.Member.update(
-      { MemberCollectiveId: into.id },
-      { where: { MemberCollectiveId: from.id } },
-      { transaction },
-    );
-
-    // Update memberships
-    await models.Member.update({ CollectiveId: into.id }, { where: { CollectiveId: from.id } }, { transaction });
-
-    // Update member invitations
-    await models.MemberInvitation.update(
-      { MemberCollectiveId: into.id },
-      { where: { MemberCollectiveId: from.id } },
-      { transaction },
-    );
-
-    // Update memberships invitations
-    await models.MemberInvitation.update(
-      { CollectiveId: into.id },
-      { where: { CollectiveId: from.id } },
-      { transaction },
-    );
-
-    // Update activities
-    await models.Activity.update({ CollectiveId: into.id }, { where: { CollectiveId: from.id } }, { transaction });
-
-    // Mark from profile as deleted
-    await models.Collective.update(
-      {
-        deletedAt: Date.now(),
-        slug: `${from.slug}-merged`,
-        data: { ...from.data, mergedIntoCollectiveId: into.id },
-      },
-      {
-        where: { id: from.id },
-      },
-    );
-  });
-};
 
 /**
  * Returns true if the event is passed

@@ -3,7 +3,6 @@ import { GraphQLNonNull, GraphQLString } from 'graphql';
 
 import orderStatus from '../../../constants/order_status';
 import { TransactionKind } from '../../../constants/transaction-kind';
-import { PLATFORM_TIP_TRANSACTION_PROPERTIES } from '../../../constants/transactions';
 import { purgeCacheForCollective } from '../../../lib/cache';
 import { notifyAdminsOfCollective } from '../../../lib/notifications';
 import models from '../../../models';
@@ -24,7 +23,7 @@ const transactionMutations = {
         description: 'Reference to the transaction in the platform tip',
       },
       amount: {
-        type: GraphQLNonNull(AmountInput),
+        type: new GraphQLNonNull(AmountInput),
         description: 'Amount of the platform tip',
       },
     },
@@ -33,44 +32,42 @@ const transactionMutations = {
         throw new Unauthorized('You need to be logged in to add a platform tip');
       }
 
-      const fundsTransaction = await fetchTransactionWithReference(args.transaction, { throwIfMissing: true });
+      const transaction = await fetchTransactionWithReference(args.transaction, { throwIfMissing: true });
 
-      if (!req.remoteUser.isAdmin(fundsTransaction.HostCollectiveId)) {
+      if (!req.remoteUser.isAdmin(transaction.HostCollectiveId)) {
         throw new Unauthorized('Only host admins can add platform tips');
-      } else if (fundsTransaction.kind !== TransactionKind.ADDED_FUNDS) {
-        throw new ValidationFailed('Platform tips can only be added on added funds at the moment');
+      } else if (transaction.kind !== TransactionKind.ADDED_FUNDS) {
+        throw new ValidationFailed('Platform tips can only be added on added funds');
       }
 
-      const isPlatformTipAvailable = await models.Transaction.findOne({
-        where: {
-          TransactionGroup: fundsTransaction.TransactionGroup,
-          kind: 'PLATFORM_TIP',
-        },
-      });
-
-      if (isPlatformTipAvailable) {
+      const existingPlatformTip = await transaction.getPlatformTipTransaction();
+      if (existingPlatformTip) {
         throw new Error('Platform tip is already set for this transaction group');
       }
 
-      const transaction = {
-        data: { isFeesOnTop: true },
-        TransactionGroup: fundsTransaction.TransactionGroup,
+      // We fake a transactionData object to pass to createPlatformTipTransactions
+      // It's not ideal but it's how it is
+      const transactionData = {
+        ...transaction.dataValues,
         CreatedByUserId: req.remoteUser.id,
-        PaymentMethodId: fundsTransaction.PaymentMethodId,
-        platformFeeInHostCurrency: getValueInCentsFromAmountInput(args.amount),
-        amountInHostCurrency: args.amount,
-        FromCollectiveId: fundsTransaction.HostCollectiveId,
-        kind: TransactionKind.PLATFORM_TIP,
-        ...PLATFORM_TIP_TRANSACTION_PROPERTIES,
+        FromCollectiveId: transaction.HostCollectiveId,
+        data: {
+          ...transaction.dataValues.data,
+          isFeesOnTop: true,
+          hasPlatformTip: true,
+          platformTip: getValueInCentsFromAmountInput(args.amount),
+        },
       };
 
-      const host = await models.Collective.findByPk(transaction.CollectiveId);
-      const { platformTipTransaction } = await models.Transaction.createPlatformTipTransactions(transaction, host);
+      const host = await models.Collective.findByPk(transaction.HostCollectiveId);
+
+      const { platformTipTransaction } = await models.Transaction.createPlatformTipTransactions(transactionData, host);
+
       return platformTipTransaction;
     },
   },
   refundTransaction: {
-    type: new GraphQLNonNull(Transaction),
+    type: Transaction,
     description: 'Refunds transaction',
     args: {
       transaction: {

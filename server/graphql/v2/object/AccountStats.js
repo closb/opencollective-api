@@ -1,7 +1,11 @@
-import { GraphQLInt, GraphQLNonNull, GraphQLObjectType } from 'graphql';
+import { GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
+import { GraphQLDateTime } from 'graphql-iso-date';
 import { get, has } from 'lodash';
 
 import queries from '../../../lib/queries';
+import { Currency } from '../enum/Currency';
+import { ExpenseType } from '../enum/ExpenseType';
+import { TransactionKind } from '../enum/TransactionKind';
 import { idEncode } from '../identifiers';
 import { Amount } from '../object/Amount';
 
@@ -11,7 +15,7 @@ export const AccountStats = new GraphQLObjectType({
   fields: () => {
     return {
       id: {
-        type: GraphQLInt,
+        type: GraphQLString,
         resolve(collective) {
           return idEncode(collective.id);
         },
@@ -26,8 +30,18 @@ export const AccountStats = new GraphQLObjectType({
       balance: {
         description: 'Amount of money in cents in the currency of the collective',
         type: new GraphQLNonNull(Amount),
+        args: {
+          dateFrom: {
+            type: GraphQLDateTime,
+            description: 'Calculate balance beginning from this date.',
+          },
+          dateTo: {
+            type: GraphQLDateTime,
+            description: 'Calculate balance until this date.',
+          },
+        },
         resolve(account, args, req) {
-          return account.getBalanceAmount({ loaders: req.loaders });
+          return account.getBalanceAmount({ loaders: req.loaders, startDate: args.dateFrom, endDate: args.dateTo });
         },
       },
       monthlySpending: {
@@ -61,8 +75,53 @@ export const AccountStats = new GraphQLObjectType({
       totalAmountReceived: {
         description: 'Net amount received',
         type: new GraphQLNonNull(Amount),
-        resolve(collective) {
-          return collective.getTotalAmountReceivedAmount();
+        args: {
+          kind: {
+            type: new GraphQLList(TransactionKind),
+            description: 'Filter by kind',
+          },
+          dateTo: {
+            type: GraphQLDateTime,
+            description: 'Calculate total amount received before this date',
+          },
+          dateFrom: {
+            type: GraphQLDateTime,
+            description: 'Calculate total amount received after this date',
+          },
+        },
+        resolve(collective, args) {
+          const kind = args.kind && args.kind.length > 0 ? args.kind : undefined;
+          return collective.getTotalAmountReceivedAmount({ kind, startDate: args.dateFrom, endDate: args.dateTo });
+        },
+      },
+      totalPaidExpenses: {
+        description: 'Total of paid expenses, filter per expensetype',
+        type: new GraphQLNonNull(Amount),
+        args: {
+          expenseType: {
+            type: new GraphQLList(ExpenseType),
+            description: 'Filter by ExpenseType',
+          },
+          dateTo: {
+            type: GraphQLDateTime,
+            description: 'Calculate total amount received before this date',
+          },
+          dateFrom: {
+            type: GraphQLDateTime,
+            description: 'Calculate total amount received after this date',
+          },
+          currency: {
+            type: Currency,
+            description: 'An optional currency. If not provided, will use the collective currency.',
+          },
+        },
+        async resolve(collective, args) {
+          return collective.getTotalPaidExpensesAmount({
+            startDate: args.dateFrom,
+            endDate: args.dateTo,
+            expenseType: args.expenseType,
+            currency: args.currency,
+          });
         },
       },
       yearlyBudget: {

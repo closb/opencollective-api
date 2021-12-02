@@ -20,7 +20,8 @@
     "frontend": "https://frontend.opencollective.com",
     "website": "https://opencollective.com",
     "images": "https://images.opencollective.com",
-    "pdf": "https://pdf.opencollective.com"
+    "pdf": "https://pdf.opencollective.com",
+    "rest": "https://rest.opencollective.com"
   },
   "log": {
     "slowRequest": true
@@ -41,7 +42,14 @@
   "pdfService": {
     "fetchTransactionsReceipts": true
   },
+  "restService": {
+    "fetchCollectiveTransactionsCsv": true,
+    "fetchHostTransactionsCsv": true
+  },
   "privacy": {
     "apiUrl": "https://api.privacy.com"
+  },
+  "thegivingblock": {
+    "apiUrl": "https://public-api.tgbwidget.com/v1"
   }
 }

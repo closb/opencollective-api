@@ -32,7 +32,8 @@
     "api": "http://localhost:3060",
     "website": "http://localhost:3000",
     "images": "https://images-staging.opencollective.com",
-    "pdf": "https://pdf-staging.opencollective.com"
+    "pdf": "https://pdf-staging.opencollective.com",
+    "rest": "https://rest-staging.opencollective.com"
   },
   "fees": {
     "default": {
@@ -47,6 +48,7 @@
       "perEmail": 10,
       "perEmailForCollective": 2,
       "perIp": 5,
+      "perMask": 5,
       "forCollective": 10
     },
     "giftCards": {
@@ -57,6 +59,7 @@
       "confirmToken": 15
     },
     "skipCleanOrdersLimitSlugs": "",
+    "enabledMasks": "",
     "sendGuestConfirmPerMinutePerEmail": 1,
     "sendGuestConfirmPerMinutePerIp": 2,
     "confirmGuestAccountPerMinutePerIp": 5,
@@ -65,7 +68,7 @@
     "searchEmailPerHour": 150,
     "searchEmailPerHourPerIp": 50,
     "collectiveEmailMessagePerHour": 5,
-    "maxMemberInvitationsPerCollective": 50
+    "maxCoreContributorsPerAccount": 60
   },
   "email": {
     "from": "Open Collective <info@opencollective.com>"
@@ -115,9 +118,15 @@
       "abuse": null
     }
   },
+  "captcha": {
+    "enabled": true
+  },
   "recaptcha": {
     "siteKey": "6LcyeXoUAAAAAFtdHDZfsxncFUkD9NqydqbIFcCK",
     "secretKey": "6LcyeXoUAAAAACqNaR6EZJ_LG0V0N35uNkab3ibj"
+  },
+  "hcaptcha": {
+    "secret": "0x0000000000000000000000000000000000000000"
   },
   "helloworks": {
     "key": "RO7aWNLJx6CzhRix",
@@ -169,7 +178,22 @@
   "pdfService": {
     "fetchTransactionsReceipts": false
   },
+  "restService": {
+    "fetchCollectiveTransactionsCsv": false,
+    "fetchHostTransactionsCsv": false
+  },
   "privacy": {
     "apiUrl": "https://sandbox.privacy.com"
+  },
+  "ledger": {
+    "separateHostFees": true
+  },
+  "thegivingblock": {
+    "username": "opencollective",
+    "password": "",
+    "aesEncryptionKey": "",
+    "aesEncryptionIv": "",
+    "aesEncryptionMethod": "aes-256-cbc",
+    "apiUrl": "https://public-api.tgb-preprod.com/v1"
   }
 }

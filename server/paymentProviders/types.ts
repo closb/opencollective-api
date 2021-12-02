@@ -42,10 +42,9 @@ export interface CardProviderService {
   deleteCard(virtualCard: VirtualCardModel): Promise<void>;
   pauseCard(virtualCard: VirtualCardModel): Promise<VirtualCardModel>;
   resumeCard(virtualCard: VirtualCardModel): Promise<VirtualCardModel>;
-  refreshCardDetails(virtualCard: VirtualCardModel): Promise<VirtualCardModel>;
 
   // To be standardized
-  createExpense: any;
+  processTransaction: any;
   assignCardToCollective: any;
   autoPauseResumeCard(virtualCard: VirtualCardModel): Promise<void>;
 }

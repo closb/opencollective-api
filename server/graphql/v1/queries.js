@@ -12,6 +12,8 @@ import rawQueries from '../../lib/queries';
 import { searchCollectivesByEmail, searchCollectivesInDB } from '../../lib/search';
 import { toIsoDateStr } from '../../lib/utils';
 import models, { Op, sequelize } from '../../models';
+import { allowContextPermission, PERMISSION_TYPE } from '../common/context-permissions';
+import { canDownloadInvoice } from '../common/transactions';
 import { Forbidden, NotFound, Unauthorized, ValidationFailed } from '../errors';
 
 import { ApplicationType } from './Application';
@@ -22,7 +24,6 @@ import {
   HostCollectiveOrderFieldType,
   TypeOfCollectiveType,
 } from './CollectiveInterface';
-import { InvoiceInputType } from './inputTypes';
 import { TransactionInterfaceType } from './TransactionInterface';
 import {
   InvoiceType,
@@ -115,83 +116,6 @@ const queries = {
     },
   },
 
-  InvoiceByDateRange: {
-    type: InvoiceType,
-    deprecationReason: '2020-09-17: PDF service is now using the GQLV2 transactions endpoint',
-    args: {
-      invoiceInputType: {
-        type: new GraphQLNonNull(InvoiceInputType),
-        description:
-          'Like the Slug of the invoice but spilt out into parts and includes dateFrom + dateTo for getting an invoice over a date range.',
-      },
-    },
-    async resolve(_, args, req) {
-      const { dateFrom, dateTo, fromCollectiveSlug, collectiveSlug } = args.invoiceInputType;
-
-      if (!dateFrom || !dateTo) {
-        throw new ValidationFailed('A valid date range must be provided');
-      } else if (!fromCollectiveSlug || !collectiveSlug) {
-        throw new ValidationFailed('You must provide a collective and a fromCollective');
-      }
-
-      const fromCollective = await models.Collective.findOne({
-        where: { slug: fromCollectiveSlug },
-      });
-      if (!fromCollective) {
-        throw new NotFound(`User or organization not found for slug ${args.fromCollective}`);
-      }
-      const host = await models.Collective.findBySlug(collectiveSlug);
-      if (!host) {
-        throw new NotFound('Host not found');
-      }
-
-      if (
-        !req.remoteUser ||
-        (!req.remoteUser.isAdminOfCollective(fromCollective) &&
-          !req.remoteUser.hasRole(roles.ACCOUNTANT, fromCollective.id) &&
-          !req.remoteUser.hasRole(roles.ACCOUNTANT, host.id))
-      ) {
-        throw new Unauthorized("You don't have permission to access invoices for this user");
-      }
-
-      if (dateTo < dateFrom) {
-        throw new ValidationFailed('Invalid date object. dateFrom must be before dateTo');
-      }
-
-      const where = {
-        [Op.or]: [
-          { FromCollectiveId: fromCollective.id, UsingGiftCardFromCollectiveId: null },
-          { UsingGiftCardFromCollectiveId: fromCollective.id },
-        ],
-        HostCollectiveId: host.id,
-        createdAt: { [Op.gte]: dateFrom, [Op.lte]: dateTo },
-        type: 'CREDIT',
-      };
-
-      const order = [['createdAt', 'DESC']];
-      const transactions = await models.Transaction.findAll({ where, order });
-
-      const invoice = {
-        title: get(host, 'settings.invoiceTitle'),
-        extraInfo: get(host, 'settings.invoice.extraInfo'),
-        HostCollectiveId: host.id,
-        FromCollectiveId: fromCollective.id,
-        dateFrom: dateFrom,
-        dateTo: dateTo,
-        currency: host.currency,
-        totalAmount: 0,
-        transactions: transactions,
-      };
-
-      transactions.forEach(transaction => {
-        invoice.currency = transaction.hostCurrency;
-        invoice.totalAmount += transaction.amountInHostCurrency;
-      });
-
-      return invoice;
-    },
-  },
-
   /**
    * Get an invoice for a single transaction.
    * As we consider `uuid` to be private, we intentionally don't protect the
@@ -205,12 +129,13 @@ const queries = {
         description: 'Slug of the transaction.',
       },
     },
-    async resolve(_, args) {
-      // Fetch transaction
-      const transaction = await models.Transaction.findOne({
-        where: { uuid: args.transactionUuid },
-      });
+    async resolve(_, args, req) {
+      if (!req.remoteUser) {
+        throw new Unauthorized('You need to be logged in to generate a receipt');
+      }
 
+      // Fetch transaction
+      const transaction = await models.Transaction.findOne({ where: { uuid: args.transactionUuid } });
       if (!transaction) {
         throw new NotFound(`Transaction ${args.transactionUuid} doesn't exists`);
       }
@@ -219,7 +144,33 @@ const queries = {
       const fromCollectiveId = transaction.paymentMethodProviderCollectiveId();
 
       // Load transaction host
-      transaction.host = await transaction.getHostCollective();
+      let host;
+      if (transaction.type === 'DEBIT') {
+        // If it's a DEBIT, we load the host from the CREDIT
+        const oppositeTransaction = await transaction.getOppositeTransaction();
+        host = oppositeTransaction && (await oppositeTransaction.getHostCollective());
+      } else if (transaction.HostCollectiveId) {
+        // Otherwise if a `HostCollectiveId` is defined, we load it directly
+        host = await transaction.getHostCollective();
+      } else {
+        // TODO: Keeping the code below to be safe and not break anything, but the logic is wrong:
+        // A collective can change host and we would display the wrong one there. `Transaction.HostCollectiveId`
+        // should be the single source of truth for this.
+        const collectiveId = transaction.type === 'CREDIT' ? transaction.CollectiveId : transaction.FromCollectiveId;
+        const collective = await models.Collective.findByPk(collectiveId);
+        host = await collective.getHostCollective();
+      }
+
+      if (!host) {
+        throw new Error(`Could not find the fiscal host for this transaction (${transaction.uuid})`);
+      }
+
+      // Check permissions
+      if (canDownloadInvoice(transaction, null, req) || req.remoteUser.isAdminOfCollective(host)) {
+        allowContextPermission(req, PERMISSION_TYPE.SEE_ACCOUNT_LEGAL_NAME, fromCollectiveId);
+      } else {
+        throw new Forbidden('You are not allowed to download this receipt');
+      }
 
       // Get total in host currency
       const totalAmountInHostCurrency =
@@ -230,10 +181,10 @@ const queries = {
       const invoice = {
         title: get(transaction.host, 'settings.invoiceTitle'),
         extraInfo: get(transaction.host, 'settings.invoice.extraInfo'),
-        HostCollectiveId: get(transaction.host, 'id'),
-        slug: `${transaction.host.name}_${createdAtString}_${args.transactionUuid}`,
-        currency: transaction.hostCurrency,
+        HostCollectiveId: host.id,
         FromCollectiveId: fromCollectiveId,
+        slug: `${host.name}_${createdAtString}_${args.transactionUuid}`,
+        currency: transaction.hostCurrency,
         totalAmount: totalAmountInHostCurrency,
         transactions: [transaction],
         year: transaction.createdAt.getFullYear(),
@@ -264,6 +215,7 @@ const queries = {
       offset: { type: GraphQLInt },
       dateFrom: { type: GraphQLString },
       dateTo: { type: GraphQLString },
+      kinds: { type: new GraphQLList(GraphQLString) },
       includeExpenseTransactions: {
         type: GraphQLBoolean,
         default: true,
@@ -288,13 +240,14 @@ const queries = {
       }
 
       return collective.getTransactions({
-        order: [['createdAt', 'DESC']],
+        order: [['createdAt', 'DESC'], ['kind'], ['type']],
         type: args.type,
         limit: args.limit,
         offset: args.offset,
         startDate: args.dateFrom,
         endDate: args.dateTo,
         includeExpenseTransactions: args.includeExpenseTransactions,
+        kinds: args.kinds,
       });
     },
   },
@@ -623,6 +576,10 @@ const queries = {
         query.order = [[args.orderBy, args.orderDirection]];
       }
 
+      // Make sure entries are always ordered
+      query.order = query.order || [];
+      query.order.push(['id', 'ASC']);
+
       if (args.minBackerCount) {
         const { total, collectives } = await rawQueries.getCollectivesWithMinBackers({
           ...args,
@@ -746,14 +703,14 @@ const queries = {
       if (args.collectiveSlug) {
         args.CollectiveId = await fetchCollectiveId(args.collectiveSlug);
         if (!args.CollectiveId) {
-          throw new Error('Invalid collectiveSlug (not found)');
+          throw new Error(`No collective found with collectiveSlug ${args.collectiveSlug}`);
         }
       }
 
       if (args.memberCollectiveSlug) {
         args.MemberCollectiveId = await fetchCollectiveId(args.memberCollectiveSlug);
         if (!args.MemberCollectiveId) {
-          throw new Error('Invalid memberCollectiveSlug (not found)');
+          throw new Error(`No collective found with memberCollectiveSlug ${args.memberCollectiveSlug}`);
         }
       }
 
@@ -991,7 +948,7 @@ const queries = {
               [Op.like]: `${args.code}%`,
             }),
             { service: PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE },
-            { type: PAYMENT_METHOD_TYPE.GIFT_CARD },
+            { type: PAYMENT_METHOD_TYPE.GIFTCARD },
           ),
         });
       } else {

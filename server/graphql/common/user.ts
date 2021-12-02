@@ -2,9 +2,10 @@ import config from 'config';
 import { pick } from 'lodash';
 
 import roles from '../../constants/roles';
+import cache, { fetchCollectiveId } from '../../lib/cache';
 import emailLib from '../../lib/email';
 import logger from '../../lib/logger';
-import models, { sequelize } from '../../models';
+import models, { Op, sequelize } from '../../models';
 import { ValidationFailed } from '../errors';
 
 type CreateUserOptions = {
@@ -26,7 +27,7 @@ type CreateUserOptions = {
 };
 
 export const createUser = (
-  userData: { firstName: string; lastName: string; email: string; newsletterOptIn: boolean },
+  userData: { firstName: string; lastName: string; legalName: string; email: string; newsletterOptIn: boolean },
   { organizationData, sendSignInLink, throwIfExists, redirect, websiteUrl, creationRequest }: CreateUserOptions,
 ): Promise<{ user: typeof models.User; organization?: typeof models.Collective }> => {
   return sequelize.transaction(async transaction => {
@@ -46,7 +47,15 @@ export const createUser = (
       const organizationParams = {
         type: 'ORGANIZATION',
         CreatedByUserId: user.id,
-        ...pick(organizationData, ['name', 'slug', 'description', 'website', 'twitterHandle', 'githubHandle']),
+        ...pick(organizationData, [
+          'name',
+          'legalName',
+          'slug',
+          'description',
+          'website',
+          'twitterHandle',
+          'githubHandle',
+        ]),
       };
       organization = await models.Collective.create(organizationParams, { transaction });
       await organization.addUserWithRole(user, roles.ADMIN, { CreatedByUserId: user.id }, {}, transaction);
@@ -63,4 +72,32 @@ export const createUser = (
 
     return { user, organization };
   });
+};
+
+export const hasSeenLatestChangelogEntry = async (user: typeof models.User): Promise<boolean> => {
+  const cacheKey = 'latest_changelog_publish_date';
+  let latestChangelogUpdatePublishDate = await cache.get(cacheKey);
+  // Make sure we don't show the changelog notifications for newly confirmed users
+  const userChangelogViewDate = user.changelogViewDate || user.confirmedAt || user.createdAt;
+  if (latestChangelogUpdatePublishDate) {
+    return userChangelogViewDate >= new Date(latestChangelogUpdatePublishDate);
+  } else {
+    const collectiveId = await fetchCollectiveId('opencollective');
+    const latestChangelogUpdate = await models.Update.findOne({
+      where: {
+        CollectiveId: collectiveId,
+        publishedAt: { [Op.ne]: null },
+        isChangelog: true,
+      },
+      order: [['publishedAt', 'DESC']],
+    });
+
+    latestChangelogUpdatePublishDate = latestChangelogUpdate?.publishedAt;
+    if (!latestChangelogUpdatePublishDate) {
+      return true;
+    }
+    // keep the latest change log publish date for a day in cache
+    cache.set(cacheKey, latestChangelogUpdatePublishDate, 24 * 60 * 60);
+  }
+  return userChangelogViewDate >= latestChangelogUpdatePublishDate;
 };

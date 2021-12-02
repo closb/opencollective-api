@@ -13,7 +13,9 @@ import {
 import { Kind } from 'graphql/language';
 import GraphQLJSON from 'graphql-type-json';
 
-import { DateString, IsoDateString } from './types';
+import { CaptchaInput } from '../v2/input/CaptchaInput';
+
+import { DateString } from './types';
 
 const EmailType = new GraphQLScalarType({
   name: 'Email',
@@ -104,8 +106,9 @@ export const UserInputType = new GraphQLInputObjectType({
   fields: () => ({
     id: { type: GraphQLInt },
     email: { type: EmailType },
-    firstName: { type: GraphQLString },
-    lastName: { type: GraphQLString },
+    firstName: { type: GraphQLString, deprecationReason: '2021-09-24: Use "name"' },
+    lastName: { type: GraphQLString, deprecationReason: '2021-09-24: Use "name"' },
+    legalName: { type: GraphQLString },
     name: { type: GraphQLString },
     company: { type: GraphQLString },
     image: { type: GraphQLString },
@@ -151,6 +154,7 @@ export const CollectiveInputType = new GraphQLInputObjectType({
     slug: { type: GraphQLString },
     type: { type: GraphQLString },
     name: { type: GraphQLString },
+    legalName: { type: GraphQLString },
     company: { type: GraphQLString },
     website: { type: GraphQLString },
     twitterHandle: { type: GraphQLString },
@@ -173,12 +177,12 @@ export const CollectiveInputType = new GraphQLInputObjectType({
     members: { type: new GraphQLList(MemberInputType) },
     notifications: { type: new GraphQLList(NotificationInputType) },
     HostCollectiveId: { type: GraphQLInt },
-    hostFeePercent: { type: GraphQLInt },
+    hostFeePercent: { type: GraphQLFloat },
     ParentCollectiveId: { type: GraphQLInt },
     // not very logical to have this here. Might need some refactoring. Used to add/edit members and to create a new user on a new order
     email: { type: GraphQLString },
-    firstName: { type: GraphQLString },
-    lastName: { type: GraphQLString },
+    firstName: { type: GraphQLString, deprecationReason: '2021-09-24: Use "name"' },
+    lastName: { type: GraphQLString, deprecationReason: '2021-09-24: Use "name"' },
     isIncognito: { type: GraphQLBoolean },
     isActive: { type: GraphQLBoolean },
     contributionPolicy: { type: GraphQLString },
@@ -203,8 +207,8 @@ export const CollectiveAttributesInputType = new GraphQLInputObjectType({
     type: { type: GraphQLString },
     name: { type: GraphQLString },
     company: { type: GraphQLString },
-    firstName: { type: GraphQLString }, // for Collective type USER
-    lastName: { type: GraphQLString }, // for Collective type USER
+    firstName: { type: GraphQLString, deprecationReason: '2021-09-24: Use "name"' }, // for Collective type USER
+    lastName: { type: GraphQLString, deprecationReason: '2021-09-24: Use "name"' }, // for Collective type USER
     email: { type: GraphQLString }, // for Collective type USER
     description: { type: GraphQLString },
     longDescription: { type: GraphQLString },
@@ -304,20 +308,28 @@ export const TierInputType = new GraphQLInputObjectType({
 export const GuestInfoInput = new GraphQLInputObjectType({
   name: 'GuestInfoInput',
   description: 'Input type for guest contributions',
-  fields: {
+  fields: () => ({
     email: {
       type: GraphQLString,
       description: "Contributor's email",
     },
     name: {
       type: GraphQLString,
-      description: 'Full name of the user',
+      description: 'Display name of the user',
+    },
+    legalName: {
+      type: GraphQLString,
+      description: 'Legal name of the user',
     },
     token: {
       type: GraphQLString,
       description: 'The unique guest token',
     },
-  },
+    captcha: {
+      type: CaptchaInput,
+      description: 'Captcha validation for creating an order',
+    },
+  }),
 });
 
 export const OrderInputType = new GraphQLInputObjectType({
@@ -417,17 +429,4 @@ export const CommentAttributesInputType = new GraphQLInputObjectType({
       type: GraphQLInt,
     },
   }),
-});
-
-export const InvoiceInputType = new GraphQLInputObjectType({
-  name: 'InvoiceInputType',
-  description: 'Input dates and collectives for Invoice',
-  fields: () => {
-    return {
-      dateFrom: { type: IsoDateString },
-      dateTo: { type: IsoDateString },
-      collectiveSlug: { type: GraphQLString },
-      fromCollectiveSlug: { type: GraphQLString },
-    };
-  },
 });

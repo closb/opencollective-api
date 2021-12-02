@@ -33,5 +33,9 @@
   },
   "pdfService": {
     "fetchTransactionsReceipts": true
+  },
+  "restService": {
+    "fetchCollectiveTransactionsCsv": true,
+    "fetchHostTransactionsCsv": true
   }
 }

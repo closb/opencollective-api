@@ -4,7 +4,7 @@ import debugLib from 'debug';
 import { get, intersection } from 'lodash';
 
 import { maxInteger } from '../constants/math';
-import { PAYMENT_METHOD_SERVICES, PAYMENT_METHOD_TYPES } from '../constants/paymentMethods';
+import { PAYMENT_METHOD_SERVICES, PAYMENT_METHOD_TYPE, PAYMENT_METHOD_TYPES } from '../constants/paymentMethods';
 import { TransactionTypes } from '../constants/transactions';
 import { getFxRate } from '../lib/currency';
 import { sumTransactions } from '../lib/hostlib';
@@ -177,10 +177,14 @@ function defineModel() {
       hooks: {
         beforeCreate: instance => {
           if (instance.service !== 'opencollective') {
-            if (!instance.token && !instance.isNewPaypalPaymentAPI()) {
+            if (!instance.token && !instance.isPaypalPayment()) {
               throw new Error(`${instance.service} payment method requires a token`);
             }
-            if (instance.service === 'stripe' && !instance.token.match(/^(tok|src|pm)_[a-zA-Z0-9]{24}/)) {
+            if (
+              instance.service === 'stripe' &&
+              instance.type === 'creditcard' &&
+              !instance.token.match(/^(tok|src|pm)_[a-zA-Z0-9]{24}/)
+            ) {
               if (config.env !== 'production' && isTestToken(instance.token)) {
                 // test token for end to end tests
               } else {
@@ -304,8 +308,8 @@ function defineModel() {
         );
       }
 
-      // If there is no monthly limit, the user needs to be an admin of the collective that owns the payment method
-      if (!this.monthlyLimitPerMember && !user.isAdminOfCollective(collective) && this.type !== 'manual') {
+      // If there is no monthly limit, the user needs to be an admin of the collective that owns the payment method (or its host)
+      if (!this.monthlyLimitPerMember && !user.isAdminOfCollectiveOrHost(collective) && this.type !== 'manual') {
         throw new Error(
           "You don't have enough permissions to use this payment method (you need to be an admin of the collective that owns this payment method)",
         );
@@ -353,8 +357,8 @@ function defineModel() {
     return await paymentProvider.updateBalance(this);
   };
 
-  PaymentMethod.prototype.isNewPaypalPaymentAPI = async function () {
-    return Boolean(this.service === 'paypal' && this.type === 'payment' && this.data?.isNewApi);
+  PaymentMethod.prototype.isPaypalPayment = async function () {
+    return Boolean(this.service === 'paypal' && this.type === 'payment');
   };
 
   /**
@@ -435,21 +439,6 @@ function defineModel() {
   };
 
   /**
-   * Returns the sum of the children PaymenMethod values (aka the gift cards which
-   * have `sourcePaymentMethod` set to this PM).
-   */
-  PaymentMethod.prototype.getChildrenPMTotalSum = async function () {
-    return models.PaymentMethod.findAll({
-      attributes: ['initialBalance', 'monthlyLimitPerMember'],
-      where: { SourcePaymentMethodId: this.id },
-    }).then(children => {
-      return children.reduce((total, pm) => {
-        return total + (pm.initialBalance || pm.monthlyLimitPerMember);
-      }, 0);
-    });
-  };
-
-  /**
    * Check if gift card is claimed.
    * Always return true for other payment methods.
    */
@@ -486,7 +475,16 @@ function defineModel() {
         CollectiveId: paymentMethod.CollectiveId, // might be null if the user decided not to save the credit card on file
       };
       debug('PaymentMethod.create', paymentMethodData);
-      return models.PaymentMethod.create(paymentMethodData);
+      // We don't need to have multiple Alipay PaymentMethod per-users because it is just we use this just as a flag for the payment type
+      if (paymentMethod.type === PAYMENT_METHOD_TYPE.ALIPAY) {
+        const [pm] = await models.PaymentMethod.findOrCreate({
+          where: { type: paymentMethod.type, service: paymentMethod.service, CollectiveId: paymentMethod.CollectiveId },
+          defaults: paymentMethodData,
+        });
+        return pm;
+      } else {
+        return models.PaymentMethod.create(paymentMethodData);
+      }
     } else {
       return PaymentMethod.findOne({
         where: { uuid: paymentMethod.uuid },

@@ -10,8 +10,9 @@ export const UpdateCreateInput = new GraphQLInputObjectType({
   fields: () => ({
     title: { type: new GraphQLNonNull(GraphQLString) },
     isPrivate: { type: GraphQLBoolean },
+    isChangelog: { type: GraphQLBoolean },
     makePublicOn: { type: IsoDateString },
-    html: { type: GraphQLString },
+    html: { type: new GraphQLNonNull(GraphQLString) },
     fromAccount: { type: AccountReferenceInput },
     account: { type: new GraphQLNonNull(AccountReferenceInput) },
   }),

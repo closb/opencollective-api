@@ -5,6 +5,7 @@ import logger from '../../../lib/logger';
 import { PaymentMethod } from '../../../types/PaymentMethod';
 
 export enum PaymentMethodLegacyTypeEnum {
+  ALIPAY = 'ALIPAY',
   CREDIT_CARD = 'CREDIT_CARD',
   GIFT_CARD = 'GIFT_CARD',
   PREPAID_BUDGET = 'PREPAID_BUDGET',
@@ -12,6 +13,7 @@ export enum PaymentMethodLegacyTypeEnum {
   PAYPAL = 'PAYPAL',
   BANK_TRANSFER = 'BANK_TRANSFER',
   ADDED_FUNDS = 'ADDED_FUNDS',
+  CRYPTO = 'CRYPTO',
 }
 
 export const PaymentMethodLegacyType = new GraphQLEnumType({
@@ -30,7 +32,7 @@ export const getLegacyPaymentMethodType = ({ service, type }: PaymentMethod): Pa
       return PaymentMethodLegacyTypeEnum.CREDIT_CARD;
     }
   } else if (service === PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE) {
-    if (type === PAYMENT_METHOD_TYPE.GIFT_CARD) {
+    if (type === PAYMENT_METHOD_TYPE.GIFTCARD) {
       return PaymentMethodLegacyTypeEnum.GIFT_CARD;
     } else if (type === PAYMENT_METHOD_TYPE.HOST) {
       return PaymentMethodLegacyTypeEnum.ADDED_FUNDS;
@@ -41,6 +43,8 @@ export const getLegacyPaymentMethodType = ({ service, type }: PaymentMethod): Pa
     }
   } else if (service === PAYMENT_METHOD_SERVICE.PAYPAL && type === PAYMENT_METHOD_TYPE.PAYMENT) {
     return PaymentMethodLegacyTypeEnum.PAYPAL;
+  } else if (service === PAYMENT_METHOD_SERVICE.THEGIVINGBLOCK && type === PAYMENT_METHOD_TYPE.CRYPTO) {
+    return PaymentMethodLegacyTypeEnum.CRYPTO;
   }
 
   logger.warn(`getPaymentMethodType: Unknown PM type for ${service}/${type}`);
@@ -53,7 +57,7 @@ export const getServiceTypeFromLegacyPaymentMethodType = (type: PaymentMethodLeg
     case PaymentMethodLegacyTypeEnum.CREDIT_CARD:
       return { service: PAYMENT_METHOD_SERVICE.STRIPE, type: PAYMENT_METHOD_TYPE.CREDITCARD };
     case PaymentMethodLegacyTypeEnum.GIFT_CARD:
-      return { service: PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE, type: PAYMENT_METHOD_TYPE.GIFT_CARD };
+      return { service: PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE, type: PAYMENT_METHOD_TYPE.GIFTCARD };
     case PaymentMethodLegacyTypeEnum.PREPAID_BUDGET:
       return { service: PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE, type: PAYMENT_METHOD_TYPE.PREPAID };
     case PaymentMethodLegacyTypeEnum.ACCOUNT_BALANCE:
@@ -64,5 +68,9 @@ export const getServiceTypeFromLegacyPaymentMethodType = (type: PaymentMethodLeg
       return { service: PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE, type: PAYMENT_METHOD_TYPE.MANUAL };
     case PaymentMethodLegacyTypeEnum.PAYPAL:
       return { service: PAYMENT_METHOD_SERVICE.PAYPAL, type: PAYMENT_METHOD_TYPE.PAYMENT };
+    case PaymentMethodLegacyTypeEnum.ALIPAY:
+      return { service: PAYMENT_METHOD_SERVICE.STRIPE, type: PAYMENT_METHOD_TYPE.ALIPAY };
+    case PaymentMethodLegacyTypeEnum.CRYPTO:
+      return { service: PAYMENT_METHOD_SERVICE.THEGIVINGBLOCK, type: PAYMENT_METHOD_TYPE.CRYPTO };
   }
 };

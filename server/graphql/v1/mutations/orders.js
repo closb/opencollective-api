@@ -1,15 +1,14 @@
 import crypto from 'crypto';
 
 import * as LibTaxes from '@opencollective/taxes';
-import Promise from 'bluebird';
 import config from 'config';
 import debugLib from 'debug';
+import * as hcaptcha from 'hcaptcha';
 import { get, isNil, omit, pick, set } from 'lodash';
-import moment from 'moment';
-import { v4 as uuid } from 'uuid';
 import { isEmail } from 'validator';
 
 import activities from '../../../constants/activities';
+import CAPTCHA_PROVIDERS from '../../../constants/captcha-providers';
 import { types } from '../../../constants/collectives';
 import FEATURE from '../../../constants/feature';
 import status from '../../../constants/order_status';
@@ -39,7 +38,12 @@ const oneHourInSeconds = 60 * 60;
 
 const debug = debugLib('orders');
 
-function getOrdersLimit(order, reqIp) {
+export const ORDER_PUBLIC_DATA_FIELDS = {
+  pledgeCurrency: 'thegivingblock.pledgeCurrency',
+  pledgeAmount: 'thegivingblock.pledgeAmount',
+};
+
+function getOrdersLimit(order, reqIp, reqMask) {
   const limits = [];
 
   const ordersLimits = config.limits.ordersPerHour;
@@ -84,6 +88,13 @@ function getOrdersLimit(order, reqIp) {
     }
   }
 
+  if (reqMask && config.limits.enabledMasks.includes(reqMask)) {
+    limits.push({
+      key: `order_limit_on_mask_${reqMask}`,
+      value: ordersLimits.perMask,
+    });
+  }
+
   // Guest Contributions
   if (guestInfo && collectiveId) {
     limits.push({
@@ -95,16 +106,18 @@ function getOrdersLimit(order, reqIp) {
   return limits;
 }
 
-async function checkOrdersLimit(order, reqIp) {
+async function checkOrdersLimit(order, reqIp, reqMask) {
   if (['ci', 'test'].includes(config.env)) {
     return;
   }
+
+  debug(`checkOrdersLimit reqIp:${reqIp} reqMask:${reqMask}`);
 
   // Generic error message
   // const errorMessage = 'Error while processing your request, please try again or contact support@opencollective.com.';
   const errorMessage = 'Your card was declined.';
 
-  const limits = getOrdersLimit(order, reqIp);
+  const limits = getOrdersLimit(order, reqIp, reqMask);
 
   for (const limit of limits) {
     const count = (await cache.get(limit.key)) || 0;
@@ -125,8 +138,8 @@ async function checkOrdersLimit(order, reqIp) {
   }
 }
 
-async function cleanOrdersLimit(order, reqIp) {
-  const limits = getOrdersLimit(order, reqIp);
+async function cleanOrdersLimit(order, reqIp, reqMask) {
+  const limits = getOrdersLimit(order, reqIp, reqMask);
 
   for (const limit of limits) {
     cache.del(limit.key);
@@ -146,9 +159,10 @@ const checkGuestContribution = async (order, loaders) => {
   } else if (!guestInfo.email || !isEmail(guestInfo.email)) {
     throw new BadRequest('You need to provide a valid email');
   } else if (order.totalAmount > 25000) {
+    const location = guestInfo.location || {};
     if (!guestInfo.name) {
       throw new BadRequest('Contributions that are more than $250 must have a name attached');
-    } else if (order.totalAmount > 500000 && (!guestInfo.location?.address || !guestInfo.location.country)) {
+    } else if (order.totalAmount > 500000 && !location.structured && (!location.address || !location.country)) {
       throw new BadRequest('Contributions that are more than $5000 must have an address attached');
     }
   } else if (order.fromCollective) {
@@ -158,20 +172,39 @@ const checkGuestContribution = async (order, loaders) => {
   }
 };
 
-async function checkRecaptcha(order, remoteUser, reqIp) {
-  // Disabled for all environments
-  if (config.env.recaptcha && !parseToBoolean(config.env.recaptcha.enable)) {
+async function checkCaptcha(order, remoteUser, reqIp) {
+  const requestedProvider = order.guestInfo?.captcha?.provider;
+  const isCaptchaEnabled = parseToBoolean(config.captcha?.enabled);
+
+  if (!isCaptchaEnabled) {
     return;
   }
 
-  if (!order.recaptchaToken) {
-    // Pass for now
-    return;
+  if (!order.guestInfo?.captcha?.token) {
+    throw new BadRequest('You need to inform a valid captcha token');
   }
 
-  const response = recaptcha.verify(order.recaptchaToken, reqIp);
+  let response;
+  if (requestedProvider === CAPTCHA_PROVIDERS.HCAPTCHA && config.hcaptcha?.secret) {
+    response = await hcaptcha.verify(
+      config.hcaptcha.secret,
+      order.guestInfo.captcha.token,
+      reqIp,
+      config.hcaptcha.sitekey,
+    );
+  } else if (
+    requestedProvider === CAPTCHA_PROVIDERS.RECAPTCHA &&
+    config.recaptcha &&
+    parseToBoolean(config.recaptcha.enable)
+  ) {
+    response = await recaptcha.verify(order.guestInfo.captcha.token, reqIp);
+  } else {
+    throw new BadRequest('Could not find requested Captcha provider', undefined, order.guestInfo?.captcha);
+  }
 
-  // TODO: check response and throw an error if needed
+  if (response.success !== true) {
+    throw new BadRequest('Captcha verification failed');
+  }
 
   return response;
 }
@@ -248,14 +281,20 @@ const hasPaymentMethod = order => {
   const { paymentMethod } = order;
   if (!paymentMethod) {
     return false;
-  } else if (paymentMethod.service === 'paypal' && paymentMethod.data?.isNewApi) {
-    return Boolean(paymentMethod.data.orderId);
+  } else if (paymentMethod.service === 'paypal' && paymentMethod.type === 'payment') {
+    return Boolean(paymentMethod.data?.orderId);
   } else {
-    return Boolean(paymentMethod.uuid || paymentMethod.token || paymentMethod.type === 'manual');
+    return Boolean(
+      paymentMethod.uuid ||
+        paymentMethod.token ||
+        paymentMethod.type === 'manual' ||
+        paymentMethod.type === 'alipay' ||
+        paymentMethod.type === 'crypto',
+    );
   }
 };
 
-export async function createOrder(order, loaders, remoteUser, reqIp, userAgent) {
+export async function createOrder(order, loaders, remoteUser, reqIp, userAgent, reqMask) {
   debug('Beginning creation of order', order);
 
   if (remoteUser && !canUseFeature(remoteUser, FEATURE.ORDER)) {
@@ -264,8 +303,7 @@ export async function createOrder(order, loaders, remoteUser, reqIp, userAgent) 
     await checkGuestContribution(order, loaders);
   }
 
-  await checkOrdersLimit(order, reqIp);
-  const recaptchaResponse = await checkRecaptcha(order, remoteUser, reqIp);
+  await checkOrdersLimit(order, reqIp, reqMask);
 
   let orderCreated, isGuest, guestToken;
   try {
@@ -404,6 +442,7 @@ export async function createOrder(order, loaders, remoteUser, reqIp, userAgent) 
       }
     }
 
+    let captchaResponse;
     if (!fromCollective) {
       if (remoteUser) {
         // @deprecated - Creating organizations inline from this endpoint should not be supported anymore
@@ -411,7 +450,8 @@ export async function createOrder(order, loaders, remoteUser, reqIp, userAgent) 
         fromCollective = await models.Collective.createOrganization(order.fromCollective, remoteUser, remoteUser);
       } else {
         // Create or retrieve guest profile from GUEST_TOKEN
-        const creationRequest = { ip: reqIp, userAgent };
+        const creationRequest = { ip: reqIp, userAgent, mask: reqMask };
+        captchaResponse = await checkCaptcha(order, remoteUser, reqIp);
         const guestProfile = await getOrCreateGuestProfile(order.guestInfo, creationRequest);
         remoteUser = guestProfile.user;
         fromCollective = guestProfile.collective;
@@ -486,6 +526,11 @@ export async function createOrder(order, loaders, remoteUser, reqIp, userAgent) 
       orderStatus = status.PENDING;
     }
 
+    let orderPublicData;
+    if (order.data) {
+      orderPublicData = pick(order.data, Object.values(ORDER_PUBLIC_DATA_FIELDS));
+    }
+
     const orderData = {
       CreatedByUserId: remoteUser.id,
       FromCollectiveId: fromCollective.id,
@@ -500,9 +545,12 @@ export async function createOrder(order, loaders, remoteUser, reqIp, userAgent) 
       publicMessage: order.publicMessage, // deprecated: '2019-07-03: This info is now stored at the Member level'
       privateMessage: order.privateMessage,
       processedAt: paymentRequired || !collective.isActive ? null : new Date(),
+      tags: order.tags,
       data: {
+        ...orderPublicData,
         reqIp,
-        recaptchaResponse,
+        reqMask,
+        captchaResponse,
         tax: taxInfo,
         customData: order.customData,
         savePaymentMethod: Boolean(!isGuest && order.paymentMethod?.save),
@@ -510,6 +558,7 @@ export async function createOrder(order, loaders, remoteUser, reqIp, userAgent) 
         guestToken, // For guest contributions, this token is a way to authenticate to confirm the order
         isEmbed: Boolean(order.context?.isEmbed),
         isGuest,
+        isBalanceTransfer: order.isBalanceTransfer,
       },
       status: orderStatus,
     };
@@ -589,7 +638,7 @@ export async function createOrder(order, loaders, remoteUser, reqIp, userAgent) 
     const skipCleanOrdersLimitSlugs = config.limits.skipCleanOrdersLimitSlugs;
 
     if (!skipCleanOrdersLimitSlugs || !skipCleanOrdersLimitSlugs.includes(collective.slug)) {
-      cleanOrdersLimit(order, reqIp);
+      cleanOrdersLimit(order, reqIp, reqMask);
     }
 
     order = await models.Order.findByPk(orderCreated.id);
@@ -733,61 +782,6 @@ export async function refundTransaction(_, args, req) {
   // Return the transaction passed to the `refundTransaction` method
   // after it was updated.
   return result;
-}
-
-/** Create prepaid payment method that can be used by an organization
- *
- * @param {Object} args contains the parameters to create the new
- *  payment method.
- * @param {String} args.description The description of the new payment
- *  method.
- * @param {Number} args.CollectiveId The ID of the organization
- *  receiving the prepaid card.
- * @param {Number} args.HostCollectiveId The ID of the host that
- *  received the money on its bank account.
- * @param {Number} args.totalAmount The total amount that will be
- *  credited to the newly created payment method.
- * @param {models.User} remoteUser is the user creating the new credit
- *  card. Right now only site admins can use this feature.
- */
-export async function addFundsToOrg(args, remoteUser) {
-  if (!remoteUser.isRoot()) {
-    throw new Error('Only site admins can perform this operation');
-  }
-  const [fromCollective, hostCollective] = await Promise.all([
-    models.Collective.findByPk(args.CollectiveId),
-    models.Collective.findByPk(args.HostCollectiveId),
-  ]);
-  // creates a new Payment method
-  const paymentMethod = await models.PaymentMethod.create({
-    name: args.description || 'Host funds',
-    initialBalance: args.totalAmount,
-    monthlyLimitPerMember: null,
-    currency: hostCollective.currency,
-    CollectiveId: args.CollectiveId,
-    customerId: fromCollective.slug,
-    expiryDate: moment().add(3, 'year').format(),
-    uuid: uuid(),
-    data: { HostCollectiveId: args.HostCollectiveId },
-    service: 'opencollective',
-    type: 'prepaid',
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  });
-
-  models.Activity.create({
-    type: activities.ADDED_FUND_TO_ORG,
-    CollectiveId: args.CollectiveId,
-    data: {
-      totalAmount: args.totalAmount,
-      collective: fromCollective,
-      currency: fromCollective.currency,
-      currentBalance: paymentMethod.initialBalance,
-      addedBy: hostCollective.name,
-    },
-  });
-
-  return paymentMethod;
 }
 
 export async function markOrderAsPaid(remoteUser, id) {
@@ -939,21 +933,12 @@ export async function addFundsToCollective(order, remoteUser) {
     orderData.data.hostFeePercent = order.hostFeePercent;
   }
 
-  if (!isNil(order.platformFeePercent)) {
-    orderData.data.platformFeePercent = order.platformFeePercent;
-  }
-
   const orderCreated = await models.Order.create(orderData);
 
   const hostPaymentMethod = await host.getOrCreateHostPaymentMethod();
   await orderCreated.setPaymentMethod({ uuid: hostPaymentMethod.uuid });
 
-  if (fromCollective.isHostAccount && fromCollective.id === collective.id) {
-    // Special Case, adding funds to itself
-    await models.Transaction.creditHost(orderCreated, collective);
-  } else {
-    await libPayments.executeOrder(remoteUser || user, orderCreated);
-  }
+  await libPayments.executeOrder(remoteUser || user, orderCreated);
 
   // Invalidate Cloudflare cache for the collective pages
   purgeCacheForCollective(collective.slug);

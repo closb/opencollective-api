@@ -1,8 +1,11 @@
 import { GraphQLInt, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
 import { GraphQLDateTime } from 'graphql-iso-date';
+import GraphQLJSON from 'graphql-type-json';
+import { pick } from 'lodash';
 
 import roles from '../../../constants/roles';
 import models from '../../../models';
+import { ORDER_PUBLIC_DATA_FIELDS } from '../../v1/mutations/orders';
 import { ContributionFrequency, OrderStatus } from '../enum';
 import { idEncode } from '../identifiers';
 import { Account } from '../interface/Account';
@@ -41,7 +44,12 @@ export const Order = new GraphQLObjectType({
       amount: {
         type: new GraphQLNonNull(Amount),
         resolve(order) {
-          return { value: order.totalAmount, currency: order.currency };
+          let value = order.totalAmount;
+          // We remove Platform Tip from totalAmount
+          if (order.data?.isFeesOnTop && order.data?.platformFee) {
+            value = value - order.data.platformFee;
+          }
+          return { value, currency: order.currency };
         },
       },
       quantity: {
@@ -136,26 +144,33 @@ export const Order = new GraphQLObjectType({
           }
         },
       },
-      platformFee: {
+      platformContributionAmount: {
         type: Amount,
-        deprecationReason: '2020-07-31: Please use platformContributionAmount',
+        deprecationReason: '2021-06-07: Please use platformTipAmount',
+        description: 'Platform contribution attached to the Order.',
         resolve(order) {
-          if (order.data?.isFeesOnTop) {
-            return { value: order.data.platformFee };
+          if (order.data?.isFeesOnTop && order.data?.platformFee) {
+            return { value: order.data.platformFee, currency: order.currency };
           } else {
             return null;
           }
         },
       },
-      platformContributionAmount: {
+      platformTipAmount: {
         type: Amount,
-        description: 'Platform contribution attached to the Order.',
+        description: 'Platform Tip attached to the Order.',
         resolve(order) {
-          if (order.data?.isFeesOnTop) {
+          if (order.data?.isFeesOnTop && order.data?.platformFee) {
             return { value: order.data.platformFee, currency: order.currency };
           } else {
             return null;
           }
+        },
+      },
+      tags: {
+        type: new GraphQLNonNull(new GraphQLList(GraphQLString)),
+        resolve(order) {
+          return order.tags || [];
         },
       },
       taxes: {
@@ -193,6 +208,25 @@ export const Order = new GraphQLObjectType({
         description: 'The permissions given to current logged in user for this order',
         async resolve(order) {
           return order; // Individual fields are set by OrderPermissions resolvers
+        },
+      },
+      data: {
+        type: GraphQLJSON,
+        description: 'Data related to the order',
+        resolve(order) {
+          return pick(order.data, Object.values(ORDER_PUBLIC_DATA_FIELDS));
+        },
+      },
+      customData: {
+        type: GraphQLJSON,
+        description:
+          'Custom data related to the order, based on the fields described by tier.customFields. Must be authenticated as an admin of the fromAccount or toAccount (returns null otherwise)',
+        resolve(order, _, { remoteUser }) {
+          if (!remoteUser || !(remoteUser.isAdmin(order.CollectiveId) || remoteUser.isAdmin(order.FromCollectiveId))) {
+            return null;
+          } else {
+            return order.data?.customData || {};
+          }
         },
       },
     };

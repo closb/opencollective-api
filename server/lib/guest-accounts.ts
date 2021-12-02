@@ -15,8 +15,9 @@ type GuestProfileDetails = {
 };
 
 type Location = {
-  country: string | null;
-  address: string | null;
+  country?: string | null;
+  address?: string | null;
+  structured?: Record<string, string> | null;
 };
 
 /**
@@ -36,6 +37,9 @@ const updateCollective = async (collective, newInfo, transaction) => {
     if (newInfo.location.address && newInfo.location.address !== collective.address) {
       fieldsToUpdate['address'] = newInfo.location.address;
     }
+    if (newInfo.location.structured) {
+      fieldsToUpdate['data'] = { ...(collective.data || {}), address: newInfo.location.structured };
+    }
   }
 
   return isEmpty(fieldsToUpdate) ? collective : collective.update(fieldsToUpdate, { transaction });
@@ -44,6 +48,7 @@ const updateCollective = async (collective, newInfo, transaction) => {
 type UserInfoInput = {
   email?: string | null;
   name?: string | null;
+  legalName?: string | null;
   location?: Location;
 };
 
@@ -56,7 +61,7 @@ type UserCreationRequest = {
  * Retrieves or create an guest profile by email.
  */
 export const getOrCreateGuestProfile = async (
-  { email, name, location }: UserInfoInput,
+  { email, name, legalName, location }: UserInfoInput,
   creationRequest: UserCreationRequest = null,
 ): Promise<GuestProfileDetails> => {
   const emailConfirmationToken = crypto.randomBytes(48).toString('hex');
@@ -84,7 +89,9 @@ export const getOrCreateGuestProfile = async (
     } else if (user.CollectiveId) {
       collective = await models.Collective.findByPk(user.CollectiveId, { transaction });
       if (!user.confirmedAt) {
-        collective = await updateCollective(collective, { name, location }, transaction);
+        const newLegalName = legalName || collective.legalName;
+        const newValues = { name, location, legalName: newLegalName };
+        collective = await updateCollective(collective, newValues, transaction);
       }
     }
 
@@ -95,7 +102,8 @@ export const getOrCreateGuestProfile = async (
           type: COLLECTIVE_TYPE.USER,
           slug: `guest-${uuid().split('-')[0]}`,
           name: name || DEFAULT_GUEST_NAME,
-          data: { isGuest: true },
+          legalName,
+          data: { isGuest: true, address: location?.structured },
           address: location?.address,
           countryISO: location?.country,
           CreatedByUserId: user.id,
@@ -129,7 +137,6 @@ export const confirmGuestAccount = async (
   const newName = userCollective.name !== DEFAULT_GUEST_NAME ? userCollective.name : 'Incognito';
   userCollective = await userCollective.update({
     name: newName,
-    slug: newName === 'Incognito' ? `user-${uuid().split('-')[0]}` : await models.Collective.generateSlug([newName]),
     data: { ...userCollective.data, isGuest: false, wasGuest: true },
   });
 

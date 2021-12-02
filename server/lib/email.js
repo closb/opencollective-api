@@ -218,8 +218,6 @@ const getNotificationLabel = (template, recipients) => {
   }
 
   const notificationTypeLabels = {
-    'email.approve': 'notifications of new emails pending approval',
-    'email.message': `the ${recipients[0].substr(0, recipients[0].indexOf('@'))} mailing list`,
     'collective.order.created': 'notifications of new donations for this collective',
     'collective.comment.created': 'notifications of new comments submitted to this collective',
     'collective.expense.created': 'notifications of new expenses submitted to this collective',
@@ -275,17 +273,14 @@ const generateEmailFromTemplate = (template, recipient, data = {}, options = {})
   }
 
   if (template === 'collective.approved') {
-    if (hostSlug === 'the-social-change-nest') {
-      template += '.the-social-change-nest';
+    if (['foundation', 'the-social-change-nest'].includes(hostSlug)) {
+      template = `${template}.${hostSlug}`;
     }
   }
 
   if (template === 'collective.created') {
-    if (hostSlug === 'opensource') {
-      template += '.opensource';
-    }
-    if (hostSlug === 'the-social-change-nest') {
-      template += '.the-social-change-nest';
+    if (['opensource', 'the-social-change-nest'].includes(hostSlug)) {
+      template = `${template}.${hostSlug}`;
     }
   }
 
@@ -338,7 +333,6 @@ const generateEmailFromTemplate = (template, recipient, data = {}, options = {})
   }
 
   data.config = pick(config, ['host']);
-  data.utm = `utm_source=opencollective&utm_campaign=${template}&utm_medium=email`;
 
   if (!templates[template]) {
     return Promise.reject(new Error(`Invalid email template: ${template}`));

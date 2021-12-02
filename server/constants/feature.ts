@@ -19,7 +19,6 @@ enum FEATURE {
   COLLECTIVE_GOALS = 'COLLECTIVE_GOALS',
   /**
    * Whether this profile has the "top contributors" section enabled.
-   * TODO: This is a frontend setting specific to the collective page, "features" shouldn't be used for that
    */
   TOP_FINANCIAL_CONTRIBUTORS = 'TOP_FINANCIAL_CONTRIBUTORS',
   /** Whether this profile can host conversations */
@@ -27,12 +26,15 @@ enum FEATURE {
   /** Whether this profile can host updates */
   UPDATES = 'UPDATES',
   /**
+   * Whether this profile can have a long description
+   */
+  ABOUT = 'ABOUT',
+  /**
    * Whether this profile has the "team" section displayed
-   * TODO: This is a frontend setting specific to the collective page, "features" shouldn't be used for that
    */
   TEAM = 'TEAM',
   /**
-   * Whether user can create collectives.
+   * Whether user can create orders.
    * TODO: This is a user feature, not a collective feature. We should separate the two
    */
   ORDER = 'ORDER',
@@ -56,6 +58,20 @@ enum FEATURE {
   HOST_DASHBOARD = 'HOST_DASHBOARD',
   /** Whether this profile has connected accounts */
   CONNECTED_ACCOUNTS = 'CONNECTED_ACCOUNTS',
+  /** Whether this profile can receive donations using AliPay */
+  ALIPAY = 'ALIPAY',
+
+  /** Whether an account can add and use payment methods */
+  USE_PAYMENT_METHODS = 'USE_PAYMENT_METHODS',
+
+  /** Whether an account can emit gift cards */
+  EMIT_GIFT_CARDS = 'EMIT_GIFT_CARDS',
+
+  /** Virtual Cards */
+  // Whether this profile can assign virtual cards
+  VIRTUAL_CARDS = 'VIRTUAL_CARDS',
+  // Whether this profile can request a virtual card
+  REQUEST_VIRTUAL_CARDS = 'REQUEST_VIRTUAL_CARDS',
 }
 
 export const FeaturesList = Object.values(FEATURE);

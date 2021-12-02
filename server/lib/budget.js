@@ -1,10 +1,11 @@
 import expenseStatus from '../constants/expense_status';
+import { TransactionKind } from '../constants/transaction-kind';
 import { TransactionTypes } from '../constants/transactions';
 import models, { Op, sequelize } from '../models';
 
 import { getFxRate } from './currency';
 
-const { CREDIT } = TransactionTypes;
+const { CREDIT, DEBIT } = TransactionTypes;
 const { PROCESSING, SCHEDULED_FOR_PAYMENT } = expenseStatus;
 
 /* Versions of the balance algorithm:
@@ -91,7 +92,7 @@ export function getBalancesWithBlockedFunds(collectiveIds, { startDate, endDate,
   });
 }
 
-export function getTotalAmountReceivedAmount(collective, { startDate, endDate, currency, version } = {}) {
+export function getTotalAmountReceivedAmount(collective, { startDate, endDate, currency, version, kind } = {}) {
   version = version || collective.settings?.budget?.version || 'v1';
   currency = currency || collective.currency;
   return sumCollectiveTransactions(collective, {
@@ -100,15 +101,53 @@ export function getTotalAmountReceivedAmount(collective, { startDate, endDate, c
     currency,
     column: ['v0', 'v1'].includes(version) ? 'amountInCollectiveCurrency' : 'amountInHostCurrency',
     transactionType: CREDIT,
+    kind: kind,
     hostCollectiveId: version === 'v3' ? { [Op.not]: null } : null,
     excludeInternals: true,
   });
 }
 
-export function getTotalNetAmountReceivedAmount(collective, { startDate, endDate, currency, version } = {}) {
+export async function getTotalAmountPaidExpenses(collective, { startDate, endDate, expenseType, currency } = {}) {
+  currency = currency || collective.currency;
+
+  const where = {
+    FromCollectiveId: collective.id,
+    status: 'PAID',
+  };
+  if (expenseType) {
+    where.type = expenseType;
+  }
+  if (startDate) {
+    where.createdAt = where.createdAt || {};
+    where.createdAt[Op.gte] = startDate;
+  }
+  if (endDate) {
+    where.createdAt = where.createdAt || {};
+    where.createdAt[Op.lt] = endDate;
+  }
+
+  const results = await models.Expense.findAll({
+    attributes: ['currency', [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('amount')), 0), 'amount']],
+    where: where,
+    group: 'currency',
+    raw: true,
+  });
+
+  let total = 0;
+  for (const result of results) {
+    const fxRate = await getFxRate(result.currency, currency);
+    total += Math.round(result.amount * fxRate);
+  }
+
+  // Sum and convert to final currency
+  return { value: total, currency };
+}
+
+export async function getTotalNetAmountReceivedAmount(collective, { startDate, endDate, currency, version } = {}) {
   version = version || collective.settings?.budget?.version || 'v1';
   currency = currency || collective.currency;
-  return sumCollectiveTransactions(collective, {
+
+  const totalReceived = await sumCollectiveTransactions(collective, {
     startDate,
     endDate,
     currency,
@@ -117,24 +156,38 @@ export function getTotalNetAmountReceivedAmount(collective, { startDate, endDate
     hostCollectiveId: version === 'v3' ? { [Op.not]: null } : null,
     excludeInternals: true,
   });
+
+  const totalFees = await sumCollectiveTransactions(collective, {
+    startDate,
+    endDate,
+    currency,
+    column: ['v0', 'v1'].includes(version) ? 'netAmountInCollectiveCurrency' : 'netAmountInHostCurrency',
+    transactionType: DEBIT,
+    kind: TransactionKind.HOST_FEE,
+    excludeInternals: true,
+  });
+
+  return { ...totalReceived, value: totalReceived.value + totalFees.value };
 }
 
-export async function getTotalMoneyManagedAmount(host, { startDate, endDate, currency, version } = {}) {
+export async function getTotalMoneyManagedAmount(host, { startDate, endDate, collectiveIds, currency, version } = {}) {
   version = version || host.settings?.budget?.version || 'v1';
   currency = currency || host.currency;
 
-  const hostedCollectives = await host.getHostedCollectives();
-  const ids = hostedCollectives.map(c => c.id);
-  if (host.isActive) {
-    ids.push(host.id);
+  if (!collectiveIds) {
+    const collectives = await host.getHostedCollectives({ attributes: ['id'] });
+    collectiveIds = collectives.map(result => result.id);
+    collectiveIds.push(host.id);
   }
-  if (ids.length === 0) {
+
+  if (collectiveIds.length === 0) {
     return { value: 0, currency };
   }
 
-  const results = await sumCollectivesTransactions(ids, {
+  const results = await sumCollectivesTransactions(collectiveIds, {
     startDate,
     endDate,
+    excludeRefunds: false,
     column: ['v0', 'v1'].includes(version) ? 'netAmountInCollectiveCurrency' : 'netAmountInHostCurrency',
     hostCollectiveId: host.id,
   });
@@ -175,13 +228,16 @@ async function sumCollectivesTransactions(
     withBlockedFunds = false,
     hostCollectiveId = null,
     excludeInternals = false,
+    kind,
   } = {},
 ) {
   const groupBy = ['amountInHostCurrency', 'netAmountInHostCurrency'].includes(column) ? 'hostCurrency' : 'currency';
 
-  const where = {
-    CollectiveId: ids,
-  };
+  const where = {};
+
+  if (ids) {
+    where.CollectiveId = ids;
+  }
   if (transactionType) {
     where.type = transactionType;
   }
@@ -196,6 +252,8 @@ async function sumCollectivesTransactions(
   if (excludeRefunds) {
     // Exclude refunded transactions
     where.RefundTransactionId = { [Op.is]: null };
+    // Also exclude anything with isRefund=true (PAYMENT_PROCESSOR_COVER doesn't have RefundTransactionId set)
+    where.isRefund = { [Op.not]: true };
   }
   if (hostCollectiveId) {
     // Only transactions that are marked under a Fiscal Host
@@ -205,12 +263,17 @@ async function sumCollectivesTransactions(
     // Exclude internal transactions (we can tag some Transactions like "Switching Host" as internal)
     where.data = { internal: { [Op.not]: true } };
   }
+  if (kind) {
+    where.kind = kind;
+  }
 
   const totals = {};
 
-  // Initialize total
-  for (const CollectiveId of ids) {
-    totals[CollectiveId] = { CollectiveId, currency: 'USD', value: 0 };
+  // Initialize totals
+  if (ids) {
+    for (const CollectiveId of ids) {
+      totals[CollectiveId] = { CollectiveId, currency: 'USD', value: 0 };
+    }
   }
 
   const results = await models.Transaction.findAll({
@@ -243,6 +306,10 @@ async function sumCollectivesTransactions(
     const CollectiveId = result['CollectiveId'];
     const value = result[column];
 
+    // Initialize Collective total
+    if (!totals[CollectiveId]) {
+      totals[CollectiveId] = { CollectiveId, currency: 'USD', value: 0 };
+    }
     // If it's the first total collected, set the currency
     if (totals[CollectiveId].value === 0) {
       totals[CollectiveId].currency = result[groupBy];
@@ -281,6 +348,10 @@ async function sumCollectivesTransactions(
       const CollectiveId = blockedFundResult['CollectiveId'];
       const value = blockedFundResult['amount'];
 
+      // Initialize Collective total
+      if (!totals[CollectiveId]) {
+        totals[CollectiveId] = { CollectiveId, currency: 'USD', value: 0 };
+      }
       // If it's the first total collected, set the currency
       if (totals[CollectiveId].value === 0) {
         totals[CollectiveId].currency = blockedFundResult['currency'];

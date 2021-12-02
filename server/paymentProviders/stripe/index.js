@@ -12,7 +12,9 @@ import stripe from '../../lib/stripe';
 import { addParamsToUrl } from '../../lib/utils';
 import models from '../../models';
 
+import alipay from './alipay';
 import creditcard from './creditcard';
+import { processAuthorization, processTransaction } from './virtual-cards';
 
 const debug = debugLib('stripe');
 
@@ -49,6 +51,7 @@ export default {
   types: {
     default: creditcard,
     creditcard,
+    alipay,
   },
 
   oauth: {
@@ -196,19 +199,39 @@ export default {
     switch (order.paymentMethod.type) {
       case 'bitcoin':
         throw new errors.BadRequest('Stripe-Bitcoin not supported anymore :(');
+      case 'alipay':
+        return alipay.processOrder(order);
       case 'creditcard': /* Fallthrough */
       default:
         return creditcard.processOrder(order);
     }
   },
 
-  webhook: requestBody => {
+  webhook: request => {
+    const requestBody = request.body;
+
+    debug(`Stripe webhook event received : ${request.rawBody}`);
+
     // Stripe sends test events to production as well
     // don't do anything if the event is not livemode
     // NOTE: not using config.env because of ugly tests
     if (process.env.OC_ENV === 'production' && !requestBody.livemode) {
       return Promise.resolve();
     }
+
+    const stripeEvent = {
+      signature: request.headers['stripe-signature'],
+      rawBody: request.rawBody,
+    };
+
+    if (requestBody.type === 'issuing_authorization.request') {
+      return processAuthorization(requestBody.data.object, stripeEvent);
+    }
+
+    if (requestBody.type === 'issuing_transaction.created') {
+      return processTransaction(requestBody.data.object, stripeEvent);
+    }
+
     /**
      * We check the event on stripe directly to be sure we don't get a fake event from
      * someone else
@@ -219,6 +242,8 @@ export default {
       }
       if (event.type === 'invoice.payment_succeeded') {
         return creditcard.webhook(requestBody, event);
+      } else if (event.type === 'charge.refund.updated') {
+        return alipay.webhook(requestBody, event);
       } else if (event.type === 'source.chargeable') {
         /* This will cause stripe to send us email alerts, saying
          * that our stuff is broken. But that should never happen

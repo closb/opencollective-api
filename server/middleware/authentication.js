@@ -89,9 +89,15 @@ export const _authenticateUserByJwt = async (req, res, next) => {
   }
 
   const userId = Number(req.jwtPayload.sub);
-  const user = await User.findByPk(userId);
+  const user = await User.findByPk(userId, {
+    include: [{ association: 'collective', required: false, attributes: ['id'] }],
+  });
   if (!user) {
     logger.warn(`User id ${userId} not found`);
+    next();
+    return;
+  } else if (!user.collective) {
+    logger.error(`User id ${userId} has no collective linked`);
     next();
     return;
   }
@@ -188,7 +194,7 @@ export const authenticateService = (req, res, next) => {
   const opts = { callbackURL: getOAuthCallbackUrl(req) };
 
   if (service === 'github') {
-    if (context == 'createCollective') {
+    if (context === 'createCollective') {
       opts.scope = [
         // We need this to call github.getOrgMemberships and check if the user is an admin of a given Organization
         'read:org',
@@ -329,7 +335,6 @@ export function authorizeClientApp(req, res, next) {
       method: 'GET',
       regex: /^\/connected-accounts\/(stripe|paypal)\/callback/,
     },
-    { method: 'GET', regex: /^\/services\/email\/approve\?messageId=.+/ },
     {
       method: 'GET',
       regex: /^\/services\/email\/unsubscribe\/(.+)\/([a-zA-Z0-9-_]+)\/([a-zA-Z0-9-_\.]+)\/.+/,

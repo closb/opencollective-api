@@ -86,16 +86,6 @@ describe('server/graphql/v1/createOrder', () => {
 
   before(() => {
     nock('https://data.fixer.io')
-      .get(/20[0-9]{2}\-[0-9]{2}\-[0-9]{2}/)
-      .times(5)
-      .query({
-        access_key: config.fixer.accessKey, // eslint-disable-line camelcase
-        base: 'EUR',
-        symbols: 'USD',
-      })
-      .reply(200, { base: 'EUR', date: '2017-09-01', rates: { USD: 1.192 } });
-
-    nock('https://data.fixer.io')
       .get('/latest')
       .times(5)
       .query({
@@ -289,7 +279,7 @@ describe('server/graphql/v1/createOrder', () => {
       where: { OrderId: res.data.createOrder.id },
     });
     expect(transactionsCount).to.equal(0);
-    await utils.waitForCondition(() => emailSendMessageSpy.callCount == 2);
+    await utils.waitForCondition(() => emailSendMessageSpy.callCount === 2);
     expect(emailSendMessageSpy.callCount).to.equal(2);
 
     const pendingEmailArgs = emailSendMessageSpy.args.find(callArgs =>
@@ -305,7 +295,7 @@ describe('server/graphql/v1/createOrder', () => {
     expect(actionRequiredEmailArgs[2]).to.match(
       /for the amount of <strong>\$20\.00<\/strong> with the mention: <strong>webpack event<\/strong> <strong>backer<\/strong> order: <strong>[0-9]+<\/strong>/,
     );
-    expect(actionRequiredEmailArgs[1]).to.equal('ACTION REQUIRED: your $20 registration to meetup is pending');
+    expect(actionRequiredEmailArgs[1]).to.equal('ACTION REQUIRED: your $20.00 registration to meetup is pending');
   });
 
   it('creates an order as new user and sends a tweet', async () => {
@@ -349,7 +339,7 @@ describe('server/graphql/v1/createOrder', () => {
     expect(transaction.FromCollectiveId).to.equal(fromCollective.id);
     expect(transaction.CollectiveId).to.equal(collective.id);
     expect(transaction.currency).to.equal(collective.currency);
-    expect(transaction.hostFeeInHostCurrency).to.equal(-(0.05 * order.totalAmount));
+    expect(transaction.hostFeeInHostCurrency).to.equal(0);
     expect(transaction.platformFeeInHostCurrency).to.equal(-(0.05 * order.totalAmount));
     expect(transaction.data.charge.currency).to.equal(collective.currency.toLowerCase());
     expect(transaction.data.charge.status).to.equal('succeeded');
@@ -369,7 +359,7 @@ describe('server/graphql/v1/createOrder', () => {
     expect(transaction.data.charge.currency).to.equal('eur');
 
     await utils.waitForCondition(() => tweetStatusSpy.callCount > 0);
-    expect(tweetStatusSpy.firstCall.args[1]).to.contain('@johnsmith thank you for your €1,543 donation!');
+    expect(tweetStatusSpy.firstCall.args[1]).to.contain('@johnsmith thank you for your €1,543.00 donation!');
   });
 
   it('creates an order for an event ticket and receives the ticket confirmation by email with iCal.ics attached', async () => {
@@ -518,7 +508,7 @@ describe('server/graphql/v1/createOrder', () => {
     expect(transaction.FromCollectiveId).to.equal(xdamman.CollectiveId);
     expect(transaction.CollectiveId).to.equal(collective.id);
     expect(transaction.currency).to.equal(collective.currency);
-    expect(transaction.hostFeeInHostCurrency).to.equal(-(0.05 * order.totalAmount));
+    expect(transaction.hostFeeInHostCurrency).to.equal(0);
     expect(transaction.platformFeeInHostCurrency).to.equal(-(0.05 * order.totalAmount));
     expect(transaction.data.charge.currency).to.equal(collective.currency.toLowerCase());
     expect(transaction.data.charge.status).to.equal('succeeded');
@@ -567,7 +557,7 @@ describe('server/graphql/v1/createOrder', () => {
     expect(transaction.FromCollectiveId).to.equal(xdamman.CollectiveId);
     expect(transaction.CollectiveId).to.equal(collective.id);
     expect(transaction.currency).to.equal(collective.currency);
-    expect(transaction.hostFeeInHostCurrency).to.equal(-(0.05 * order.totalAmount));
+    expect(transaction.hostFeeInHostCurrency).to.equal(0);
     expect(transaction.platformFeeInHostCurrency).to.equal(-(0.05 * order.totalAmount));
     expect(transaction.data.charge.currency).to.equal(collective.currency.toLowerCase());
     expect(transaction.data.charge.status).to.equal('succeeded');
@@ -649,13 +639,16 @@ describe('server/graphql/v1/createOrder', () => {
       where: { OrderId: orderCreated.id },
     });
     expect(fromCollective.website).to.equal('https://newco.com'); // api should prepend https://
-    expect(transactions.length).to.equal(2);
-    expect(transactions[0].type).to.equal('DEBIT');
-    expect(transactions[0].FromCollectiveId).to.equal(collective.id);
-    expect(transactions[0].CollectiveId).to.equal(fromCollective.id);
-    expect(transactions[1].type).to.equal('CREDIT');
-    expect(transactions[1].FromCollectiveId).to.equal(fromCollective.id);
-    expect(transactions[1].CollectiveId).to.equal(collective.id);
+    expect(transactions.length).to.equal(4);
+
+    const contributions = transactions.filter(t => t.kind === 'CONTRIBUTION');
+    expect(contributions.length).to.equal(2);
+    expect(contributions[0].type).to.equal('DEBIT');
+    expect(contributions[0].FromCollectiveId).to.equal(collective.id);
+    expect(contributions[0].CollectiveId).to.equal(fromCollective.id);
+    expect(contributions[1].type).to.equal('CREDIT');
+    expect(contributions[1].FromCollectiveId).to.equal(fromCollective.id);
+    expect(contributions[1].CollectiveId).to.equal(collective.id);
   });
 
   it('creates an order as a logged in user for an existing organization', async () => {
@@ -706,13 +699,16 @@ describe('server/graphql/v1/createOrder', () => {
       where: { OrderId: orderCreated.id },
     });
     expect(orderCreated.createdByUser.id).to.equal(duc.id);
-    expect(transactions.length).to.equal(2);
-    expect(transactions[0].type).to.equal('DEBIT');
-    expect(transactions[0].FromCollectiveId).to.equal(collective.id);
-    expect(transactions[0].CollectiveId).to.equal(fromCollective.id);
-    expect(transactions[1].type).to.equal('CREDIT');
-    expect(transactions[1].FromCollectiveId).to.equal(fromCollective.id);
-    expect(transactions[1].CollectiveId).to.equal(collective.id);
+    expect(transactions.length).to.equal(4);
+
+    const contributions = transactions.filter(t => t.kind === 'CONTRIBUTION');
+    expect(contributions.length).to.equal(2);
+    expect(contributions[0].type).to.equal('DEBIT');
+    expect(contributions[0].FromCollectiveId).to.equal(collective.id);
+    expect(contributions[0].CollectiveId).to.equal(fromCollective.id);
+    expect(contributions[1].type).to.equal('CREDIT');
+    expect(contributions[1].FromCollectiveId).to.equal(fromCollective.id);
+    expect(contributions[1].CollectiveId).to.equal(collective.id);
   });
 
   it("creates an order as a logged in user for an existing collective using the collective's payment method", async () => {
@@ -752,7 +748,7 @@ describe('server/graphql/v1/createOrder', () => {
     res = await utils.graphqlQuery(createOrderMutation, { order }, duc);
     expect(res.errors).to.exist;
     expect(res.errors[0].message).to.equal(
-      'The total amount of this order (€200 ~= $239) is higher than your monthly spending limit on this payment method (stripe:creditcard) ($100)',
+      'The total amount of this order (€200.00 ~= $239.22) is higher than your monthly spending limit on this payment method (stripe:creditcard) ($100.00)',
     );
 
     sandbox.useFakeTimers(new Date('2017-09-22').getTime());
@@ -764,7 +760,7 @@ describe('server/graphql/v1/createOrder', () => {
     expect(res.errors).to.not.exist;
 
     const availableBalance = await paymentMethod.getBalanceForUser(duc);
-    expect(availableBalance.amount).to.equal(1160);
+    expect(availableBalance.amount).to.equal(1078);
 
     const orderCreated = res.data.createOrder;
     const fromCollective = orderCreated.fromCollective;
@@ -774,19 +770,22 @@ describe('server/graphql/v1/createOrder', () => {
       order: [['id', 'ASC']],
     });
     expect(orderCreated.createdByUser.id).to.equal(duc.id);
-    expect(transactions.length).to.equal(2);
-    expect(transactions[0].type).to.equal('DEBIT');
-    expect(transactions[0].FromCollectiveId).to.equal(collective.id);
-    expect(transactions[0].CollectiveId).to.equal(fromCollective.id);
-    expect(transactions[1].type).to.equal('CREDIT');
-    expect(transactions[1].FromCollectiveId).to.equal(fromCollective.id);
-    expect(transactions[1].CollectiveId).to.equal(collective.id);
+    expect(transactions.length).to.equal(4);
+
+    const contributions = transactions.filter(t => t.kind === 'CONTRIBUTION');
+    expect(contributions.length).to.equal(2);
+    expect(contributions[0].type).to.equal('DEBIT');
+    expect(contributions[0].FromCollectiveId).to.equal(collective.id);
+    expect(contributions[0].CollectiveId).to.equal(fromCollective.id);
+    expect(contributions[1].type).to.equal('CREDIT');
+    expect(contributions[1].FromCollectiveId).to.equal(fromCollective.id);
+    expect(contributions[1].CollectiveId).to.equal(collective.id);
 
     // Should fail if order.totalAmount > PaymentMethod.getBalanceForUser
     res = await utils.graphqlQuery(createOrderMutation, { order }, duc);
     expect(res.errors).to.exist;
     expect(res.errors[0].message).to.equal(
-      "You don't have enough funds available ($12 left) to execute this order (€200 ~= $239)",
+      "You don't have enough funds available ($10.78 left) to execute this order (€200.00 ~= $239.22)",
     );
   });
 
@@ -833,7 +832,7 @@ describe('server/graphql/v1/createOrder', () => {
       const res = await utils.graphqlQuery(createOrderMutation, { order }, hostAdmin);
       expect(res.errors).to.exist;
       expect(res.errors[0].message).to.equal(
-        "You don't have enough funds available ($7,461 left) to execute this order ($21,474,836)",
+        "You don't have enough funds available ($7,461.49 left) to execute this order ($21,474,836.47)",
       );
     });
 
@@ -887,7 +886,7 @@ describe('server/graphql/v1/createOrder', () => {
     let res = await utils.graphqlQuery(createOrderMutation, { order }, xdamman);
     expect(res.errors).to.exist;
     expect(res.errors[0].message).to.equal(
-      "You don't have enough funds available ($7,461 left) to execute this order ($21,474,836)",
+      "You don't have enough funds available ($7,461.49 left) to execute this order ($21,474,836.47)",
     );
 
     order.totalAmount = 20000;

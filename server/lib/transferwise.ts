@@ -8,11 +8,12 @@ import Axios, { AxiosError } from 'axios';
 import config from 'config';
 import Debug from 'debug';
 import { Request } from 'express';
-import { isNull, omitBy, startCase, toInteger, toUpper } from 'lodash';
+import { isNull, omitBy, pick, startCase, toInteger, toUpper } from 'lodash';
 
 import { TransferwiseError } from '../graphql/errors';
 import {
   AccessToken,
+  BatchGroup,
   BorderlessAccount,
   CurrencyPair,
   Profile,
@@ -100,7 +101,8 @@ export const requestDataAndThrowParsedError = (
   },
   defaultErrorMessage?: string,
 ): Promise<any> => {
-  debug(`calling ${url}: ${JSON.stringify({ data, params: options.params }, null, 2)}`);
+  const start = process.hrtime.bigint();
+  debug(`calling ${config.transferwise.apiUrl}${url}: ${JSON.stringify({ data, params: options.params }, null, 2)}`);
   const pRequest = data ? fn(url, data, options) : fn(url, options);
   return pRequest
     .then(getData)
@@ -121,10 +123,15 @@ export const requestDataAndThrowParsedError = (
       }
     })
     .catch(e => {
-      debug(e.response?.data || e);
+      debug(JSON.stringify(e.response?.data, null, 2) || e);
       const error = parseError(e, defaultErrorMessage);
       logger.error(error.toString());
       throw error;
+    })
+    .finally(() => {
+      const end = process.hrtime.bigint();
+      const executionTime = Math.round(Number(end - start) / 1000000);
+      debug(`called ${config.transferwise.apiUrl}${url} in ${executionTime}ms`);
     });
 };
 
@@ -158,15 +165,15 @@ export const createQuote = async (
     targetAmount,
     targetCurrency,
   };
-  try {
-    return requestDataAndThrowParsedError(axios.post, `/v2/quotes`, {
+  return requestDataAndThrowParsedError(
+    axios.post,
+    `/v2/quotes`,
+    {
       headers: { Authorization: `Bearer ${token}` },
       data,
-    });
-  } catch (e) {
-    logger.error(e);
-    throw new Error('There was an error while creating the quote on Wise');
-  }
+    },
+    'There was an error while creating the quote on Wise',
+  );
 };
 
 interface CreateRecipientAccount extends RecipientAccount {
@@ -177,19 +184,19 @@ export const createRecipientAccount = async (
   { profileId: profile, currency, type, accountHolderName, legalType, details }: CreateRecipientAccount,
 ): Promise<RecipientAccount> => {
   const data = { profile, currency, type, accountHolderName, legalType, details };
-  try {
-    const response = await requestDataAndThrowParsedError(axios.post, `/v1/accounts`, {
+  const response = await requestDataAndThrowParsedError(
+    axios.post,
+    `/v1/accounts`,
+    {
       data,
       headers: { Authorization: `Bearer ${token}` },
-    });
-    return {
-      ...response,
-      details: compactRecipientDetails(response.details),
-    };
-  } catch (e) {
-    logger.error(e);
-    throw new Error("There was an error while creating Wise's recipient");
-  }
+    },
+    "There was an error while creating Wise's recipient",
+  );
+  return {
+    ...response,
+    details: compactRecipientDetails(response.details),
+  };
 };
 
 export interface CreateTransfer {
@@ -207,27 +214,27 @@ export const createTransfer = async (
   { accountId: targetAccount, quoteUuid, customerTransactionId, details }: CreateTransfer,
 ): Promise<Transfer> => {
   const data = { targetAccount, quoteUuid, customerTransactionId, details };
-  try {
-    return requestDataAndThrowParsedError(axios.post, `/v1/transfers`, {
+  return requestDataAndThrowParsedError(
+    axios.post,
+    `/v1/transfers`,
+    {
       data,
       headers: { Authorization: `Bearer ${token}` },
-    });
-  } catch (e) {
-    logger.error(e);
-    throw new Error('There was an error while creating the Wise transfer');
-  }
+    },
+    'There was an error while creating the Wise transfer',
+  );
 };
 
 export const cancelTransfer = async (token: string, transferId: string | number): Promise<Transfer> => {
-  try {
-    return requestDataAndThrowParsedError(axios.put, `/v1/transfers/${transferId}/cancel`, {
+  return requestDataAndThrowParsedError(
+    axios.put,
+    `/v1/transfers/${transferId}/cancel`,
+    {
       data: {},
       headers: { Authorization: `Bearer ${token}` },
-    });
-  } catch (e) {
-    logger.error(e);
-    throw new Error('There was an error while cancelling the Wise transfer');
-  }
+    },
+    'There was an error while cancelling the Wise transfer',
+  );
 };
 
 interface FundTransfer {
@@ -238,36 +245,26 @@ export const fundTransfer = async (
   token: string,
   { profileId, transferId }: FundTransfer,
 ): Promise<{ status: 'COMPLETED' | 'REJECTED'; errorCode: string }> => {
-  try {
-    return requestDataAndThrowParsedError(
-      axios.post,
-      `/v3/profiles/${profileId}/transfers/${transferId}/payments`,
-      {
-        data: { type: 'BALANCE' },
-        headers: { Authorization: `Bearer ${token}` },
-      },
-      'Unable to fund transfer, please check your balance and try again.',
-    );
-  } catch (e) {
-    logger.error(e);
-    throw new Error('There was an error while funding the transfer for Wise');
-  }
+  return requestDataAndThrowParsedError(
+    axios.post,
+    `/v3/profiles/${profileId}/transfers/${transferId}/payments`,
+    {
+      data: { type: 'BALANCE' },
+      headers: { Authorization: `Bearer ${token}` },
+    },
+    'There was an error while funding the transfer for Wise',
+  );
 };
 
 export const getProfiles = async (token: string): Promise<Profile[]> => {
-  try {
-    return requestDataAndThrowParsedError(
-      axios.get,
-      `/v1/profiles`,
-      {
-        headers: { Authorization: `Bearer ${token}` },
-      },
-      'Unable to fetch profiles.',
-    );
-  } catch (e) {
-    logger.error(e);
-    throw new Error('There was an error fetching the profiles for Wise');
-  }
+  return requestDataAndThrowParsedError(
+    axios.get,
+    `/v1/profiles`,
+    {
+      headers: { Authorization: `Bearer ${token}` },
+    },
+    'There was an error fetching the profiles for Wise',
+  );
 };
 
 interface GetTemporaryQuote {
@@ -285,26 +282,26 @@ export const getTemporaryQuote = async (
     targetCurrency,
     ...amount,
   };
-  try {
-    return requestDataAndThrowParsedError(axios.post, `/v2/quotes`, {
+  return requestDataAndThrowParsedError(
+    axios.post,
+    `/v2/quotes`,
+    {
       headers: { Authorization: `Bearer ${token}` },
       data,
-    });
-  } catch (e) {
-    logger.error(e);
-    throw new Error('There was an error while fetching the Wise quote');
-  }
+    },
+    'There was an error while fetching the Wise quote',
+  );
 };
 
 export const getTransfer = async (token: string, transferId: number): Promise<Transfer> => {
-  try {
-    return requestDataAndThrowParsedError(axios.get, `/v1/transfers/${transferId}`, {
+  return requestDataAndThrowParsedError(
+    axios.get,
+    `/v1/transfers/${transferId}`,
+    {
       headers: { Authorization: `Bearer ${token}` },
-    });
-  } catch (e) {
-    logger.error(e);
-    throw new Error('There was an error fetching transfer for Wise');
-  }
+    },
+    'There was an error fetching transfer for Wise',
+  );
 };
 
 export const getAccountRequirements = async (
@@ -316,15 +313,15 @@ export const getAccountRequirements = async (
     target: targetCurrency,
     ...amount,
   };
-  try {
-    return requestDataAndThrowParsedError(axios.get, `/v1/account-requirements`, {
-      headers: { Authorization: `Bearer ${token}` },
+  return requestDataAndThrowParsedError(
+    axios.get,
+    `/v1/account-requirements`,
+    {
+      headers: { Authorization: `Bearer ${token}`, 'Accept-Minor-Version': 1 },
       params,
-    });
-  } catch (e) {
-    logger.error(e);
-    throw new Error('There was an error while fetching account requirements for Wise');
-  }
+    },
+    'There was an error while fetching account requirements for Wise',
+  );
 };
 
 export const validateAccountRequirements = async (
@@ -337,27 +334,27 @@ export const validateAccountRequirements = async (
     target: targetCurrency,
     ...amount,
   };
-  try {
-    return requestDataAndThrowParsedError(axios.post, `/v1/account-requirements`, {
+  return requestDataAndThrowParsedError(
+    axios.post,
+    `/v1/account-requirements`,
+    {
       data: accountDetails,
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { Authorization: `Bearer ${token}`, 'Accept-Minor-Version': 1 },
       params,
-    });
-  } catch (e) {
-    logger.error(e);
-    throw new Error('There was an error while validating account requirements for Wise');
-  }
+    },
+    'There was an error while validating account requirements for Wise',
+  );
 };
 
 export const getCurrencyPairs = async (token: string): Promise<{ sourceCurrencies: CurrencyPair[] }> => {
-  try {
-    return requestDataAndThrowParsedError(axios.get, `/v1/currency-pairs`, {
+  return requestDataAndThrowParsedError(
+    axios.get,
+    `/v1/currency-pairs`,
+    {
       headers: { Authorization: `Bearer ${token}` },
-    });
-  } catch (e) {
-    logger.error(e);
-    throw new Error('There was an error while fetching account requirements for Wise');
-  }
+    },
+    'There was an error while fetching account requirements for Wise',
+  );
 };
 
 export const getBorderlessAccount = async (token: string, profileId: string | number): Promise<BorderlessAccount> => {
@@ -376,7 +373,129 @@ export const getBorderlessAccount = async (token: string, profileId: string | nu
   }
 };
 
+export const createBatchGroup = async (
+  token: string,
+  profileId: string | number,
+  data: { name: string; sourceCurrency: string },
+): Promise<BatchGroup> => {
+  try {
+    return requestDataAndThrowParsedError(axios.post, `/v3/profiles/${profileId}/batch-groups`, {
+      headers: { Authorization: `Bearer ${token}` },
+      data,
+    });
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error while creating the batch group.');
+  }
+};
+
+export const getBatchGroup = async (
+  token: string,
+  profileId: string | number,
+  batchGroupId: string,
+): Promise<BatchGroup> => {
+  try {
+    return requestDataAndThrowParsedError(axios.get, `/v3/profiles/${profileId}/batch-groups/${batchGroupId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error while fetching the batch group.');
+  }
+};
+
+export const createBatchGroupTransfer = async (
+  token: string,
+  profileId: string | number,
+  batchGroupId: string,
+  { accountId: targetAccount, quoteUuid, customerTransactionId, details }: CreateTransfer,
+): Promise<Transfer> => {
+  const data = { targetAccount, quoteUuid, customerTransactionId, details };
+  try {
+    return requestDataAndThrowParsedError(
+      axios.post,
+      `/v3/profiles/${profileId}/batch-groups/${batchGroupId}/transfers`,
+      {
+        data,
+        headers: { Authorization: `Bearer ${token}` },
+      },
+    );
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error while creating the Wise transfer in the batch group');
+  }
+};
+
+export const completeBatchGroup = async (
+  token: string,
+  profileId: string | number,
+  batchGroupId: string,
+  version: number,
+): Promise<BatchGroup> => {
+  try {
+    return requestDataAndThrowParsedError(axios.patch, `/v3/profiles/${profileId}/batch-groups/${batchGroupId}`, {
+      data: { version, status: 'COMPLETED' },
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error while creating the Wise transfer in the batch group');
+  }
+};
+
+export const cancelBatchGroup = async (
+  token: string,
+  profileId: string | number,
+  batchGroupId: string,
+  version: number,
+): Promise<BatchGroup> => {
+  try {
+    return requestDataAndThrowParsedError(axios.patch, `/v3/profiles/${profileId}/batch-groups/${batchGroupId}`, {
+      data: { version, status: 'CANCELLED' },
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (e) {
+    logger.error(e);
+    throw new Error('There was an error while creating the Wise transfer in the batch group');
+  }
+};
+
+export type OTTResponse = {
+  status: number;
+  headers: {
+    'x-2fa-approval': string;
+  };
+};
+
+export const fundBatchGroup = async (
+  token: string,
+  profileId: string | number,
+  batchGroupId: string,
+  x2faApproval?: string,
+): Promise<BatchGroup | OTTResponse> => {
+  const headers = { Authorization: `Bearer ${token}` };
+  if (x2faApproval) {
+    headers['x-2fa-approval'] = x2faApproval;
+  }
+
+  return axios
+    .post(`/v3/profiles/${profileId}/batch-payments/${batchGroupId}/payments`, { type: 'BALANCE' }, { headers })
+    .then(getData)
+    .catch(e => {
+      const headers = pick(e.response?.headers, ['x-2fa-approval']);
+      const status = e.response?.status;
+
+      if (status === 403 && headers['x-2fa-approval']) {
+        return { headers, status };
+      } else {
+        logger.error(e);
+        throw new Error('There was an error while funding the batch group');
+      }
+    });
+};
+
 const isProduction = config.env === 'production';
+
 const publicKey = fs.readFileSync(
   path.join(
     __dirname,
@@ -476,8 +595,9 @@ export const getOrRefreshToken = async ({
     debug(`getOrRefreshUserToken: ${JSON.stringify(token, null, 2)}`);
     return token;
   } catch (e) {
-    logger.error(e);
-    throw new Error("There was an error while refreshing host's Wise token");
+    const error = parseError(e, "There was an error while refreshing host's Wise token");
+    logger.error(error.toString());
+    throw error;
   }
 };
 

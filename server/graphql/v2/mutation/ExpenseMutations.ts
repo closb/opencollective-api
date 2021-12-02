@@ -24,6 +24,7 @@ import {
   rejectExpense,
   scheduleExpenseForPayment,
   unapproveExpense,
+  unscheduleExpensePayment,
 } from '../../common/expenses';
 import { createUser } from '../../common/user';
 import { FeatureNotAllowedForUser, NotFound, RateLimitExceeded, Unauthorized, ValidationFailed } from '../../errors';
@@ -155,7 +156,7 @@ const expenseMutations = {
           const { organization: organizationData, ...payee } = expense.payee;
           const { user, organization } = await createUser(
             {
-              ...pick(payee, ['email', 'newsletterOptIn']),
+              ...pick(payee, ['email', 'legalName', 'newsletterOptIn']),
               ...models.User.splitName(payee.name),
               location: expenseData.payeeLocation,
             },
@@ -274,6 +275,8 @@ const expenseMutations = {
           return markExpenseAsUnpaid(req, expense.id, args.paymentParams?.paymentProcessorFee);
         case 'SCHEDULE_FOR_PAYMENT':
           return scheduleExpenseForPayment(req, expense);
+        case 'UNSCHEDULE_PAYMENT':
+          return unscheduleExpensePayment(req, expense);
         case 'PAY':
           return payExpense(req, {
             id: expense.id,

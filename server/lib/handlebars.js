@@ -15,10 +15,12 @@ import {
 handlebars.registerHelper('ifCond', function (v1, operator, v2, options) {
   switch (operator) {
     case '==':
+      // eslint-disable-next-line eqeqeq
       return v1 == v2 ? options.fn(this) : options.inverse(this);
     case '===':
       return v1 === v2 ? options.fn(this) : options.inverse(this);
     case '!=':
+      // eslint-disable-next-line eqeqeq
       return v1 != v2 ? options.fn(this) : options.inverse(this);
     case '!==':
       return v1 !== v2 ? options.fn(this) : options.inverse(this);
@@ -98,6 +100,10 @@ handlebars.registerHelper('moment', (value, props) => {
   return d.format(format);
 });
 
+handlebars.registerHelper('moment-timezone', value => {
+  return moment().tz(value).format('Z');
+});
+
 handlebars.registerHelper('currency', (value, props) => {
   const { currency, size, sign, precision } = props.hash;
 
@@ -119,7 +125,7 @@ handlebars.registerHelper('currency', (value, props) => {
     return value.toLocaleString(locale, {
       style: 'currency',
       currency,
-      minimumFractionDigits: precision || 0,
+      minimumFractionDigits: precision || getDefaultCurrencyPrecision(currency),
       maximumFractionDigits: !isNil(precision) ? precision : getDefaultCurrencyPrecision(currency),
     });
   })();
@@ -128,7 +134,7 @@ handlebars.registerHelper('currency', (value, props) => {
     res = `+${res}`;
   }
   // If we are limited in space, no need to show the trailing .00
-  if (size && precision == 2) {
+  if (size && precision === 2) {
     res = res.replace(/\.00$/, '');
   }
   if (size) {

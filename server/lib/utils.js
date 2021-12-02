@@ -52,7 +52,7 @@ export function getDomain(url = '') {
   if (arrLen > 2) {
     domain = `${splitArr[arrLen - 2]}.${splitArr[arrLen - 1]}`;
     // check to see if it's using a Country Code Top Level Domain (ccTLD) (i.e. ".me.uk")
-    if (splitArr[arrLen - 1].length == 2 && splitArr[arrLen - 1].length == 2) {
+    if (splitArr[arrLen - 1].length === 2 && splitArr[arrLen - 1].length === 2) {
       // this is using a ccTLD
       domain = `${splitArr[arrLen - 3]}.${domain}`;
     }
@@ -383,7 +383,7 @@ export const getDefaultCurrencyPrecision = currency => {
   }
 };
 
-export function formatCurrency(amount, currency, precision = 0) {
+export function formatCurrency(amount, currency, precision = 2) {
   amount = amount / 100; // converting cents
   let locale;
   switch (currency) {
@@ -409,7 +409,7 @@ export function formatCurrency(amount, currency, precision = 0) {
  * @PRE: { USD: 1000, EUR: 6000 }
  * @POST: "€60 and $10"
  */
-export function formatCurrencyObject(currencyObj, options = { precision: 0, conjonction: 'and' }) {
+export function formatCurrencyObject(currencyObj, options = { precision: 2, conjunction: 'and' }) {
   const array = [];
   for (const currency in currencyObj) {
     if (currencyObj[currency] > 0) {
@@ -425,7 +425,7 @@ export function formatCurrencyObject(currencyObj, options = { precision: 0, conj
   array.sort((a, b) => b.value - a.value);
   return formatArrayToString(
     array.map(r => r.str),
-    options.conjonction,
+    options.conjunction,
   );
 }
 

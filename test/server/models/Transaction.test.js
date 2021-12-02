@@ -56,7 +56,6 @@ describe('server/models/Transaction', () => {
       id: 2,
       name: 'Random Host',
       CreatedByUserId: user.id,
-      data: { reimbursePaymentProcessorFeeOnTips: true },
     });
     collective = await fakeCollective({
       id: 3,
@@ -96,8 +95,11 @@ describe('server/models/Transaction', () => {
     });
   });
 
-  it('createFromPayload creates a double entry transaction for a Stripe payment in EUR with VAT', () => {
-    const transaction = {
+  it('createFromContributionPayload creates a double entry transaction for a Stripe payment in EUR with VAT', () => {
+    const transactionPayload = {
+      CreatedByUserId: user.id,
+      FromCollectiveId: user.CollectiveId,
+      CollectiveId: collective.id,
       description: '€121 for Vegan Burgers including €21 VAT',
       amount: 12100,
       amountInHostCurrency: 12100,
@@ -113,38 +115,41 @@ describe('server/models/Transaction', () => {
       PaymentMethodId: 1,
     };
 
-    return Transaction.createFromPayload({
-      transaction,
-      CreatedByUserId: user.id,
-      FromCollectiveId: user.CollectiveId,
-      CollectiveId: collective.id,
-    }).then(() => {
+    return Transaction.createFromContributionPayload(transactionPayload).then(() => {
       return Transaction.findAll().then(transactions => {
         utils.snapshotTransactions(transactions, { columns: SNAPSHOT_COLUMNS });
 
-        expect(transactions.length).to.equal(2);
-        expect(transactions[0].kind).to.equal(TransactionKind.CONTRIBUTION);
-        expect(transactions[0].type).to.equal('DEBIT');
-        expect(transactions[0].netAmountInCollectiveCurrency).to.equal(-12100);
-        expect(transactions[0].currency).to.equal('EUR');
-        expect(transactions[0].HostCollectiveId).to.be.null;
+        expect(transactions.length).to.equal(4);
 
-        expect(transactions[1].kind).to.equal(TransactionKind.CONTRIBUTION);
-        expect(transactions[1].type).to.equal('CREDIT');
-        expect(transactions[1].amount).to.equal(12100);
-        expect(transactions[1].platformFeeInHostCurrency).to.equal(-500);
-        expect(transactions[1].paymentProcessorFeeInHostCurrency).to.equal(-300);
-        expect(transactions[1].taxAmount).to.equal(-2100);
-        expect(transactions[1].amount).to.equal(12100);
-        expect(transactions[1].netAmountInCollectiveCurrency).to.equal(8700);
-        expect(transactions[0] instanceof models.Transaction).to.be.true;
-        expect(transactions[0].description).to.equal(transaction.description);
+        const contributions = transactions.filter(t => t.kind === TransactionKind.CONTRIBUTION);
+
+        expect(contributions.length).to.equal(2);
+        expect(contributions[0].kind).to.equal(TransactionKind.CONTRIBUTION);
+        expect(contributions[0].type).to.equal('DEBIT');
+        expect(contributions[0].netAmountInCollectiveCurrency).to.equal(-12100);
+        expect(contributions[0].currency).to.equal('EUR');
+        expect(contributions[0].HostCollectiveId).to.be.null;
+
+        expect(contributions[1].kind).to.equal(TransactionKind.CONTRIBUTION);
+        expect(contributions[1].type).to.equal('CREDIT');
+        expect(contributions[1].amount).to.equal(12100);
+        expect(contributions[1].platformFeeInHostCurrency).to.equal(-500);
+        expect(contributions[1].hostFeeInHostCurrency).to.equal(0);
+        expect(contributions[1].paymentProcessorFeeInHostCurrency).to.equal(-300);
+        expect(contributions[1].taxAmount).to.equal(-2100);
+        expect(contributions[1].amount).to.equal(12100);
+        expect(contributions[1].netAmountInCollectiveCurrency).to.equal(9200);
+        expect(contributions[0] instanceof models.Transaction).to.be.true;
+        expect(contributions[0].description).to.equal(transactionPayload.description);
       });
     });
   });
 
-  it('createFromPayload creates a double entry transaction for a Stripe donation in EUR on a USD host', () => {
-    const transaction = {
+  it('createFromContributionPayload creates a double entry transaction for a Stripe donation in EUR on a USD host', () => {
+    const transactionPayload = {
+      CreatedByUserId: user.id,
+      FromCollectiveId: user.CollectiveId,
+      CollectiveId: collective.id,
       description: '€100 donation to WWCode Berlin',
       amount: 10000,
       amountInHostCurrency: 11000,
@@ -159,46 +164,46 @@ describe('server/models/Transaction', () => {
       PaymentMethodId: 1,
     };
 
-    return Transaction.createFromPayload({
-      transaction,
-      CreatedByUserId: user.id,
-      FromCollectiveId: user.CollectiveId,
-      CollectiveId: collective.id,
-    }).then(() => {
+    return Transaction.createFromContributionPayload(transactionPayload).then(() => {
       return Transaction.findAll().then(transactions => {
-        expect(transactions.length).to.equal(2);
-        expect(transactions[0] instanceof models.Transaction).to.be.true;
-        expect(transactions[0].type).to.equal('DEBIT');
-        expect(transactions[0].netAmountInCollectiveCurrency).to.equal(-10000);
-        expect(transactions[0].currency).to.equal('EUR');
-        expect(transactions[0].HostCollectiveId).to.be.null;
-        expect(transactions[0].kind).to.equal(TransactionKind.CONTRIBUTION);
-        expect(transactions[0].description).to.equal(transaction.description);
+        expect(transactions.length).to.equal(4);
 
-        expect(transactions[1].type).to.equal('CREDIT');
-        expect(transactions[1].kind).to.equal(TransactionKind.CONTRIBUTION);
-        expect(transactions[1].amount).to.equal(10000);
-        expect(transactions[1].platformFeeInHostCurrency).to.equal(-550);
-        expect(transactions[1].paymentProcessorFeeInHostCurrency).to.equal(-330);
-        expect(transactions[1].taxAmount).to.be.null;
-        expect(transactions[1].amount).to.equal(10000);
-        expect(transactions[1].netAmountInCollectiveCurrency).to.equal(8700);
+        const contributions = transactions.filter(t => t.kind === TransactionKind.CONTRIBUTION);
+
+        expect(contributions.length).to.equal(2);
+        expect(contributions[0] instanceof models.Transaction).to.be.true;
+        expect(contributions[0].type).to.equal('DEBIT');
+        expect(contributions[0].netAmountInCollectiveCurrency).to.equal(-10000);
+        expect(contributions[0].currency).to.equal('EUR');
+        expect(contributions[0].HostCollectiveId).to.be.null;
+        expect(contributions[0].kind).to.equal(TransactionKind.CONTRIBUTION);
+        expect(contributions[0].description).to.equal(transactionPayload.description);
+
+        expect(contributions[1].type).to.equal('CREDIT');
+        expect(contributions[1].kind).to.equal(TransactionKind.CONTRIBUTION);
+        expect(contributions[1].amount).to.equal(10000);
+        expect(contributions[1].platformFeeInHostCurrency).to.equal(-550);
+        expect(contributions[1].hostFeeInHostCurrency).to.equal(0);
+        expect(contributions[1].paymentProcessorFeeInHostCurrency).to.equal(-330);
+        expect(contributions[1].taxAmount).to.be.null;
+        expect(contributions[1].amount).to.equal(10000);
+        expect(contributions[1].netAmountInCollectiveCurrency).to.equal(9200);
       });
     });
   });
 
-  it('createFromPayload() generates a new activity', done => {
+  it('createFromContributionPayload() generates a new activity', done => {
     const createActivityStub = sinon.stub(Transaction, 'createActivity').callsFake(t => {
-      expect(Math.abs(t.amount)).to.equal(Math.abs(transactionsData[7].netAmountInCollectiveCurrency));
+      expect(Math.abs(t.amount)).to.equal(Math.abs(transactionsData[7].amount));
       createActivityStub.restore();
       done();
     });
 
-    Transaction.createFromPayload({
-      transaction: transactionsData[7],
+    Transaction.createFromContributionPayload({
       CreatedByUserId: user.id,
       FromCollectiveId: user.CollectiveId,
       CollectiveId: collective.id,
+      ...transactionsData[7],
     })
       .then(transaction => {
         expect(transaction.CollectiveId).to.equal(collective.id);
@@ -208,7 +213,10 @@ describe('server/models/Transaction', () => {
 
   describe('fees on top', () => {
     it('should deduct the platform fee from the main transactions', async () => {
-      const transaction = {
+      const transactionPayload = {
+        CreatedByUserId: user.id,
+        FromCollectiveId: user.CollectiveId,
+        CollectiveId: collective.id,
         description: '$100 donation to Merveilles',
         amount: 11000,
         amountInHostCurrency: 11000,
@@ -226,12 +234,7 @@ describe('server/models/Transaction', () => {
         },
       };
 
-      const t = await Transaction.createFromPayload({
-        transaction,
-        CreatedByUserId: user.id,
-        FromCollectiveId: user.CollectiveId,
-        CollectiveId: collective.id,
-      });
+      const t = await Transaction.createFromContributionPayload(transactionPayload);
 
       expect(t).to.have.property('platformFeeInHostCurrency').equal(0);
       expect(t).to.have.property('kind').equal(TransactionKind.CONTRIBUTION);
@@ -240,10 +243,8 @@ describe('server/models/Transaction', () => {
         .equal(
           // The total amount of donation minus the fees on top
           10000 -
-            // Minus the host fee
-            500 -
-            // Minus the partial platform fee: (10000 out of 11000)
-            Math.round((300 * 10000) / 11000),
+            // Minus the payment processor fee
+            300,
         );
     });
 
@@ -253,7 +254,11 @@ describe('server/models/Transaction', () => {
         FromCollectiveId: user.CollectiveId,
         CollectiveId: collective.id,
       });
-      const transaction = {
+
+      const transactionPayload = {
+        CreatedByUserId: user.id,
+        FromCollectiveId: user.CollectiveId,
+        CollectiveId: collective.id,
         description: '$100 donation to Merveilles',
         amount: 11000,
         totalAmount: 11000,
@@ -273,12 +278,7 @@ describe('server/models/Transaction', () => {
         },
       };
 
-      const createdTransaction = await Transaction.createFromPayload({
-        transaction,
-        CreatedByUserId: user.id,
-        FromCollectiveId: user.CollectiveId,
-        CollectiveId: collective.id,
-      });
+      const createdTransaction = await Transaction.createFromContributionPayload(transactionPayload);
 
       // Should have 6 transactions:
       // - 2 for contributions
@@ -288,7 +288,7 @@ describe('server/models/Transaction', () => {
       const include = [{ association: 'host' }];
       const allTransactions = await Transaction.findAll({ where: { OrderId: order.id }, order: sqlOrder, include });
       await models.TransactionSettlement.attachStatusesToTransactions(allTransactions);
-      expect(allTransactions).to.have.length(6);
+      expect(allTransactions).to.have.length(8);
       await utils.preloadAssociationsForTransactions(allTransactions, SNAPSHOT_COLUMNS_WITH_DEBT);
       utils.snapshotTransactions(allTransactions, { columns: SNAPSHOT_COLUMNS_WITH_DEBT });
 
@@ -300,13 +300,10 @@ describe('server/models/Transaction', () => {
       expect(tipCredit).to.have.property('TransactionGroup').equal(createdTransaction.TransactionGroup);
 
       const tipDebit = allTransactions.find(t => t.FromCollectiveId === inc.id && !t.isDebt);
-      const partialPaymentProcessorFee = Math.round(200 * (1000 / 11000));
       expect(tipDebit).to.have.property('type').equal('DEBIT');
       expect(tipDebit).to.have.property('kind').equal(TransactionKind.PLATFORM_TIP);
       expect(tipDebit).to.have.property('TransactionGroup').equal(createdTransaction.TransactionGroup);
-      expect(tipDebit)
-        .to.have.property('amount')
-        .equal(-1000 + partialPaymentProcessorFee);
+      expect(tipDebit).to.have.property('amount').equal(-1000);
 
       // Check tip DEBT transactions
       const tipDebtCredit = allTransactions.find(t => t.CollectiveId === inc.id && t.isDebt);
@@ -315,7 +312,7 @@ describe('server/models/Transaction', () => {
       expect(tipDebtDebit).to.exist;
 
       // Check settlement
-      const settlement = await models.TransactionSettlement.getByTransaction(tipCredit);
+      const settlement = await models.TransactionSettlement.getByTransaction(tipDebtCredit);
       expect(settlement).to.exist;
       expect(settlement.status).to.eq('OWED');
     });
@@ -327,7 +324,11 @@ describe('server/models/Transaction', () => {
         CollectiveId: collective.id,
         currency: 'EUR',
       });
-      const transaction = {
+
+      const transactionPayload = {
+        CreatedByUserId: user.id,
+        FromCollectiveId: user.CollectiveId,
+        CollectiveId: collective.id,
         description: '$100 donation to Merveilles',
         amount: 11000,
         totalAmount: 11000,
@@ -347,32 +348,30 @@ describe('server/models/Transaction', () => {
         },
       };
 
-      await Transaction.createFromPayload({
-        transaction,
-        CreatedByUserId: user.id,
-        FromCollectiveId: user.CollectiveId,
-        CollectiveId: collective.id,
-      });
+      await Transaction.createFromContributionPayload(transactionPayload);
 
       const allTransactions = await Transaction.findAll({ where: { OrderId: order.id } });
-      expect(allTransactions).to.have.length(6);
+      expect(allTransactions).to.have.length(8);
 
       const donationCredit = allTransactions.find(t => t.CollectiveId === inc.id);
       expect(donationCredit).to.have.property('type').equal('CREDIT');
-      expect(donationCredit).to.have.property('currency').equal('USD');
+      expect(donationCredit).to.have.property('currency').equal('EUR');
+      expect(donationCredit).to.have.property('hostCurrency').equal('USD');
       expect(donationCredit).to.have.nested.property('data.hostToPlatformFxRate');
+      expect(donationCredit).to.have.property('amount').equal(Math.round(1000));
       expect(donationCredit)
-        .to.have.property('amount')
+        .to.have.property('amountInHostCurrency')
         .equal(Math.round(1000 * donationCredit.data.hostToPlatformFxRate));
 
       const donationDebit = allTransactions.find(t => t.FromCollectiveId === inc.id);
-      const partialPaymentProcessorFee = Math.round(200 * (1000 / 11000));
       expect(donationDebit).to.have.nested.property('data.hostToPlatformFxRate');
       expect(donationDebit).to.have.property('type').equal('DEBIT');
-      expect(donationDebit).to.have.property('currency').equal('USD');
+      expect(donationDebit).to.have.property('currency').equal('EUR');
+      expect(donationDebit).to.have.property('hostCurrency').equal('USD');
+      expect(donationDebit).to.have.property('amount').equal(-1000);
       expect(donationDebit)
-        .to.have.property('amount')
-        .equal(Math.round((-1000 + partialPaymentProcessorFee) * donationDebit.data.hostToPlatformFxRate));
+        .to.have.property('amountInHostCurrency')
+        .equal(Math.round(-1000 * donationDebit.data.hostToPlatformFxRate));
     });
 
     it('should not create transactions if platformFee is 0', async () => {
@@ -382,7 +381,11 @@ describe('server/models/Transaction', () => {
         CollectiveId: collective.id,
         currency: 'EUR',
       });
-      const transaction = {
+
+      const transactionPayload = {
+        CreatedByUserId: user.id,
+        FromCollectiveId: user.CollectiveId,
+        CollectiveId: collective.id,
         description: '$100 donation to Merveilles',
         amount: 10000,
         totalAmount: 10000,
@@ -402,15 +405,10 @@ describe('server/models/Transaction', () => {
         },
       };
 
-      await Transaction.createFromPayload({
-        transaction,
-        CreatedByUserId: user.id,
-        FromCollectiveId: user.CollectiveId,
-        CollectiveId: collective.id,
-      });
+      await Transaction.createFromContributionPayload(transactionPayload);
 
       const allTransactions = await Transaction.findAll({ where: { OrderId: order.id } });
-      expect(allTransactions).to.have.length(2);
+      expect(allTransactions).to.have.length(4);
     });
   });
 
@@ -422,7 +420,10 @@ describe('server/models/Transaction', () => {
       currency: 'USD',
     });
 
-    const transaction = {
+    const transactionPayload = {
+      CreatedByUserId: user.id,
+      FromCollectiveId: user.CollectiveId,
+      CollectiveId: collective.id,
       description: 'Financial contribution to Booky Foundation',
       amount: 500,
       currency: 'USD',
@@ -444,12 +445,7 @@ describe('server/models/Transaction', () => {
       },
     };
 
-    const credit = await Transaction.createFromPayload({
-      transaction,
-      CreatedByUserId: user.id,
-      FromCollectiveId: user.CollectiveId,
-      CollectiveId: collective.id,
-    });
+    const credit = await Transaction.createFromContributionPayload(transactionPayload);
 
     await Transaction.validate(credit);
 

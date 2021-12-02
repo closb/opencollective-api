@@ -2,21 +2,29 @@ import {
   GraphQLBoolean,
   GraphQLInt,
   GraphQLInterfaceType,
+  GraphQLList,
   GraphQLNonNull,
   GraphQLObjectType,
   GraphQLString,
 } from 'graphql';
 import { GraphQLDateTime } from 'graphql-iso-date';
+import { pick } from 'lodash';
 
 import orderStatus from '../../../constants/order_status';
+import roles from '../../../constants/roles';
+import { TransactionKind as TransactionKinds } from '../../../constants/transaction-kind';
+import { generateDescription } from '../../../lib/transactions';
 import models from '../../../models';
+import { allowContextPermission, PERMISSION_TYPE } from '../../common/context-permissions';
 import * as TransactionLib from '../../common/transactions';
+import { TransactionKind } from '../enum/TransactionKind';
 import { TransactionType } from '../enum/TransactionType';
-import { getIdEncodeResolver, idEncode, IDENTIFIER_TYPES } from '../identifiers';
+import { getIdEncodeResolver, IDENTIFIER_TYPES } from '../identifiers';
 import { Amount } from '../object/Amount';
 import { Expense } from '../object/Expense';
 import { Order } from '../object/Order';
 import { PaymentMethod } from '../object/PaymentMethod';
+import { TaxInfo } from '../object/TaxInfo';
 
 import { Account } from './Account';
 
@@ -46,99 +54,168 @@ const TransactionPermissions = new GraphQLObjectType({
   }),
 });
 
+const transactionFieldsDefinition = () => ({
+  id: {
+    type: new GraphQLNonNull(GraphQLString),
+  },
+  legacyId: {
+    type: new GraphQLNonNull(GraphQLInt),
+  },
+  uuid: {
+    type: new GraphQLNonNull(GraphQLString),
+    deprecationReason: '2021-08-15: Use id instead.',
+  },
+  group: {
+    type: new GraphQLNonNull(GraphQLString),
+  },
+  type: {
+    type: new GraphQLNonNull(TransactionType),
+  },
+  kind: {
+    type: TransactionKind,
+  },
+  description: {
+    type: GraphQLString,
+    args: {
+      dynamic: {
+        type: GraphQLBoolean,
+        defaultValue: false,
+        description: 'Wether to generate the description dynamically.',
+      },
+      full: {
+        type: GraphQLBoolean,
+        defaultValue: false,
+        description: 'Wether to generate the full description when using dynamic.',
+      },
+    },
+  },
+  amount: {
+    type: new GraphQLNonNull(Amount),
+  },
+  amountInHostCurrency: {
+    type: new GraphQLNonNull(Amount),
+  },
+  netAmount: {
+    type: new GraphQLNonNull(Amount),
+    args: {
+      fetchHostFee: {
+        type: GraphQLBoolean,
+        defaultValue: false,
+        description: 'Fetch HOST_FEE transaction and integrate in calculation for retro-compatiblity.',
+      },
+    },
+  },
+  netAmountInHostCurrency: {
+    type: new GraphQLNonNull(Amount),
+    args: {
+      fetchHostFee: {
+        type: GraphQLBoolean,
+        defaultValue: false,
+        description: 'Fetch HOST_FEE transaction and integrate in calculation for retro-compatiblity.',
+      },
+    },
+  },
+  taxAmount: {
+    type: new GraphQLNonNull(Amount),
+  },
+  taxInfo: {
+    type: TaxInfo,
+    description: 'If taxAmount is set, this field will contain more info about the tax',
+  },
+  platformFee: {
+    type: new GraphQLNonNull(Amount),
+  },
+  hostFee: {
+    type: Amount,
+    args: {
+      fetchHostFee: {
+        type: GraphQLBoolean,
+        defaultValue: false,
+        description: 'Fetch HOST_FEE transaction for retro-compatiblity.',
+      },
+    },
+  },
+  paymentProcessorFee: {
+    type: Amount,
+  },
+  host: {
+    type: Account,
+  },
+  account: {
+    type: Account,
+  },
+  oppositeAccount: {
+    type: Account,
+  },
+  fromAccount: {
+    type: Account,
+    description: 'The sender of a transaction (on CREDIT = oppositeAccount, DEBIT = account)',
+  },
+  toAccount: {
+    type: Account,
+    description: 'The recipient of a transaction (on CREDIT = account, DEBIT = oppositeAccount)',
+  },
+  giftCardEmitterAccount: {
+    type: Account,
+  },
+  createdAt: {
+    type: GraphQLDateTime,
+  },
+  updatedAt: {
+    type: GraphQLDateTime,
+  },
+  expense: {
+    type: Expense,
+  },
+  order: {
+    type: Order,
+  },
+  isRefunded: {
+    type: GraphQLBoolean,
+  },
+  isRefund: {
+    type: GraphQLBoolean,
+  },
+  paymentMethod: {
+    type: PaymentMethod,
+  },
+  permissions: {
+    type: TransactionPermissions,
+  },
+  isOrderRejected: {
+    type: new GraphQLNonNull(GraphQLBoolean),
+  },
+  refundTransaction: {
+    type: Transaction,
+  },
+  relatedTransactions: {
+    type: new GraphQLNonNull(new GraphQLList(Transaction)),
+    args: {
+      kind: {
+        type: new GraphQLList(TransactionKind),
+        description: 'Filter by kind',
+      },
+    },
+  },
+  merchantId: {
+    type: GraphQLString,
+    description: 'Merchant id related to the Transaction (Stripe, PayPal, Wise, Privacy)',
+  },
+});
+
 export const Transaction = new GraphQLInterfaceType({
   name: 'Transaction',
   description: 'Transaction interface shared by all kind of transactions (Debit, Credit)',
-  fields: () => {
-    return {
-      id: {
-        type: new GraphQLNonNull(GraphQLString),
-      },
-      legacyId: {
-        type: new GraphQLNonNull(GraphQLInt),
-      },
-      uuid: {
-        type: GraphQLString,
-      },
-      type: {
-        type: TransactionType,
-      },
-      description: {
-        type: GraphQLString,
-      },
-      amount: {
-        type: new GraphQLNonNull(Amount),
-      },
-      amountInHostCurrency: {
-        type: new GraphQLNonNull(Amount),
-      },
-      netAmount: {
-        type: new GraphQLNonNull(Amount),
-      },
-      taxAmount: {
-        type: new GraphQLNonNull(Amount),
-      },
-      platformFee: {
-        type: new GraphQLNonNull(Amount),
-      },
-      hostFee: {
-        type: Amount,
-      },
-      paymentProcessorFee: {
-        type: Amount,
-      },
-      host: {
-        type: Account,
-      },
-      fromAccount: {
-        type: Account,
-      },
-      toAccount: {
-        type: Account,
-      },
-      giftCardEmitterAccount: {
-        type: Account,
-      },
-      createdAt: {
-        type: GraphQLDateTime,
-      },
-      updatedAt: {
-        type: GraphQLDateTime,
-      },
-      expense: {
-        type: Expense,
-      },
-      order: {
-        type: Order,
-      },
-      isRefunded: {
-        type: GraphQLBoolean,
-      },
-      isRefund: {
-        type: GraphQLBoolean,
-      },
-      paymentMethod: {
-        type: PaymentMethod,
-      },
-      permissions: {
-        type: TransactionPermissions,
-      },
-      isOrderRejected: {
-        type: new GraphQLNonNull(GraphQLBoolean),
-      },
-      refundTransaction: {
-        type: Transaction,
-      },
-    };
-  },
+  fields: transactionFieldsDefinition,
 });
 
 export const TransactionFields = () => {
   return {
+    ...transactionFieldsDefinition(),
     id: {
       type: new GraphQLNonNull(GraphQLString),
       resolve(transaction) {
-        return idEncode(transaction.id, 'transaction');
+        return transaction.uuid;
       },
     },
     legacyId: {
@@ -147,19 +224,28 @@ export const TransactionFields = () => {
         return transaction.id;
       },
     },
-    uuid: {
-      type: GraphQLString,
-    },
-    type: {
-      type: TransactionType,
+    group: {
+      type: new GraphQLNonNull(GraphQLString),
       resolve(transaction) {
-        return transaction.type;
+        return transaction.TransactionGroup;
       },
     },
     description: {
       type: GraphQLString,
-      resolve(transaction) {
-        return transaction.description;
+      args: {
+        dynamic: {
+          type: GraphQLBoolean,
+          defaultValue: false,
+          description: 'Wether to generate the description dynamically.',
+        },
+        full: {
+          type: GraphQLBoolean,
+          defaultValue: false,
+          description: 'Wether to generate the full description when using dynamic.',
+        },
+      },
+      resolve(transaction, args, req) {
+        return args.dynamic ? generateDescription(transaction, { req, full: args.full }) : transaction.description;
       },
     },
     amount: {
@@ -176,10 +262,49 @@ export const TransactionFields = () => {
     },
     netAmount: {
       type: new GraphQLNonNull(Amount),
-      resolve(transaction) {
+      args: {
+        fetchHostFee: {
+          type: GraphQLBoolean,
+          defaultValue: false,
+          description: 'Fetch HOST_FEE transaction and integrate in calculation for retro-compatiblity.',
+        },
+      },
+      async resolve(transaction, args, req) {
+        let value = transaction.netAmountInCollectiveCurrency;
+        if (args.fetchHostFee && !transaction.hostFeeInHostCurrency) {
+          const hostFeeInHostCurrency = await req.loaders.Transaction.hostFeeAmountForTransaction.load(transaction);
+          value = models.Transaction.calculateNetAmountInCollectiveCurrency({
+            ...transaction.dataValues,
+            hostFeeInHostCurrency,
+          });
+        }
         return {
-          value: transaction.netAmountInCollectiveCurrency,
+          value,
           currency: transaction.currency,
+        };
+      },
+    },
+    netAmountInHostCurrency: {
+      type: new GraphQLNonNull(Amount),
+      args: {
+        fetchHostFee: {
+          type: GraphQLBoolean,
+          defaultValue: false,
+          description: 'Fetch HOST_FEE transaction and integrate in calculation for retro-compatiblity.',
+        },
+      },
+      async resolve(transaction, args, req) {
+        let value = transaction.netAmountInHostCurrency;
+        if (args.fetchHostFee && !transaction.hostFeeInHostCurrency) {
+          const hostFeeInHostCurrency = await req.loaders.Transaction.hostFeeAmountForTransaction.load(transaction);
+          value = models.Transaction.calculateNetAmountInHostCurrency({
+            ...transaction.dataValues,
+            hostFeeInHostCurrency,
+          });
+        }
+        return {
+          value,
+          currency: transaction.hostCurrency,
         };
       },
     },
@@ -187,9 +312,20 @@ export const TransactionFields = () => {
       type: new GraphQLNonNull(Amount),
       resolve(transaction) {
         return {
-          value: Math.abs(transaction.taxAmount),
+          value: transaction.taxAmount,
           currency: transaction.currency,
         };
+      },
+    },
+    taxInfo: {
+      type: TaxInfo,
+      description: 'If taxAmount is set, this field will contain more info about the tax',
+      resolve(transaction) {
+        if (!transaction.data?.tax) {
+          return null;
+        } else {
+          return pick(transaction.data.tax, ['id', 'percentage']);
+        }
       },
     },
     platformFee: {
@@ -203,15 +339,27 @@ export const TransactionFields = () => {
     },
     hostFee: {
       type: new GraphQLNonNull(Amount),
-      resolve(transaction) {
+      args: {
+        fetchHostFee: {
+          type: GraphQLBoolean,
+          defaultValue: false,
+          description: 'Fetch HOST_FEE transaction for retro-compatiblity.',
+        },
+      },
+      async resolve(transaction, args, req) {
+        let hostFeeInHostCurrency = transaction.hostFeeInHostCurrency;
+        if (args.fetchHostFee && !hostFeeInHostCurrency) {
+          hostFeeInHostCurrency = await req.loaders.Transaction.hostFeeAmountForTransaction.load(transaction);
+        }
         return {
-          value: transaction.hostFeeInHostCurrency || 0,
+          value: hostFeeInHostCurrency || 0,
           currency: transaction.hostCurrency,
         };
       },
     },
     paymentProcessorFee: {
       type: new GraphQLNonNull(Amount),
+      description: 'Payment Processor Fee (usually in host currency)',
       resolve(transaction) {
         return {
           value: transaction.paymentProcessorFeeInHostCurrency || 0,
@@ -221,14 +369,34 @@ export const TransactionFields = () => {
     },
     host: {
       type: Account,
-      resolve(transaction) {
-        return transaction.getHostCollective();
+      resolve(transaction, _, req) {
+        if (transaction.HostCollectiveId) {
+          return req.loaders.Collective.byId.load(transaction.HostCollectiveId);
+        } else {
+          return null;
+        }
       },
     },
-    createdAt: {
-      type: GraphQLDateTime,
-      resolve(transaction) {
-        return transaction.createdAt;
+    account: {
+      type: Account,
+      description: 'The account on the main side of the transaction (CREDIT -> recipient, DEBIT -> sender)',
+      resolve(transaction, _, req) {
+        if (req.remoteUser?.isAdmin(transaction.HostCollectiveId)) {
+          allowContextPermission(req, PERMISSION_TYPE.SEE_ACCOUNT_LEGAL_NAME, transaction.CollectiveId);
+        }
+
+        return req.loaders.Collective.byId.load(transaction.CollectiveId);
+      },
+    },
+    oppositeAccount: {
+      type: Account,
+      description: 'The account on the opposite side of the transaction (CREDIT -> sender, DEBIT -> recipient)',
+      resolve(transaction, _, req) {
+        if (req.remoteUser?.isAdmin(transaction.HostCollectiveId)) {
+          allowContextPermission(req, PERMISSION_TYPE.SEE_ACCOUNT_LEGAL_NAME, transaction.FromCollectiveId);
+        }
+
+        return req.loaders.Collective.byId.load(transaction.FromCollectiveId);
       },
     },
     updatedAt: {
@@ -261,16 +429,17 @@ export const TransactionFields = () => {
     isRefunded: {
       type: GraphQLBoolean,
       resolve(transaction) {
-        return transaction.RefundTransactionId !== null;
+        return transaction.isRefund !== true && transaction.RefundTransactionId !== null;
       },
-    },
-    isRefund: {
-      type: GraphQLBoolean,
     },
     paymentMethod: {
       type: PaymentMethod,
-      resolve(transaction) {
-        return models.PaymentMethod.findByPk(transaction.PaymentMethodId);
+      resolve(transaction, _, req) {
+        if (transaction.PaymentMethodId) {
+          return req.loaders.PaymentMethod.byId.load(transaction.PaymentMethodId);
+        } else {
+          return null;
+        }
       },
     },
     permissions: {
@@ -302,8 +471,56 @@ export const TransactionFields = () => {
     },
     refundTransaction: {
       type: Transaction,
-      resolve(transaction) {
-        return transaction.getRefundTransaction();
+      resolve(transaction, _, req) {
+        if (transaction.RefundTransactionId) {
+          return req.loaders.Transaction.byId.load(transaction.RefundTransactionId);
+        } else {
+          return null;
+        }
+      },
+    },
+    relatedTransactions: {
+      type: new GraphQLNonNull(new GraphQLList(Transaction)),
+      args: {
+        kind: {
+          type: new GraphQLList(TransactionKind),
+          description: 'Filter by kind',
+        },
+      },
+      async resolve(transaction, args, req) {
+        const relatedTransactions = await req.loaders.Transaction.relatedTransactions.load(transaction);
+        if (args.kind) {
+          return relatedTransactions.filter(t => args.kind.includes(t.kind));
+        } else {
+          return relatedTransactions;
+        }
+      },
+    },
+    merchantId: {
+      type: GraphQLString,
+      description: 'Merchant id related to the Transaction (Stripe, PayPal, Wise, Privacy)',
+      resolve(transaction, _, req) {
+        if (!req.remoteUser || !req.remoteUser.hasRole([roles.ACCOUNTANT, roles.ADMIN], transaction.HostCollectiveId)) {
+          return;
+        }
+
+        if (transaction.kind === TransactionKinds.CONTRIBUTION) {
+          const stripeId = transaction.data?.charge?.id;
+          const onetimePaypalPaymentId = transaction.data?.capture?.id;
+          const recurringPaypalPaymentId = transaction.data?.paypalSale?.id;
+
+          return stripeId || onetimePaypalPaymentId || recurringPaypalPaymentId;
+        }
+
+        if (transaction.kind === TransactionKinds.EXPENSE) {
+          const wiseId = transaction.data?.transfer?.id;
+          // TODO: PayPal Adaptive is missing
+          // https://github.com/opencollective/opencollective/issues/4891
+          const paypalPayoutId = transaction.data?.payout_item_id;
+          const privacyId = transaction.data?.token;
+
+          return wiseId || paypalPayoutId || privacyId;
+        }
       },
     },
   };

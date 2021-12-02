@@ -117,6 +117,11 @@ const Expense = new GraphQLObjectType({
         type: new GraphQLNonNull(Account),
         description: 'The account being paid by this expense',
         async resolve(expense, _, req) {
+          // Allow users to see account's legal names if they can see expense invoice details
+          if (await ExpensePermissionsLib.canSeeExpenseInvoiceInfo(req, expense)) {
+            allowContextPermission(req, PERMISSION_TYPE.SEE_ACCOUNT_LEGAL_NAME, expense.FromCollectiveId);
+          }
+
           return req.loaders.Collective.byId.load(expense.FromCollectiveId);
         },
       },
@@ -137,6 +142,20 @@ const Expense = new GraphQLObjectType({
             const collective = await req.loaders.Collective.byId.load(user.CollectiveId);
             if (collective && !collective.isIncognito) {
               return collective;
+            }
+          }
+        },
+      },
+      host: {
+        type: Account,
+        description: 'The account from where the expense was paid',
+        async resolve(expense, _, req) {
+          if (expense.HostCollectiveId) {
+            return req.loaders.Collective.byId.load(expense.HostCollectiveId);
+          } else {
+            const collective = await req.loaders.Collective.byId.load(expense.CollectiveId);
+            if (collective.HostCollectiveId) {
+              return req.loaders.Collective.byId.load(collective.HostCollectiveId);
             }
           }
         },
@@ -247,7 +266,7 @@ const Expense = new GraphQLObjectType({
         type: GraphQLJSON,
         description: 'Drafted field values that were still not persisted',
         async resolve(expense) {
-          if (expense.status == expenseStatus.DRAFT) {
+          if (expense.status === expenseStatus.DRAFT) {
             return pick(expense.data, EXPENSE_DRAFT_PUBLIC_FIELDS);
           }
         },

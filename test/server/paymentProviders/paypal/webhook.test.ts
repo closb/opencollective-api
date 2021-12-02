@@ -69,7 +69,7 @@ describe('server/paymentProviders/paypal/webhook', () => {
       const order = await createOrderWithSubscription({ CollectiveId: collective.id });
       await expect(
         callPaymentSaleCompleted({ resource: { billing_agreement_id: order.paymentMethod.token } }),
-      ).to.be.rejectedWith(`Host ${host.slug} is not connected to PayPal`);
+      ).to.be.rejectedWith(`Host ${host.slug} is not connected to paypal`);
     });
 
     it('fails if webhook event is invalid', async () => {
@@ -102,7 +102,9 @@ describe('server/paymentProviders/paypal/webhook', () => {
         },
       });
 
-      const transaction = await models.Transaction.findOne({ where: { OrderId: order.id, type: 'CREDIT' } });
+      const transaction = await models.Transaction.findOne({
+        where: { OrderId: order.id, type: 'CREDIT', kind: 'CONTRIBUTION' },
+      });
       await transaction.validate();
       expect(transaction.amount).to.eq(1200);
       expect(transaction.paymentProcessorFeeInHostCurrency).to.eq(-120);
@@ -136,7 +138,7 @@ describe('server/paymentProviders/paypal/webhook', () => {
       const collective = await fakeCollective({ HostCollectiveId: host.id });
       const order = await createOrderWithSubscription({ CollectiveId: collective.id });
       await expect(callSubscriptionCancelled({ resource: { id: order.paymentMethod.token } })).to.be.rejectedWith(
-        `Host ${host.slug} is not connected to PayPal`,
+        `Host ${host.slug} is not connected to paypal`,
       );
     });
 

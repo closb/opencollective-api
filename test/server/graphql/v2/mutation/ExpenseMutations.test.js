@@ -613,6 +613,7 @@ describe('server/graphql/v2/mutation/ExpenseMutations', () => {
       hostPaypalPm = await fakePaymentMethod({
         name: randEmail(),
         service: 'paypal',
+        type: 'adaptive',
         CollectiveId: host.id,
         token: 'abcdefg',
         confirmedAt: new Date(),
@@ -837,7 +838,7 @@ describe('server/graphql/v2/mutation/ExpenseMutations', () => {
         const result = await graphqlQueryV2(processExpenseMutation, mutationParams, hostAdmin);
         expect(result.errors).to.exist;
         expect(result.errors[0].message).to.eq(
-          "You don't have enough funds to pay this expense. Current balance: $0, Expense amount: $10",
+          'Collective does not have enough funds to pay this expense. Current balance: $0.00, Expense amount: $10.00',
         );
       });
 
@@ -855,7 +856,7 @@ describe('server/graphql/v2/mutation/ExpenseMutations', () => {
         const result = await graphqlQueryV2(processExpenseMutation, mutationParams, hostAdmin);
         expect(result.errors).to.exist;
         expect(result.errors[0].message).to.eq(
-          "You don't have enough funds to cover for the fees of this payment method. Current balance: $10, Expense amount: $10, Estimated PAYPAL fees: $1",
+          'Collective does not have enough funds to cover for the fees of this payment method. Current balance: $10.00, Expense amount: $10.00, Estimated PAYPAL fees: $0.69',
         );
       });
 

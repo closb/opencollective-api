@@ -1,4 +1,4 @@
-import { GraphQLInt, GraphQLInterfaceType } from 'graphql';
+import { GraphQLInt, GraphQLInterfaceType, GraphQLNonNull } from 'graphql';
 
 /** All the fields Collection interface implementers have to implemented. */
 const CollectionFields = {
@@ -36,12 +36,12 @@ const Collection = new GraphQLInterfaceType({
  */
 const CollectionArgs = {
   limit: {
-    type: GraphQLInt,
+    type: new GraphQLNonNull(GraphQLInt),
     description: 'The number of results to fetch (default 10, max 1000)',
     defaultValue: 10,
   },
   offset: {
-    type: GraphQLInt,
+    type: new GraphQLNonNull(GraphQLInt),
     description: 'The offset to use to fetch',
     defaultValue: 0,
   },
@@ -52,6 +52,14 @@ export interface CollectionReturnType {
   totalCount: number;
   limit: number;
   offset: number;
+}
+
+export interface TransactionsCollectionReturnType {
+  nodes: Record<string, unknown>[];
+  totalCount: number;
+  limit: number;
+  offset: number;
+  kinds?: string[] | (() => string[]);
 }
 
 export { Collection, CollectionFields, CollectionArgs };

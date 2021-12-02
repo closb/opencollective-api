@@ -1,4 +1,5 @@
 import { GraphQLInt, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
+import { GraphQLDateTime } from 'graphql-iso-date';
 import GraphQLJSON from 'graphql-type-json';
 import { get, pick } from 'lodash';
 
@@ -10,7 +11,6 @@ import { idEncode } from '../identifiers';
 import { Account } from '../interface/Account';
 import { Amount } from '../object/Amount';
 import { Host } from '../object/Host';
-import ISODateTime from '../scalar/ISODateTime';
 
 export const PaymentMethod = new GraphQLObjectType({
   name: 'PaymentMethod',
@@ -33,7 +33,7 @@ export const PaymentMethod = new GraphQLObjectType({
         type: GraphQLString,
         resolve(paymentMethod, _, req) {
           const publicProviders = [
-            [PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE, PAYMENT_METHOD_TYPE.GIFT_CARD],
+            [PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE, PAYMENT_METHOD_TYPE.GIFTCARD],
             [PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE, PAYMENT_METHOD_TYPE.PREPAID],
           ];
 
@@ -87,16 +87,21 @@ export const PaymentMethod = new GraphQLObjectType({
       data: {
         type: GraphQLJSON,
         resolve(paymentMethod, _, req) {
-          if (!req.remoteUser?.isAdmin(paymentMethod.CollectiveId)) {
+          if (
+            !req.remoteUser?.isAdmin(paymentMethod.CollectiveId) &&
+            paymentMethod.type !== PAYMENT_METHOD_TYPE.CRYPTO
+          ) {
             return null;
           }
 
           // Protect and limit fields
           let allowedFields = [];
-          if (paymentMethod.type === PAYMENT_METHOD_TYPE.GIFT_CARD) {
+          if (paymentMethod.type === PAYMENT_METHOD_TYPE.GIFTCARD) {
             allowedFields = ['email'];
           } else if (paymentMethod.type === PAYMENT_METHOD_TYPE.CREDITCARD) {
             allowedFields = ['fullName', 'expMonth', 'expYear', 'brand', 'country', 'last4'];
+          } else if (paymentMethod.type === PAYMENT_METHOD_TYPE.CRYPTO) {
+            allowedFields = ['depositAddress'];
           }
 
           return pick(paymentMethod.data, allowedFields);
@@ -113,7 +118,7 @@ export const PaymentMethod = new GraphQLObjectType({
             }
             const host = await req.loaders.Collective.byId.load(hostId);
             hosts = [host];
-          } else if (paymentMethod.type === PAYMENT_METHOD_TYPE.GIFT_CARD && paymentMethod.limitedToHostCollectiveIds) {
+          } else if (paymentMethod.type === PAYMENT_METHOD_TYPE.GIFTCARD && paymentMethod.limitedToHostCollectiveIds) {
             hosts = paymentMethod.limitedToHostCollectiveIds.map(id => {
               return req.loaders.Collective.byId.load(id);
             });
@@ -122,7 +127,7 @@ export const PaymentMethod = new GraphQLObjectType({
         },
       },
       expiryDate: {
-        type: ISODateTime,
+        type: GraphQLDateTime,
         resolve(paymentMethod, _, req) {
           if (!req.remoteUser?.isAdmin(paymentMethod.CollectiveId)) {
             return null;
@@ -132,7 +137,7 @@ export const PaymentMethod = new GraphQLObjectType({
         },
       },
       createdAt: {
-        type: ISODateTime,
+        type: GraphQLDateTime,
       },
     };
   },

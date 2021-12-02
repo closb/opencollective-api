@@ -1,5 +1,7 @@
 /* eslint-disable camelcase */
 
+import crypto from 'crypto';
+
 import Axios from 'axios';
 import config from 'config';
 import Debug from 'debug';
@@ -61,7 +63,7 @@ export const findCard = async (token: string, cardProperties: Partial<Card>): Pr
   while (keepGoing) {
     const cards = await listCards(token, undefined, { page, page_size: 500 });
     debug(`got page ${page} with ${cards.length} cards...`);
-    if (cards.length == 0) {
+    if (cards.length === 0) {
       return undefined;
     }
     const card = find(cards, cardProperties);
@@ -87,4 +89,14 @@ export const updateCard = async (
     .catch(rethrowSanitizedError);
 
   return response.data;
+};
+
+export const verifyEvent = (signature: string, rawBody: string, key: string) => {
+  const hmac = crypto.createHmac('sha256', key);
+  hmac.update(rawBody);
+  const verified = signature === hmac.digest('base64');
+
+  if (!verified) {
+    throw new Error('Could not verify event signature');
+  }
 };

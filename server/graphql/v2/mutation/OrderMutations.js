@@ -47,7 +47,7 @@ const OrderWithPayment = new GraphQLObjectType({
 
 const orderMutations = {
   createOrder: {
-    type: GraphQLNonNull(OrderWithPayment),
+    type: new GraphQLNonNull(OrderWithPayment),
     description: 'To submit a new order',
     args: {
       order: {
@@ -75,6 +75,7 @@ const orderMutations = {
       const tier = order.tier && (await fetchTierWithReference(order.tier, loadersParams));
       const fromCollective = order.fromAccount && (await loadAccount(order.fromAccount));
       const collective = await loadAccount(order.toAccount);
+
       const paymentMethod = await getLegacyPaymentMethodFromPaymentMethodInput(order.paymentMethod);
 
       const legacyOrderObj = {
@@ -90,15 +91,18 @@ const orderMutations = {
         fromCollective: fromCollective && { id: fromCollective.id },
         collective: { id: collective.id },
         totalAmount: getOrderTotalAmount(order),
+        data: order.data,
         customData: order.customData,
+        isBalanceTransfer: order.isBalanceTransfer,
         tier: tier && { id: tier.id },
         guestInfo: order.guestInfo,
         context: order.context,
+        tags: order.tags,
         platformFee,
       };
 
-      const userArgent = req.header('user-agent');
-      const result = await createOrderLegacy(legacyOrderObj, req.loaders, req.remoteUser, req.ip, userArgent);
+      const userAgent = req.header('user-agent');
+      const result = await createOrderLegacy(legacyOrderObj, req.loaders, req.remoteUser, req.ip, userAgent, req.mask);
       return { order: result.order, stripeError: result.stripeError, guestToken: result.order.data?.guestToken };
     },
   },
@@ -226,9 +230,23 @@ const orderMutations = {
       if (haveDetailsChanged) {
         // Update details (eg. amount, tier)
         const tier = !isNull(args.tier.id) && (await fetchTierWithReference(args.tier, { throwIfMissing: true }));
-        const newAmount = getValueInCentsFromAmountInput(args.amount);
+        const membership =
+          !isNull(order) &&
+          (await models.Member.findOne({
+            where: { MemberCollectiveId: order.FromCollectiveId, CollectiveId: order.CollectiveId, role: 'BACKER' },
+          }));
+        let newTotalAmount = getValueInCentsFromAmountInput(args.amount);
+        // We add the current Platform Tip to the totalAmount
+        if (order.data?.isFeesOnTop && order.data.platformFee) {
+          newTotalAmount = newTotalAmount + order.data.platformFee;
+        }
         // interval, amount, tierId, paymentMethodId
-        ({ previousOrderValues, previousSubscriptionValues } = await updateSubscriptionDetails(order, tier, newAmount));
+        ({ previousOrderValues, previousSubscriptionValues } = await updateSubscriptionDetails(
+          order,
+          tier,
+          membership,
+          newTotalAmount,
+        ));
       }
 
       if (args.paypalSubscriptionId) {

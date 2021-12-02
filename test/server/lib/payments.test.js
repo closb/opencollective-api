@@ -331,25 +331,23 @@ describe('server/lib/payments', () => {
   describe('createRefundTransaction', () => {
     it('should allow collective to start a refund', async () => {
       // Given the following pair of transactions created
-      const transaction = await models.Transaction.createFromPayload({
+      const transaction = await models.Transaction.createFromContributionPayload({
         CreatedByUserId: user.id,
         FromCollectiveId: order.FromCollectiveId,
         CollectiveId: collective.id,
         PaymentMethodId: order.PaymentMethodId,
-        transaction: {
-          type: 'CREDIT',
-          OrderId: order.id,
-          amount: 5000,
-          currency: 'USD',
-          hostCurrency: 'USD',
-          amountInHostCurrency: 5000,
-          hostCurrencyFxRate: 1,
-          hostFeeInHostCurrency: 250,
-          platformFeeInHostCurrency: 250,
-          paymentProcessorFeeInHostCurrency: 175,
-          description: 'Monthly subscription to Webpack',
-          data: { charge: { id: 'ch_1AzPXHD8MNtzsDcgXpUhv4pm' } },
-        },
+        type: 'CREDIT',
+        OrderId: order.id,
+        amount: 5000,
+        currency: 'USD',
+        hostCurrency: 'USD',
+        amountInHostCurrency: 5000,
+        hostCurrencyFxRate: 1,
+        hostFeeInHostCurrency: 250,
+        platformFeeInHostCurrency: 250,
+        paymentProcessorFeeInHostCurrency: 175,
+        description: 'Monthly subscription to Webpack',
+        data: { charge: { id: 'ch_1AzPXHD8MNtzsDcgXpUhv4pm' } },
       });
 
       // When the refund transaction is created
@@ -363,7 +361,9 @@ describe('server/lib/payments', () => {
       });
 
       // Then there should be 4 transactions in total under that order id
-      expect(allTransactions.length).to.equal(4);
+      expect(allTransactions.length).to.equal(10);
+
+      // TODO: check that HOST_FEES, PAYMENT_PROCESSOR_COVER are there
 
       // And Then two transactions should be refund
       const refundTransactions = allTransactions.filter(
@@ -373,6 +373,7 @@ describe('server/lib/payments', () => {
 
       // And then the values for the transaction from the collective
       // to the donor are correct
+      // TODO: more precise filters
       const [creditRefundTransaction] = refundTransactions.filter(t => t.type === 'CREDIT');
       expect(creditRefundTransaction.FromCollectiveId).to.equal(collective.id);
       expect(creditRefundTransaction.CollectiveId).to.equal(order.FromCollectiveId);
@@ -397,36 +398,35 @@ describe('server/lib/payments', () => {
         CollectiveId: collective.id,
         FromCollectiveId: contributorUser.CollectiveId,
       });
-      const transaction = await models.Transaction.createFromPayload({
+      const transaction = await models.Transaction.createFromContributionPayload({
         CreatedByUserId: contributorUser.id,
         FromCollectiveId: order.FromCollectiveId,
         CollectiveId: order.CollectiveId,
         PaymentMethodId: order.PaymentMethodId,
-        transaction: {
-          type: 'CREDIT',
-          OrderId: order.id,
-          amount: 5000,
-          currency: 'USD',
-          hostCurrency: 'USD',
-          amountInHostCurrency: 5000,
-          hostCurrencyFxRate: 1,
-          hostFeeInHostCurrency: 250,
-          platformFeeInHostCurrency: 500,
-          paymentProcessorFeeInHostCurrency: 175,
-          description: 'Monthly subscription to Webpack',
-          data: { charge: { id: 'ch_refunded_charge' }, isFeesOnTop: true },
-        },
+        type: 'CREDIT',
+        OrderId: order.id,
+        amount: 5000,
+        currency: 'USD',
+        hostCurrency: 'USD',
+        amountInHostCurrency: 5000,
+        hostCurrencyFxRate: 1,
+        hostFeeInHostCurrency: 250,
+        platformFeeInHostCurrency: 500,
+        paymentProcessorFeeInHostCurrency: 175,
+        description: 'Monthly subscription to Webpack',
+        data: { charge: { id: 'ch_refunded_charge' }, isFeesOnTop: true },
       });
 
       // Should have 6 transactions:
       // - 2 for contributions
+      // - 2 for host fees
       // - 2 for platform tip (contributor -> Open Collective)
       // - 2 for platform tip debt (host -> Open Collective)
       const originalTransactions = await order.getTransactions();
-      expect(originalTransactions).to.have.lengthOf(6);
+      expect(originalTransactions).to.have.lengthOf(8);
 
       // Should have created a settlement entry for tip
-      const tipTransaction = originalTransactions.find(t => t.kind === TransactionKind.PLATFORM_TIP);
+      const tipTransaction = originalTransactions.find(t => t.kind === TransactionKind.PLATFORM_TIP_DEBT);
       const tipSettlement = await models.TransactionSettlement.getByTransaction(tipTransaction);
       expect(tipSettlement.status).to.eq('OWED');
 
@@ -439,16 +439,18 @@ describe('server/lib/payments', () => {
       utils.snapshotTransactions(allTransactions, { columns: SNAPSHOT_COLUMNS });
 
       const refundedTransactions = await order.getTransactions({ where: { isRefund: true } });
-      expect(refundedTransactions).to.have.lengthOf(6);
+      expect(refundedTransactions).to.have.lengthOf(10);
       expect(refundedTransactions.filter(t => t.kind === 'CONTRIBUTION')).to.have.lengthOf(2);
-      expect(refundedTransactions.filter(t => t.kind === 'PLATFORM_TIP' && t.isDebt)).to.have.lengthOf(2);
-      expect(refundedTransactions.filter(t => t.kind === 'PLATFORM_TIP' && !t.isDebt)).to.have.lengthOf(2);
+      expect(refundedTransactions.filter(t => t.kind === 'PLATFORM_TIP')).to.have.lengthOf(2);
+      expect(refundedTransactions.filter(t => t.kind === 'PLATFORM_TIP_DEBT')).to.have.lengthOf(2);
+      expect(refundedTransactions.filter(t => t.kind === 'HOST_FEE')).to.have.lengthOf(2);
+      expect(refundedTransactions.filter(t => t.kind === 'PAYMENT_PROCESSOR_COVER')).to.have.lengthOf(2);
 
       // TODO(LedgerRefactor): Check debt transactions and settlement status
 
-      // Settlement should have been deleted since it's was not invoiced yet
-      await tipSettlement.reload({ paranoid: false });
-      expect(tipSettlement.deletedAt).to.not.be.null;
+      // Settlement should be marked as SETTLED since it's was not invoiced yet
+      await tipSettlement.reload();
+      expect(tipSettlement.status).to.eq('SETTLED');
     });
 
     it('should remove the settlement if the tip was already invoiced', async () => {

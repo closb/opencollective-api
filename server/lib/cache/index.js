@@ -5,6 +5,7 @@ import { get } from 'lodash';
 import { purgeCacheForCollectiveOperationNames } from '../../graphql/cache';
 import models from '../../models';
 import { purgeCacheForPage } from '../cloudflare';
+import { invalidateContributorsCache } from '../contributors';
 import logger from '../logger';
 import { md5 } from '../utils';
 
@@ -140,12 +141,23 @@ export function memoize(func, { key, maxAge = 0, serialize, unserialize }) {
   return memoizedFunction;
 }
 
-export function purgeCacheForCollective(slug) {
-  purgeCacheForPage(`/${slug}`);
-  // GraphQL cache
+export function purgeGQLCacheForCollective(slug) {
   for (const operationName of purgeCacheForCollectiveOperationNames) {
     cache.del(`${operationName}_${slug}`);
   }
+}
+
+export function purgeCacheForCollective(slug) {
+  purgeCacheForPage(`/${slug}`);
+  purgeGQLCacheForCollective(slug);
+}
+
+/**
+ * purgeCacheForCollective + purge contributors cache
+ */
+export async function purgeAllCachesForAccount(account) {
+  purgeCacheForCollective(account.slug);
+  await invalidateContributorsCache(account.id);
 }
 
 export default cache;

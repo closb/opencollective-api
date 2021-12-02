@@ -44,13 +44,13 @@ const Conversation = new GraphQLObjectType({
         },
       },
       comments: {
-        type: CommentCollection,
+        type: new GraphQLNonNull(CommentCollection),
         description: "List the comments for this conversation. Not backed by a loader, don't use this in lists.",
         args: {
-          limit: { type: GraphQLInt },
-          offset: { type: GraphQLInt },
+          limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 150 },
+          offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
         },
-        async resolve(conversation, _, { limit, offset }) {
+        async resolve(conversation, { limit, offset }) {
           const where = { ConversationId: conversation.id, id: { [Op.not]: conversation.RootCommentId } };
           const order = [['createdAt', 'ASC']];
           const query = { where, order };
@@ -67,10 +67,10 @@ const Conversation = new GraphQLObjectType({
         },
       },
       followers: {
-        type: AccountCollection,
+        type: new GraphQLNonNull(AccountCollection),
         args: {
-          limit: { type: GraphQLInt, defaultValue: 10 },
-          offset: { type: GraphQLInt, defaultValue: 0 },
+          limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 10 },
+          offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
         },
         async resolve(conversation, { offset, limit }, req) {
           const followers = await req.loaders.Conversation.followers.load(conversation.id);

@@ -1,10 +1,13 @@
+import { get } from 'lodash';
+
 import { types } from '../../constants/collectives';
 import FEATURE from '../../constants/feature';
 import FEATURE_STATUS from '../../constants/feature-status';
+import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE } from '../../constants/paymentMethods';
 import { hasFeature, isFeatureAllowedForCollectiveType } from '../../lib/allowed-features';
 import models, { Op } from '../../models';
 
-const checkIsActive = (
+const checkIsActive = async (
   promise: Promise<number | boolean>,
   fallback = FEATURE_STATUS.AVAILABLE,
 ): Promise<FEATURE_STATUS> => {
@@ -26,6 +29,70 @@ const checkReceiveFinancialContributions = collective => {
   }
 };
 
+const checkVirtualCardFeatureStatus = async account => {
+  if (account.isHostAccount) {
+    if (get(account.settings, 'features.privacyVcc')) {
+      return checkIsActive(models.VirtualCard.count({ where: { HostCollectiveId: account.id } }));
+    }
+  } else if (account.HostCollectiveId) {
+    const host = account.host || (await account.getHostCollective());
+    if (host && get(host.settings, 'features.privacyVcc')) {
+      return checkIsActive(models.VirtualCard.count({ where: { CollectiveId: account.id } }));
+    }
+  }
+
+  return FEATURE_STATUS.DISABLED;
+};
+
+const checkCanUsePaymentMethods = async collective => {
+  // Ignore type if the account already has some payment methods setup. Useful for Organizations that were turned into Funds.
+  const paymentMethodCount = await models.PaymentMethod.count({
+    where: {
+      CollectiveId: collective.id,
+      [Op.or]: [
+        { service: PAYMENT_METHOD_SERVICE.STRIPE, type: PAYMENT_METHOD_TYPE.CREDITCARD },
+        { service: PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE, type: PAYMENT_METHOD_TYPE.GIFTCARD },
+        { service: PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE, type: PAYMENT_METHOD_TYPE.PREPAID },
+      ],
+    },
+  });
+
+  if (paymentMethodCount) {
+    return FEATURE_STATUS.ACTIVE;
+  } else if ([types.USER, types.ORGANIZATION].includes(collective.type)) {
+    return FEATURE_STATUS.AVAILABLE;
+  } else {
+    return FEATURE_STATUS.UNSUPPORTED;
+  }
+};
+
+const checkCanEmitGiftCards = async collective => {
+  // Ignore type if the account already has some gift cards setup. Useful for Organizations that were turned into Funds.
+  const createdGiftCards = await models.PaymentMethod.count({
+    where: {
+      service: PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE,
+      type: PAYMENT_METHOD_TYPE.GIFTCARD,
+    },
+    include: [
+      {
+        model: models.PaymentMethod,
+        as: 'sourcePaymentMethod',
+        where: { CollectiveId: collective.id },
+        required: true,
+        attributes: [],
+      },
+    ],
+  });
+
+  if (createdGiftCards) {
+    return FEATURE_STATUS.ACTIVE;
+  } else if ([types.USER, types.ORGANIZATION].includes(collective.type)) {
+    return FEATURE_STATUS.AVAILABLE;
+  } else {
+    return FEATURE_STATUS.UNSUPPORTED;
+  }
+};
+
 /**
  * Returns a resolved that will give the `FEATURE_STATUS` for the given collective/feature.
  */
@@ -43,6 +110,8 @@ export const getFeatureStatusResolver =
     // Add some special cases that check for data to see if the feature is `ACTIVE` or just `AVAILABLE`
     // Right now only UPDATES, CONVERSATIONS, and RECURRING CONTRIBUTIONS
     switch (feature) {
+      case FEATURE.ABOUT:
+        return collective.longDescription ? FEATURE_STATUS.ACTIVE : FEATURE_STATUS.AVAILABLE;
       case FEATURE.RECEIVE_FINANCIAL_CONTRIBUTIONS:
         return checkReceiveFinancialContributions(collective);
       case FEATURE.RECEIVE_EXPENSES:
@@ -99,6 +168,21 @@ export const getFeatureStatusResolver =
             limit: 1,
           }),
         );
+      case FEATURE.USE_PAYMENT_METHODS:
+        return checkCanUsePaymentMethods(collective);
+      case FEATURE.EMIT_GIFT_CARDS:
+        return checkCanEmitGiftCards(collective);
+      case FEATURE.VIRTUAL_CARDS:
+        return checkVirtualCardFeatureStatus(collective);
+      case FEATURE.REQUEST_VIRTUAL_CARDS: {
+        const host = await collective.getHostCollective();
+        const balance = await collective.getBalance();
+        return balance > 0 && // Collective has balance
+          collective.isActive && // Collective is effectively being hosted
+          host.settings?.virtualcards?.requestcard
+          ? FEATURE_STATUS.ACTIVE // TODO: This flag is misused, there's a confusion between ACTIVE and AVAILABLE
+          : FEATURE_STATUS.DISABLED;
+      }
       default:
         return FEATURE_STATUS.ACTIVE;
     }

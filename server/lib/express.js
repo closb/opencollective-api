@@ -15,7 +15,6 @@ import redis from 'redis';
 
 import { loadersMiddleware } from '../graphql/loaders';
 
-import forest from './forest';
 import hyperwatch from './hyperwatch';
 import logger from './logger';
 
@@ -41,7 +40,7 @@ export default async function (app) {
       // the request body buffer to a new property called `rawBody` so we can
       // calculate the checksum to verify if the request is authentic.
       verify(req, res, buf) {
-        if (req.originalUrl.startsWith('/webhooks/transferwise')) {
+        if (req.originalUrl.startsWith('/webhooks')) {
           req.rawBody = buf.toString();
         }
       },
@@ -56,9 +55,6 @@ export default async function (app) {
   if (config.env !== 'production' && config.env !== 'staging') {
     app.use(errorHandler());
   }
-
-  // Forest
-  await forest(app);
 
   // Cors.
   app.use(cors());
@@ -83,7 +79,13 @@ export default async function (app) {
   let store;
   if (get(config, 'redis.serverUrl')) {
     const RedisStore = connectRedis(session);
-    store = new RedisStore({ client: redis.createClient(get(config, 'redis.serverUrl')) });
+    const redisOptions = {};
+    if (get(config, 'redis.serverUrl').includes('rediss://')) {
+      redisOptions.tls = { rejectUnauthorized: false };
+    }
+    store = new RedisStore({
+      client: redis.createClient(get(config, 'redis.serverUrl'), redisOptions),
+    });
   }
 
   app.use(

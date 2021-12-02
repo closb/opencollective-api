@@ -5,6 +5,8 @@ import { groupBy, keyBy, pick, sumBy } from 'lodash';
 import moment from 'moment';
 
 import MemberRoles from '../server/constants/roles.ts';
+import { generateHostFeeAmountForTransactionLoader } from '../server/graphql/loaders/transactions';
+import { getHostTransactionsCsvAsAdmin } from '../server/lib/csv';
 import emailLib from '../server/lib/email';
 import { getBackersStats, getHostedCollectives, sumTransactions } from '../server/lib/hostlib';
 import { stripHTML } from '../server/lib/sanitize-html';
@@ -13,6 +15,10 @@ import { exportToPDF, sumByWhen } from '../server/lib/utils';
 import models, { Op, sequelize } from '../server/models';
 
 const debug = debugLib('hostreport');
+
+if (process.env.ERRATUM_NUMBER && !process.env.ERRATUM_MESSAGE) {
+  throw new Error('ERRATUM_MESSAGE is required when using ERRATUM_NUMBER');
+}
 
 const summary = {
   totalHosts: 0,
@@ -23,6 +29,23 @@ const summary = {
   numberDonations: 0,
   numberPaidExpenses: 0,
   hosts: [],
+};
+
+const hostFeeAmountForTransactionLoader = generateHostFeeAmountForTransactionLoader();
+
+const enrichTransactionsWithHostFee = async transactions => {
+  const hostFees = await hostFeeAmountForTransactionLoader.loadMany(transactions);
+  transactions.forEach((transaction, idx) => {
+    const hostFeeInHostCurrency = hostFees[idx];
+    if (transaction.kind === 'ADDED_FUNDS' || transaction.kind === 'CONTRIBUTION') {
+      if (hostFeeInHostCurrency && hostFeeInHostCurrency !== transaction.hostFeeInHostCurrency) {
+        transaction.hostFeeInHostCurrency = hostFeeInHostCurrency;
+        transaction.netAmountInCollectiveCurrency =
+          models.Transaction.calculateNetAmountInCollectiveCurrency(transaction);
+      }
+    }
+  });
+  return transactions;
 };
 
 async function HostReport(year, month, hostId) {
@@ -53,6 +76,7 @@ async function HostReport(year, month, hostId) {
   const reportName = yearlyReport ? `${year} Yearly Host Report` : `${year}/${month + 1} Monthly Host Report`;
   const dateFormat = yearlyReport ? 'YYYY' : 'YYYYMM';
   const csvFilename = `${moment(d).format(dateFormat)}-transactions.csv`;
+  const csvFilenameV2 = `${moment(d).format(dateFormat)}-transactions-v2.csv`;
   const pdfFilename = `${moment(d).format(dateFormat)}-expenses.pdf`;
   console.log('startDate', startDate, 'endDate', endDate);
 
@@ -107,6 +131,13 @@ async function HostReport(year, month, hostId) {
         ).totalInHostCurrency +
         (
           await sumTransactions(
+            'hostFeeInHostCurrency',
+            { where: { ...where, createdAt: { [Op.lt]: endDate } } },
+            host.currency,
+          )
+        ).totalInHostCurrency +
+        (
+          await sumTransactions(
             'platformFeeInHostCurrency',
             { where: { ...where, createdAt: { [Op.lt]: endDate } } },
             host.currency,
@@ -145,6 +176,8 @@ async function HostReport(year, month, hostId) {
       data.expensesPerPage = [[]];
       data.taxType = host.getTaxType() || 'Taxes';
       data.stats = {};
+      data.erratumMessage = process.env.ERRATUM_MESSAGE;
+      data.erratumNumber = process.env.ERRATUM_NUMBER;
 
       const getHostAdminsEmails = async host => {
         if (host.type === 'USER') {
@@ -214,7 +247,9 @@ async function HostReport(year, month, hostId) {
       summary.totalCollectives += data.stats.totalCollectives;
       console.log(`>>> processing ${data.stats.totalCollectives} collectives`);
       let transactions = await getTransactions(Object.keys(collectivesById), startDate, endDate, {
-        where: { HostCollectiveId: host.id },
+        where: {
+          HostCollectiveId: host.id,
+        },
         include: [
           {
             model: models.Expense,
@@ -239,16 +274,13 @@ async function HostReport(year, month, hostId) {
       });
 
       if (!transactions || transactions.length === 0) {
-        throw new Error('No transaction found');
+        console.log(`No transaction found for ${host.slug}, skipping`);
+        return;
       }
       console.log(`>>> processing ${transactions.length} transactions`);
+      await enrichTransactionsWithHostFee(transactions);
       transactions = await Promise.all(transactions.map(processTransaction));
-      const csv = models.Transaction.exportCSV(transactions, collectivesById);
-      attachments.push({
-        filename: `${host.slug}-${csvFilename}`,
-        content: csv,
-      });
-      data.transactions = transactions;
+
       // Don't generate PDF in email if it's the yearly report
       let pdf;
       if (!yearlyReport && !process.env.SKIP_PDF) {
@@ -270,25 +302,33 @@ async function HostReport(year, month, hostId) {
       }
       const stats = await getHostStats(host, Object.keys(collectivesById));
 
-      const groupedTransactions = groupBy(data.transactions, t => {
-        if (t.isDebt && t.kind === 'PLATFORM_TIP') {
-          return 'otherCredits';
+      const groupedTransactions = groupBy(transactions, t => {
+        if (t.kind === 'HOST_FEE') {
+          return 'hostFees';
+        } else if (t.kind === 'HOST_FEE_SHARE') {
+          return 'hostFeeShare';
+        } else if (t.kind === 'PLATFORM_TIP_DEBT' || t.kind === 'HOST_FEE_SHARE_DEBT') {
+          return 'debts';
         } else if (t.OrderId && t.type === 'CREDIT') {
           return 'donations';
         } else if (t.ExpenseId && t.type === 'DEBIT') {
           return 'expenses';
-          // TODO REPLACE WITH OTHER INCOMES AND OTHER EXPENSES
-        } else if (t.type === 'DEBIT') {
+        } else if (t.type === 'DEBIT' && t.kind !== null) {
           return 'otherDebits';
-        } else if (t.type === 'CREDIT') {
+        } else if (t.type === 'CREDIT' && t.kind !== null) {
           return 'otherCredits';
+        } else {
+          return 'ignoredTransactions';
         }
       });
 
       const donations = groupedTransactions.donations || [];
       const expenses = groupedTransactions.expenses || [];
+      const debts = groupedTransactions.debts || [];
       const otherCredits = groupedTransactions.otherCredits || [];
       const otherDebits = groupedTransactions.otherDebits || [];
+      const hostFees = groupedTransactions.hostFees || [];
+      const hostFeeShare = groupedTransactions.hostFeeShare || [];
 
       const plan = await host.getPlan();
 
@@ -302,12 +342,12 @@ async function HostReport(year, month, hostId) {
       const paymentProcessorFeesOtherDebits = sumBy(otherDebits, 'paymentProcessorFeeInHostCurrency');
       const platformFeesOtherDebits = sumBy(otherDebits, 'platformFeeInHostCurrency');
 
-      const totalOwedPlatformTips = sumByWhen(
-        otherCredits,
-        'amountInHostCurrency',
-        t => t.isDebt && t.kind === 'PLATFORM_TIP',
-      );
+      const totalHostFees = sumByWhen(hostFees, 'amountInHostCurrency', t => t.CollectiveId === host.id);
+      const totalSharedRevenue = sumBy(hostFeeShare, 'amountInHostCurrency');
 
+      const totalAmountDebts = sumBy(debts, 'amountInHostCurrency');
+      const totalOwedPlatformTips = sumByWhen(debts, 'amountInHostCurrency', t => t.kind === 'PLATFORM_TIP_DEBT');
+      const totalOwedHostFeeShare = sumByWhen(debts, 'amountInHostCurrency', t => t.kind === 'HOST_FEE_SHARE_DEBT');
       const payoutProcessorFeesPaypal = sumByWhen(
         expenses,
         'paymentProcessorFeeInHostCurrency',
@@ -332,9 +372,7 @@ async function HostReport(year, month, hostId) {
         platformFeesOtherCredits;
       const totalTaxAmountCollected = sumByWhen(transactions, 'taxAmount', t => t.type === 'CREDIT');
       const totalAmountPaidExpenses = sumByWhen(expenses, 'netAmountInHostCurrency');
-      const totalHostFees = sumBy([...donations, ...otherCredits], 'hostFeeInHostCurrency');
-      const totalNetAmountReceivedForCollectives =
-        sumBy([...donations, ...otherCredits], 'netAmountInHostCurrency') - totalOwedPlatformTips;
+      const totalNetAmountReceivedForCollectives = totalNetAmountReceived - totalHostFees;
       const totalAmountSpent =
         totalAmountPaidExpenses +
         payoutProcessorFeesOther +
@@ -343,12 +381,30 @@ async function HostReport(year, month, hostId) {
         paymentProcessorFeesOtherDebits +
         platformFeesOtherDebits;
 
-      const totalSharedRevenue = sumByWhen(
-        donations,
-        t => (t.hostFeeInHostCurrency * (t.data?.hostFeeSharePercent || plan.hostFeeSharePercent)) / 100,
-        t => !t.platformFeeInHostCurrency && t.hostFeeInHostCurrency,
-      );
       const hostNetRevenue = Math.abs(totalHostFees) + totalSharedRevenue;
+
+      // We exclude host fees and related transactions from the displayed results
+      data.transactions = transactions = transactions.filter(
+        t => !t.kind || !['HOST_FEE', 'HOST_FEE_SHARE', 'HOST_FEE_SHARE_DEBT'].includes(t.kind),
+      );
+
+      const csv = models.Transaction.exportCSV(transactions, collectivesById);
+
+      attachments.push({
+        filename: `${host.slug}-${csvFilename}`,
+        content: csv,
+      });
+
+      const csv2 = await getHostTransactionsCsvAsAdmin(host, { startDate, endDate });
+      if (csv2) {
+        attachments.push({
+          filename: `${host.slug}-${csvFilenameV2}`,
+          content: csv2,
+        });
+        data.csvV2 = true;
+      }
+
+      const displayedDebts = debts.filter(t => t.kind !== 'HOST_FEE_SHARE_DEBT');
 
       data.stats = {
         ...data.stats,
@@ -358,6 +414,7 @@ async function HostReport(year, month, hostId) {
         numberOtherCredits: otherCredits?.length || 0,
         numberOtherDebits: otherDebits?.length || 0,
         numberPaidExpenses: expenses.length,
+        numberDebts: displayedDebts.length,
         numberTransactions: transactions.length,
         paymentProcessorFees,
         paymentProcessorFeesOtherCredits,
@@ -373,6 +430,7 @@ async function HostReport(year, month, hostId) {
         totalAmountOtherCredits,
         totalAmountOtherDebits,
         totalAmountPaidExpenses,
+        totalAmountDebts,
         totalAmountSpent,
         totalHostFees,
         totalNetAmountReceived,
@@ -381,6 +439,7 @@ async function HostReport(year, month, hostId) {
         totalSharedRevenue,
         hostNetRevenue,
         totalOwedPlatformTips,
+        totalOwedHostFeeShare,
       };
 
       summary.hosts.push({
@@ -391,6 +450,7 @@ async function HostReport(year, month, hostId) {
       summary.totalActiveCollectives += data.stats.totalActiveCollectives;
       summary.numberTransactions += data.stats.numberTransactions;
       summary.numberDonations += data.stats.numberDonations;
+      summary.numberDebts += data.stats.numberDebts;
       summary.numberPaidExpenses += data.stats.numberPaidExpenses;
       summary.totalAmountPaidExpenses += data.stats.totalAmountPaidExpenses;
       // Don't send transactions in email if there is more than 1000

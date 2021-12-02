@@ -1,8 +1,15 @@
 import { get } from 'lodash';
 
 import { TransactionTypes } from '../../constants/transactions';
-import * as currency from '../../lib/currency';
-import { createRefundTransaction, getHostFee, getPlatformFee, isProvider } from '../../lib/payments';
+import { getFxRate } from '../../lib/currency';
+import {
+  createRefundTransaction,
+  getHostFee,
+  getHostFeeSharePercent,
+  getPlatformTip,
+  isPlatformTipEligible,
+  isProvider,
+} from '../../lib/payments';
 import models, { Op } from '../../models';
 
 /** Get the balance of a prepaid credit card
@@ -40,8 +47,8 @@ async function getBalance(paymentMethod) {
   });
   let spent = 0;
   for (const transaction of allTransactions) {
-    if (transaction.currency != paymentMethod.currency) {
-      const fxRate = await currency.getFxRate(transaction.currency, paymentMethod.currency);
+    if (transaction.currency !== paymentMethod.currency) {
+      const fxRate = await getFxRate(transaction.currency, paymentMethod.currency);
       spent += transaction.netAmountInCollectiveCurrency * fxRate;
     } else {
       spent += transaction.netAmountInCollectiveCurrency;
@@ -72,8 +79,8 @@ async function processOrder(order) {
   }
 
   // Check that target Collective's Host is same as gift card issuer
-  const hostCollective = await order.collective.getHostCollective();
-  if (hostCollective.id !== data.HostCollectiveId) {
+  const host = await order.collective.getHostCollective();
+  if (host.id !== data.HostCollectiveId) {
     throw new Error('Prepaid method can only be used in collectives from the same host');
   }
 
@@ -83,28 +90,48 @@ async function processOrder(order) {
     throw new Error("This payment method doesn't have enough funds to complete this order");
   }
 
-  const platformFeeInHostCurrency = await getPlatformFee(order.totalAmount, order, hostCollective);
-  const hostFeeInHostCurrency = await getHostFee(order.totalAmount, order, hostCollective);
+  const hostFeeSharePercent = await getHostFeeSharePercent(order, host);
+  const isSharedRevenue = !!hostFeeSharePercent;
+
+  const amount = order.totalAmount;
+  const currency = order.currency;
+  const hostCurrency = host.currency;
+  const hostCurrencyFxRate = await getFxRate(currency, hostCurrency);
+  const amountInHostCurrency = Math.round(amount * hostCurrencyFxRate);
+
+  const platformTipEligible = await isPlatformTipEligible(order, host);
+  const platformTip = getPlatformTip(order);
+  const platformTipInHostCurrency = Math.round(platformTip * hostCurrencyFxRate);
+
+  const hostFee = await getHostFee(order, host);
+  const hostFeeInHostCurrency = Math.round(hostFee * hostCurrencyFxRate);
 
   // Use the above payment method to donate to Collective
-  const transactions = await models.Transaction.createFromPayload({
+  const transactions = await models.Transaction.createFromContributionPayload({
     CreatedByUserId: user.id,
     FromCollectiveId: order.FromCollectiveId,
     CollectiveId: order.CollectiveId,
     PaymentMethodId: order.paymentMethod.id,
-    transaction: {
-      type: TransactionTypes.CREDIT,
-      OrderId: order.id,
-      amount: order.totalAmount,
-      amountInHostCurrency: order.totalAmount,
-      currency: order.currency,
-      hostCurrency: order.currency,
-      hostCurrencyFxRate: 1,
-      hostFeeInHostCurrency,
-      platformFeeInHostCurrency,
-      paymentProcessorFeeInHostCurrency: 0,
-      taxAmount: order.taxAmount,
-      description: order.description,
+    type: TransactionTypes.CREDIT,
+    OrderId: order.id,
+    amount,
+    amountInHostCurrency,
+    currency,
+    hostCurrency,
+    hostCurrencyFxRate,
+    hostFeeInHostCurrency,
+    paymentProcessorFeeInHostCurrency: 0,
+    taxAmount: order.taxAmount,
+    description: order.description,
+    data: {
+      isFeesOnTop: order.data?.isFeesOnTop,
+      hasPlatformTip: platformTip ? true : false,
+      isSharedRevenue,
+      platformTipEligible,
+      platformTip,
+      platformTipInHostCurrency,
+      hostFeeSharePercent,
+      tax: order.data?.tax,
     },
   });
 

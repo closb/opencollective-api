@@ -1,7 +1,14 @@
-import { GraphQLBoolean, GraphQLInputObjectType, GraphQLInt, GraphQLList, GraphQLNonNull } from 'graphql';
+import {
+  GraphQLBoolean,
+  GraphQLInputObjectType,
+  GraphQLInt,
+  GraphQLList,
+  GraphQLNonNull,
+  GraphQLString,
+} from 'graphql';
 import GraphQLJSON from 'graphql-type-json';
 
-import { ContributionFrequency } from '../enum/ContributionFrequency';
+import { ContributionFrequency } from '../enum';
 
 import { AccountReferenceInput } from './AccountReferenceInput';
 import { AmountInput } from './AmountInput';
@@ -64,6 +71,10 @@ export const OrderCreateInput = new GraphQLInputObjectType({
       type: TierReferenceInput,
       description: 'The tier you are contributing to',
     },
+    data: {
+      type: GraphQLJSON,
+      description: 'Data related to this order',
+    },
     customData: {
       type: GraphQLJSON,
       description: 'If the tier has some "customFields", use this field to set their values',
@@ -71,6 +82,14 @@ export const OrderCreateInput = new GraphQLInputObjectType({
     context: {
       type: OrderContextInput,
       description: 'Some context about how this order was created',
+    },
+    isBalanceTransfer: {
+      type: GraphQLBoolean,
+      description: 'Whether this is transferring the remaining balance from a project/event/collective',
+    },
+    tags: {
+      type: new GraphQLList(GraphQLString),
+      description: 'Tags associated to the order',
     },
   }),
 });

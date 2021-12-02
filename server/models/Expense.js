@@ -45,6 +45,15 @@ function defineModel() {
         allowNull: false,
       },
 
+      HostCollectiveId: {
+        type: DataTypes.INTEGER,
+        references: {
+          model: 'Collectives',
+          key: 'id',
+        },
+        allowNull: true,
+      },
+
       FromCollectiveId: {
         type: DataTypes.INTEGER,
         references: { key: 'id', model: 'Collectives' },
@@ -221,7 +230,7 @@ function defineModel() {
         type: DataTypes.ARRAY(DataTypes.STRING),
         set(tags) {
           const sanitizedTags = sanitizeTags(tags);
-          if (!tags || sanitizedTags.length === 0) {
+          if (!sanitizedTags?.length) {
             this.setDataValue('tags', null);
           } else {
             this.setDataValue('tags', sanitizedTags);
@@ -362,8 +371,15 @@ function defineModel() {
     return this.save();
   };
 
-  Expense.prototype.setPaid = async function (lastEditedById) {
-    await this.update({ status: status.PAID, lastEditedById });
+  Expense.prototype.setPaid = async function (editedById) {
+    const collective = this.collective || (await this.getCollective());
+    const lastEditedById = editedById || this.lastEditedById;
+    await this.update({ status: status.PAID, lastEditedById, HostCollectiveId: collective.HostCollectiveId });
+
+    // Update transactions settlement
+    if (this.type === expenseType.SETTLEMENT || this.data?.['isPlatformTipSettlement']) {
+      await models.TransactionSettlement.markExpenseAsSettled(this);
+    }
 
     try {
       await this.createContributorMember();

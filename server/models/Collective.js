@@ -35,12 +35,11 @@ import FEATURE from '../constants/feature';
 import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE } from '../constants/paymentMethods';
 import plans from '../constants/plans';
 import roles, { MemberRoleLabels } from '../constants/roles';
-import { TransactionKind } from '../constants/transaction-kind';
-import { PLATFORM_TIP_TRANSACTION_PROPERTIES, TransactionTypes } from '../constants/transactions';
 import { hasOptedOutOfFeature, isFeatureAllowedForCollectiveType } from '../lib/allowed-features';
 import {
   getBalanceAmount,
   getBalanceWithBlockedFundsAmount,
+  getTotalAmountPaidExpenses,
   getTotalAmountReceivedAmount,
   getTotalMoneyManagedAmount,
   getTotalNetAmountReceivedAmount,
@@ -57,6 +56,13 @@ import {
 import { invalidateContributorsCache } from '../lib/contributors';
 import { getFxRate } from '../lib/currency';
 import emailLib from '../lib/email';
+import {
+  getHostFees,
+  getHostFeeShare,
+  getPendingHostFeeShare,
+  getPendingPlatformTips,
+  getPlatformTips,
+} from '../lib/host-metrics';
 import logger from '../lib/logger';
 import queries from '../lib/queries';
 import { buildSanitizerOptions, sanitizeHTML } from '../lib/sanitize-html';
@@ -64,7 +70,7 @@ import sequelize, { DataTypes, Op, Sequelize } from '../lib/sequelize';
 import { collectiveSpamCheck, notifyTeamAboutSuspiciousCollective } from '../lib/spam';
 import { canUseFeature } from '../lib/user-permissions';
 import userlib from '../lib/userlib';
-import { capitalize, cleanTags, formatCurrency, getDomain, md5, sumByWhen } from '../lib/utils';
+import { capitalize, cleanTags, formatCurrency, getDomain, md5 } from '../lib/utils';
 
 import CustomDataTypes from './DataTypes';
 import { PayoutMethodTypes } from './PayoutMethod';
@@ -163,10 +169,24 @@ function defineModel() {
         },
       },
 
+      /** Public name */
       name: {
         type: DataTypes.STRING,
         set(name) {
           this.setDataValue('name', name.replace(/\s+/g, ' ').trim());
+        },
+        validate: {
+          len: [0, 255],
+        },
+      },
+
+      /** Private, legal name. Used for expense receipts, taxes, etc. */
+      legalName: {
+        type: DataTypes.STRING,
+        allowNull: true,
+        set(legalName) {
+          const cleanLegalName = legalName?.replace(/\s+/g, ' ').trim();
+          this.setDataValue('legalName', cleanLegalName || null);
         },
         validate: {
           len: [0, 255],
@@ -219,6 +239,13 @@ function defineModel() {
 
       hostFeePercent: {
         type: DataTypes.FLOAT,
+        set(hostFeePercent) {
+          if (hostFeePercent) {
+            this.setDataValue('hostFeePercent', round(hostFeePercent, 2));
+          } else {
+            this.setDataValue('hostFeePercent', hostFeePercent);
+          }
+        },
         validate: {
           min: 0,
           max: 100,
@@ -485,7 +512,7 @@ function defineModel() {
             name: this.locationName,
             address: this.address,
             country: this.countryISO,
-            structured: this.settings?.address,
+            structured: this.data?.address,
             lat: this.geoLocationLatLong?.coordinates?.[0],
             long: this.geoLocationLatLong?.coordinates?.[1],
           };
@@ -626,15 +653,15 @@ function defineModel() {
           }
           let potentialSlugs,
             useSlugify = true;
+          // Populate potentialSlugs, priority of choices is the same as order in the array
           if (instance.isIncognito) {
             useSlugify = false;
             potentialSlugs = [`incognito-${uuid().split('-')[0]}`];
           } else {
             potentialSlugs = [
-              instance.slug,
+              instance.name ? instance.name.replace(/ /g, '-') : null,
               instance.image ? userlib.getUsernameFromGithubURL(instance.image) : null,
               instance.twitterHandle ? instance.twitterHandle.replace(/@/g, '') : null,
-              instance.name ? instance.name.replace(/ /g, '-') : null,
             ];
           }
           return Collective.generateSlug(potentialSlugs, useSlugify).then(slug => {
@@ -771,8 +798,22 @@ function defineModel() {
     return new Promise(resolve => {
       return this.getParentCollective().then(parentCollective => {
         const url = `${config.host.website}/${parentCollective.slug}/events/${this.slug}`;
-        const start = moment(this.startsAt).format('YYYY-M-D-H-m').split('-');
-        const end = moment(this.endsAt).format('YYYY-M-D-H-m').split('-');
+        const startDate = new Date(this.startsAt);
+        const endDate = new Date(this.endsAt);
+        const start = [
+          startDate.getFullYear(),
+          startDate.getMonth() + 1,
+          startDate.getDate(),
+          startDate.getHours(),
+          startDate.getMinutes(),
+        ];
+        const end = [
+          endDate.getFullYear(),
+          endDate.getMonth() + 1,
+          endDate.getDate(),
+          endDate.getHours(),
+          endDate.getMinutes(),
+        ];
         let description = this.description || '';
         if (this.longDescription) {
           description += `\n\n${this.longDescription}`;
@@ -901,6 +942,12 @@ function defineModel() {
         CollectiveId: this.id,
         data: { collective: this.info },
       });
+    } else if (this.type === types.COLLECTIVE) {
+      await models.Activity.create({
+        type: activities.ACTIVATED_COLLECTIVE_AS_INDEPENDENT,
+        CollectiveId: this.id,
+        data: { collective: this.info },
+      });
     }
 
     await this.activateBudget();
@@ -996,6 +1043,14 @@ function defineModel() {
       approvedAt: new Date(),
     });
 
+    await models.PaymentMethod.destroy({
+      where: {
+        CollectiveId: this.id,
+        service: 'opencollective',
+        type: 'collective',
+      },
+    });
+
     await models.PaymentMethod.create({
       CollectiveId: this.id,
       service: 'opencollective',
@@ -1027,18 +1082,13 @@ function defineModel() {
       },
     });
 
-    const collectivePaymentMethod = await models.PaymentMethod.findOne({
+    await models.PaymentMethod.destroy({
       where: {
         CollectiveId: this.id,
         service: 'opencollective',
         type: 'collective',
-        deletedAt: null,
       },
     });
-
-    if (collectivePaymentMethod) {
-      await collectivePaymentMethod.destroy();
-    }
 
     return this;
   };
@@ -1136,7 +1186,8 @@ function defineModel() {
    * Get the admin users { id, email } of this collective
    */
   Collective.prototype.getAdminUsers = async function ({ userQueryParams, paranoid = true } = {}) {
-    if (this.type === 'USER') {
+    if (this.type === 'USER' && !this.isIncognito) {
+      // Incognito profiles rely on the `Members` entry to know which user it belongs to
       return [await this.getUser({ paranoid, ...userQueryParams })];
     }
 
@@ -1164,25 +1215,38 @@ function defineModel() {
     return this.getAdminUsers().then(users => users.map(u => u && u.email));
   };
 
-  Collective.prototype.getEvents = function (query = {}) {
+  Collective.prototype.getChildren = function (query = {}) {
     return Collective.findAll({
+      order: [
+        ['createdAt', 'DESC'],
+        ['id', 'DESC'],
+      ],
       ...query,
-      where: {
-        ...query.where,
-        ParentCollectiveId: this.id,
-        type: types.EVENT,
-      },
+      where: { ...query.where, ParentCollectiveId: this.id },
+    });
+  };
+
+  Collective.prototype.getEvents = function (query = {}) {
+    return this.getChildren({
+      order: [
+        ['startsAt', 'DESC'],
+        ['endsAt', 'DESC'],
+        ['id', 'DESC'],
+      ],
+      ...query,
+      where: { ...query.where, type: types.EVENT },
     });
   };
 
   Collective.prototype.getProjects = function (query = {}) {
-    return Collective.findAll({
+    return this.getChildren({
       ...query,
-      where: {
-        ...query.where,
-        ParentCollectiveId: this.id,
-        type: types.PROJECT,
-      },
+      order: [
+        ['deactivatedAt', 'DESC'], // Will put active projects first, ordering the others by deactivation date
+        ['createdAt', 'DESC'],
+        ['id', 'DESC'],
+      ],
+      where: { ...query.where, type: types.PROJECT },
     });
   };
 
@@ -1635,7 +1699,7 @@ function defineModel() {
         recipient: {
           collective: memberUser.collective.activity,
         },
-        loginLink: `${config.host.website}/signin?next=/${memberUser.collective.slug}/edit`,
+        loginLink: `${config.host.website}/signin?next=/${memberUser.collective.slug}/admin`,
       },
       { bcc: remoteUser.email },
     );
@@ -1667,12 +1731,19 @@ function defineModel() {
    *
    * It's expected that child Collectives like EVENTS are returned
    */
-  Collective.prototype.getHostedCollectives = async function () {
-    const hostedCollectives = await models.Member.findAll({
-      where: { MemberCollectiveId: this.id, role: roles.HOST },
+  Collective.prototype.getHostedCollectives = async function (queryParams = {}) {
+    return models.Collective.findAll({
+      ...queryParams,
+      where: { isActive: true, HostCollectiveId: this.id },
+      includes: [
+        {
+          attributes: [],
+          association: 'members',
+          required: true,
+          where: { MemberCollectiveId: this.id, role: roles.HOST },
+        },
+      ],
     });
-    const hostedCollectiveIds = hostedCollectives.map(m => m.CollectiveId);
-    return models.Collective.findAll({ where: { id: { [Op.in]: hostedCollectiveIds } } });
   };
 
   Collective.prototype.getHostedCollectiveAdmins = async function () {
@@ -1911,8 +1982,8 @@ function defineModel() {
       ...(shouldAutomaticallyApprove ? { isActive: true, approvedAt: new Date() } : null),
     };
 
-    // events should take the currency of their parent collective, not necessarily the host of their host.
-    if (this.type === 'COLLECTIVE') {
+    // events should take the currency of their parent collective, not necessarily the one from their host.
+    if ([types.COLLECTIVE, types.FUND].includes(this.type)) {
       updatedValues.currency = hostCollective.currency;
     }
 
@@ -1924,7 +1995,6 @@ function defineModel() {
         CollectiveId: this.id,
         service: 'opencollective',
         type: 'collective',
-        deletedAt: null,
       },
     });
 
@@ -1942,7 +2012,7 @@ function defineModel() {
       );
     }
 
-    if (this.type === types.COLLECTIVE) {
+    if ([types.COLLECTIVE, types.FUND].includes(this.type)) {
       let tiers = await this.getTiers();
       if (!tiers || tiers.length === 0) {
         tiers = defaultTiers(hostCollective.currency);
@@ -2049,7 +2119,7 @@ function defineModel() {
    */
   Collective.prototype.changeHost = async function (newHostCollectiveId, remoteUser, options) {
     // Skip
-    if (this.HostCollectiveId == newHostCollectiveId) {
+    if (this.HostCollectiveId === newHostCollectiveId) {
       return this;
     }
 
@@ -2068,8 +2138,6 @@ function defineModel() {
 
     // Self Hosted Collective
     if (this.id === this.HostCollectiveId) {
-      this.isHostAccount = false;
-      this.plan = null;
       await models.ConnectedAccount.destroy({
         where: {
           service: 'stripe',
@@ -2077,13 +2145,6 @@ function defineModel() {
         },
       });
     }
-
-    // Prepare collective to receive a new host
-    this.HostCollectiveId = null;
-    this.isActive = false;
-    this.approvedAt = null;
-    this.hostFeePercent = null;
-    this.platformFeePercent = null;
 
     // Prepare events and projects to receive a new host
     const events = await this.getEvents();
@@ -2095,6 +2156,18 @@ function defineModel() {
       await Promise.all(projects.map(e => e.changeHost(null)));
     }
 
+    // Reset current host
+    await this.update({
+      HostCollectiveId: null,
+      isActive: false,
+      approvedAt: null,
+      hostFeePercent: null,
+      platformFeePercent: null,
+      isHostAccount: false,
+      plan: null,
+    });
+
+    // Add new host
     if (newHostCollectiveId) {
       const newHostCollective = await models.Collective.findByPk(newHostCollectiveId);
       if (!newHostCollective) {
@@ -2107,9 +2180,6 @@ function defineModel() {
         message: options?.message,
         applicationData: options?.applicationData,
       });
-    } else {
-      // if we remove the host
-      return this.save();
     }
   };
 
@@ -2414,6 +2484,14 @@ function defineModel() {
     return getTotalAmountReceivedAmount(this, options).then(result => result.value);
   };
 
+  Collective.prototype.getTotalPaidExpensesAmount = function (options) {
+    return getTotalAmountPaidExpenses(this, options);
+  };
+
+  Collective.prototype.getTotalPaidExpenses = function (options) {
+    return getTotalAmountPaidExpenses(this, options).then(result => result.value);
+  };
+
   Collective.prototype.getTotalNetAmountReceivedAmount = function (options) {
     return getTotalNetAmountReceivedAmount(this, options);
   };
@@ -2524,6 +2602,7 @@ function defineModel() {
     offset,
     limit,
     attributes,
+    kinds,
     order = [['createdAt', 'DESC']],
     includeUsedGiftCardsEmittedByOthers = true,
     includeExpenseTransactions = true,
@@ -2544,6 +2623,11 @@ function defineModel() {
     // Filter on host
     if (HostCollectiveId) {
       query.where.HostCollectiveId = HostCollectiveId;
+    }
+
+    // Filter on kind
+    if (kinds) {
+      query.where.kind = kinds;
     }
 
     // Filter on date
@@ -2730,6 +2814,18 @@ function defineModel() {
           return stripeAccount;
         }
       });
+  };
+
+  Collective.prototype.getAccountForPaymentProvider = async function (provider) {
+    const connectedAccount = await models.ConnectedAccount.findOne({
+      where: { service: provider, CollectiveId: this.id },
+    });
+
+    if (!connectedAccount) {
+      throw new Error(`Host ${this.slug} is not connected to ${provider}`);
+    }
+
+    return connectedAccount;
   };
 
   Collective.prototype.getTopBackers = async function (since, until, limit) {
@@ -2942,84 +3038,41 @@ function defineModel() {
    * Returns financial metrics from the Host collective.
    * @param {Date} from Defaults to beginning of the current month.
    * @param {Date} [to] Optional, defaults to the end of the 'from' month and 'from' is reseted to the beginning of its month.
+   * @param {[Integer]} [collectiveIds] Optional, a list of collective ids for which the metrics are returned.
    */
-  Collective.prototype.getHostMetrics = async function (
-    from = moment().utc().startOf('month'),
-    to,
-    { returnTransactions = false } = {},
-  ) {
+  Collective.prototype.getHostMetrics = async function (from, to, collectiveIds) {
     if (!this.isHostAccount || !this.isActive || this.type !== types.ORGANIZATION) {
       return null;
     }
 
-    // If only one argument is passed, get metric for the whole month of the first argument date.
-    if (!to) {
-      to = moment(from).utc().endOf('month');
-      from = moment(from).utc().startOf('month');
-    }
+    from = from ? moment(from) : moment().utc().startOf('month');
+    to = to ? moment(to) : moment(from).utc().endOf('month');
 
-    const isPendingTransaction = t =>
-      !(t.PaymentMethod?.service == 'stripe' || t.PaymentMethod?.sourcePaymentMethod?.service == 'stripe');
     const plan = await this.getPlan();
     const hostFeeSharePercent = plan.hostFeeSharePercent || 0;
 
-    const transactions = await models.Transaction.findAll({
-      where: {
-        HostCollectiveId: this.id,
-        type: TransactionTypes.CREDIT,
-        createdAt: { [Op.gte]: from, [Op.lt]: to },
-      },
-      include: [
-        {
-          model: models.PaymentMethod,
-          as: 'PaymentMethod',
-          include: [{ model: models.PaymentMethod, as: 'sourcePaymentMethod' }],
-        },
-      ],
+    const hostFees = await getHostFees(this, { startDate: from, endDate: to, fromCollectiveIds: collectiveIds });
+
+    const hostFeeShare = await getHostFeeShare(this, {
+      startDate: from,
+      endDate: to,
+      collectiveIds,
     });
-
-    const hostFees = Math.abs(sumBy(transactions, 'hostFeeInHostCurrency'));
-    const platformFees = Math.abs(sumBy(transactions, 'platformFeeInHostCurrency'));
-    const pendingPlatformFees = Math.abs(sumByWhen(transactions, 'platformFeeInHostCurrency', isPendingTransaction));
-    const hostFeeShare = Math.abs(
-      sumByWhen(
-        transactions,
-        t => round((t.hostFeeInHostCurrency * (t.data?.hostFeeSharePercent || plan.hostFeeSharePercent)) / 100),
-        t => !t.platformFeeInHostCurrency && t.hostFeeInHostCurrency,
-      ),
-    );
-    const pendingHostFeeShare = Math.abs(
-      sumByWhen(
-        transactions,
-        t => round((t.hostFeeInHostCurrency * (t.data?.hostFeeSharePercent || plan.hostFeeSharePercent)) / 100),
-        t => !t.platformFeeInHostCurrency && t.hostFeeInHostCurrency && isPendingTransaction(t),
-      ),
-    );
-
-    const tipsTransactions = await models.Transaction.findAll({
-      where: {
-        ...pick(PLATFORM_TIP_TRANSACTION_PROPERTIES, ['CollectiveId', 'HostCollectiveId']),
-        createdAt: { [Op.gte]: from, [Op.lt]: to },
-        type: TransactionTypes.CREDIT,
-        TransactionGroup: { [Op.in]: transactions.map(t => t.TransactionGroup) },
-        kind: TransactionKind.PLATFORM_TIP,
-      },
-      include: [
-        {
-          model: models.PaymentMethod,
-          as: 'PaymentMethod',
-          include: [{ model: models.PaymentMethod, as: 'sourcePaymentMethod' }],
-        },
-      ],
+    const pendingHostFeeShare = await getPendingHostFeeShare(this, {
+      startDate: from,
+      endDate: to,
+      collectiveIds,
     });
+    const settledHostFeeShare = hostFeeShare - pendingHostFeeShare;
 
-    const getTipAmountInHostCurrency = t => t.netAmountInCollectiveCurrency / (t.data?.hostToPlatformFxRate || 1);
-    const platformTips = Math.round(sumBy(tipsTransactions, getTipAmountInHostCurrency));
-    const pendingPlatformTips = Math.round(
-      sumByWhen(tipsTransactions, getTipAmountInHostCurrency, isPendingTransaction),
-    );
+    const totalMoneyManaged = await this.getTotalMoneyManaged({ endDate: to, collectiveIds });
 
-    const totalMoneyManaged = await this.getTotalMoneyManaged({ endDate: to });
+    const platformTips = await getPlatformTips(this, { startDate: from, endDate: to, collectiveIds });
+    const pendingPlatformTips = await getPendingPlatformTips(this, { startDate: from, endDate: to, collectiveIds });
+
+    // We don't support platform fees anymore
+    const platformFees = 0;
+    const pendingPlatformFees = 0;
 
     const metrics = {
       hostFees,
@@ -3029,14 +3082,10 @@ function defineModel() {
       pendingPlatformTips,
       hostFeeShare,
       pendingHostFeeShare,
+      settledHostFeeShare,
       hostFeeSharePercent,
       totalMoneyManaged,
     };
-
-    if (returnTransactions) {
-      metrics.transactions = transactions;
-      metrics.tipsTransactions = tipsTransactions;
-    }
 
     return metrics;
   };
@@ -3107,12 +3156,15 @@ function defineModel() {
   };
 
   /*
-   * If there is a username suggested, we'll check that it's valid or increase it's count
-   * Otherwise, we'll suggest something.
+   * Generates best unique slug by checking a base slug and adding a count if it is reserved/non-unique.
+   * If multiple suggestions are provided, the first non-null suggestion is used as the base.
+   *
+   * @param [array] suggestions Array of suggested base slugs in order of priority.
    */
   Collective.generateSlug = (suggestions, useSlugify = true) => {
     /*
-     * Checks a given slug in a list and if found, increments count and recursively checks again
+     * Checks a given slug against existing and reserved slugs. Increments count if non-unique/reserved and
+     * recursively checks again until acceptable slug is found.
      */
     const slugSuggestionHelper = (slugToCheck, slugList, count) => {
       const slug = count > 0 ? `${slugToCheck}${count}` : slugToCheck;
@@ -3124,20 +3176,21 @@ function defineModel() {
     };
 
     suggestions = suggestions.filter(slug => (slug ? true : false)); // filter out any nulls
+    let baseSlug = suggestions[0]; // Use the first non-null suggestion as the base
 
     if (useSlugify) {
-      suggestions = suggestions.map(slug => slugify(slug)); // Will also trim, lowercase and remove + signs
+      baseSlug = slugify(baseSlug); // Will also trim, lowercase and remove + signs
     }
 
-    // fetch any matching slugs or slugs for the top choice in the list above
+    // fetch any existing slugs which match or start with baseSlug. Used as list for helper function.
     return models.Collective.findAll({
       attributes: ['slug'],
-      where: { slug: { [Op.startsWith]: suggestions[0] } },
+      where: { slug: { [Op.startsWith]: baseSlug } },
       paranoid: false,
       raw: true,
     })
       .then(userObjectList => userObjectList.map(user => user.slug))
-      .then(slugList => slugSuggestionHelper(suggestions[0], slugList, 0));
+      .then(slugList => slugSuggestionHelper(baseSlug, slugList, 0));
   };
 
   Collective.findBySlug = (slug, options = {}, throwIfMissing = true) => {

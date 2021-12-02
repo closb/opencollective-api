@@ -1,10 +1,10 @@
 // We often use `utils.data` (ie. utils.data('collective1')) in the code to generate test
 // data. This approach is enough in certain cases but it has flows:
-// - Collectives with unique colomns (slugs) cannot be created without reseting the DB
+// - Collectives with unique columns (slugs) cannot be created without resetting the DB
 // - No randomness in produced values
 //
 // This lib is a superset of `utils.data` that generates values that are random and safe
-// to use in loops and repeted tests.
+// to use in loops and repeated tests.
 
 import { get, padStart, sample } from 'lodash';
 import { v4 as uuid } from 'uuid';
@@ -22,6 +22,11 @@ export const randStr = (prefix = '') => `${prefix}${uuid().split('-')[0]}`;
 export const randNumber = (min = 0, max = 10000000) => Math.floor(Math.random() * max) + min;
 export const randAmount = (min = 100, max = 10000000) => randNumber(min, max);
 export const multiple = (fn, n, args) => Promise.all([...Array(n).keys()].map(() => fn(args)));
+
+const randStrOfLength = length =>
+  Math.round(Math.pow(36, length + 1) - Math.random() * Math.pow(36, length))
+    .toString(36)
+    .slice(1);
 
 /** Generate an array containing between min and max item, filled with generateFunc */
 export const randArray = (generateFunc, min = 1, max = 1) => {
@@ -79,7 +84,7 @@ export const fakeHost = async hostData => {
 /**
  * Creates a fake collective. All params are optionals.
  */
-export const fakeCollective = async (collectiveData = {}) => {
+export const fakeCollective = async (collectiveData = {}, sequelizeParams = {}) => {
   const type = collectiveData.type || CollectiveType.COLLECTIVE;
   if (!collectiveData.CreatedByUserId) {
     collectiveData.CreatedByUserId = (await fakeUser()).id;
@@ -87,42 +92,52 @@ export const fakeCollective = async (collectiveData = {}) => {
   if (collectiveData.HostCollectiveId === undefined) {
     collectiveData.HostCollectiveId = (await fakeHost()).id;
   }
-  const collective = await models.Collective.create({
-    type,
-    name: collectiveData.isHostAccount ? randStr('Test Host ') : randStr('Test Collective '),
-    slug: collectiveData.isHostAccount ? randStr('host-') : randStr('collective-'),
-    description: randStr('Description '),
-    currency: 'USD',
-    twitterHandle: randStr('twitter'),
-    website: randUrl(),
-    hostFeePercent: 10,
-    tags: [randStr(), randStr()],
-    isActive: true,
-    approvedAt: collectiveData.HostCollectiveId ? new Date() : null,
-    ...collectiveData,
-  });
+  const collective = await models.Collective.create(
+    {
+      type,
+      name: collectiveData.isHostAccount ? randStr('Test Host ') : randStr('Test Collective '),
+      slug: collectiveData.isHostAccount ? randStr('host-') : randStr('collective-'),
+      description: randStr('Description '),
+      currency: 'USD',
+      twitterHandle: randStr('twitter'),
+      website: randUrl(),
+      hostFeePercent: 10,
+      tags: [randStr(), randStr()],
+      isActive: true,
+      approvedAt: collectiveData.HostCollectiveId ? new Date() : null,
+      ...collectiveData,
+    },
+    sequelizeParams,
+  );
 
   collective.host = collective.HostCollectiveId && (await models.Collective.findByPk(collective.HostCollectiveId));
   if (collective.host) {
     try {
-      await models.Member.create({
-        CollectiveId: collective.id,
-        MemberCollectiveId: collective.host.id,
-        role: roles.HOST,
-        CreatedByUserId: collective.CreatedByUserId,
-      });
+      await models.Member.create(
+        {
+          CollectiveId: collective.id,
+          MemberCollectiveId: collective.host.id,
+          role: roles.HOST,
+          CreatedByUserId: collective.CreatedByUserId,
+        },
+        sequelizeParams,
+      );
     } catch {
       // Ignore if host is already linked
     }
   }
   if (collectiveData.admin) {
     try {
-      await models.Member.create({
-        CollectiveId: collective.id,
-        MemberCollectiveId: collectiveData.admin.id,
-        role: roles.ADMIN,
-        CreatedByUserId: collectiveData.admin.CreatedByUserId,
-      });
+      const isUser = collectiveData.admin instanceof models.User;
+      await models.Member.create(
+        {
+          CollectiveId: collective.id,
+          MemberCollectiveId: isUser ? collectiveData.admin.CollectiveId : collectiveData.admin.id,
+          role: roles.ADMIN,
+          CreatedByUserId: isUser ? collectiveData.admin.id : collectiveData.admin.CreatedByUserId,
+        },
+        sequelizeParams,
+      );
     } catch {
       // Ignore if host is already linked
     }
@@ -160,16 +175,19 @@ export const fakeEvent = async (collectiveData = {}) => {
 /**
  * Creates a fake update. All params are optionals.
  */
-export const fakeUpdate = async (updateData = {}) => {
-  const update = await models.Update.create({
-    slug: randStr('update-'),
-    title: randStr('Update '),
-    html: '<div><strong>Hello</strong> Test!</div>',
-    ...updateData,
-    FromCollectiveId: updateData.FromCollectiveId || (await fakeCollective()).id,
-    CollectiveId: updateData.CollectiveId || (await fakeCollective()).id,
-    CreatedByUserId: updateData.CreatedByUserId || (await fakeUser()).id,
-  });
+export const fakeUpdate = async (updateData = {}, sequelizeParams = {}) => {
+  const update = await models.Update.create(
+    {
+      slug: randStr('update-'),
+      title: randStr('Update '),
+      html: '<div><strong>Hello</strong> Test!</div>',
+      ...updateData,
+      FromCollectiveId: updateData.FromCollectiveId || (await fakeCollective()).id,
+      CollectiveId: updateData.CollectiveId || (await fakeCollective()).id,
+      CreatedByUserId: updateData.CreatedByUserId || (await fakeUser()).id,
+    },
+    sequelizeParams,
+  );
 
   update.collective = await models.Collective.findByPk(update.CollectiveId);
   update.fromCollective = await models.Collective.findByPk(update.FromCollectiveId);
@@ -275,17 +293,17 @@ export const fakeExpense = async (expenseData = {}) => {
 /**
  * Creates a fake comment. All params are optionals.
  */
-export const fakeComment = async commentData => {
+export const fakeComment = async (commentData = {}, sequelizeParams = {}) => {
   let FromCollectiveId = get(commentData, 'FromCollectiveId') || get(commentData, 'fromCollective.id');
   let CollectiveId = get(commentData, 'CollectiveId') || get(commentData, 'collective.id');
   let CreatedByUserId = get(commentData, 'CreatedByUserId') || get(commentData, 'createdByUser.id');
   let ExpenseId = get(commentData, 'ExpenseId') || get(commentData, 'expense.id');
   const ConversationId = get(commentData, 'ConversationId') || get(commentData, 'conversation.id');
   if (!FromCollectiveId) {
-    FromCollectiveId = (await fakeCollective()).id;
+    FromCollectiveId = (await fakeCollective({}, sequelizeParams)).id;
   }
   if (!CollectiveId) {
-    CollectiveId = (await fakeCollective()).id;
+    CollectiveId = (await fakeCollective({}, sequelizeParams)).id;
   }
   if (!CreatedByUserId) {
     CreatedByUserId = (await fakeUser()).id;
@@ -294,46 +312,63 @@ export const fakeComment = async commentData => {
     ExpenseId = (await fakeExpense()).id;
   }
 
-  return models.Comment.create({
-    html: '<div><strong>Hello</strong> Test comment!</div>',
-    ...commentData,
-    FromCollectiveId,
-    CollectiveId,
-    CreatedByUserId,
-    ExpenseId,
-    ConversationId,
-  });
+  return models.Comment.create(
+    {
+      html: '<div><strong>Hello</strong> Test comment!</div>',
+      ...commentData,
+      FromCollectiveId,
+      CollectiveId,
+      CreatedByUserId,
+      ExpenseId,
+      ConversationId,
+    },
+    sequelizeParams,
+  );
 };
 
 /**
  * Creates a fake comment reaction. All params are optionals.
  */
-export const fakeCommentReaction = async (reactionData = {}) => {
+export const fakeEmojiReaction = async (reactionData = {}, opts = {}) => {
   const UserId = reactionData.UserId || (await fakeUser()).id;
   const user = await models.User.findByPk(UserId);
   const FromCollectiveId = reactionData.FromCollectiveId || (await models.Collective.findByPk(user.CollectiveId)).id;
-  const ConversationId = (await fakeConversation()).id;
-  const CommentId = reactionData.CommentId || (await fakeComment({ ConversationId })).id;
-  return models.CommentReaction.create({
-    UserId,
-    FromCollectiveId,
-    CommentId,
-    emoji: sample(REACTION_EMOJI),
-  });
+  if (opts.isComment) {
+    const ConversationId = (await fakeConversation()).id;
+    const CommentId = reactionData.CommentId || (await fakeComment({ ConversationId })).id;
+    return models.EmojiReaction.create({
+      UserId,
+      FromCollectiveId,
+      CommentId,
+      emoji: sample(REACTION_EMOJI),
+    });
+  } else {
+    const CollectiveId = (await fakeCollective()).id;
+    const UpdateId = reactionData.UpdateId || (await fakeUpdate({ CollectiveId })).id;
+    return models.EmojiReaction.create({
+      UserId,
+      FromCollectiveId,
+      UpdateId,
+      emoji: sample(REACTION_EMOJI),
+    });
+  }
 };
 
-export const fakeConversation = async (conversationData = {}) => {
-  const RootCommentId = conversationData.RootCommentId || (await fakeComment()).id;
+export const fakeConversation = async (conversationData = {}, sequelizeParams) => {
+  const RootCommentId = conversationData.RootCommentId || (await fakeComment({}, sequelizeParams)).id;
   const rootComment = await models.Comment.findByPk(RootCommentId);
-  return models.Conversation.create({
-    title: randStr('Update '),
-    summary: rootComment.html,
-    FromCollectiveId: conversationData.FromCollectiveId || (await fakeCollective()).id,
-    CollectiveId: conversationData.CollectiveId || (await fakeCollective()).id,
-    CreatedByUserId: conversationData.CreatedByUserId || (await fakeUser()).id,
-    RootCommentId: conversationData.RootCommentId || (await fakeComment()).id,
-    ...conversationData,
-  });
+  return models.Conversation.create(
+    {
+      title: randStr('Update '),
+      summary: rootComment.html,
+      FromCollectiveId: conversationData.FromCollectiveId || (await fakeCollective()).id,
+      CollectiveId: conversationData.CollectiveId || (await fakeCollective()).id,
+      CreatedByUserId: conversationData.CreatedByUserId || (await fakeUser()).id,
+      RootCommentId: conversationData.RootCommentId || (await fakeComment()).id,
+      ...conversationData,
+    },
+    sequelizeParams,
+  );
 };
 
 /**
@@ -444,6 +479,9 @@ export const fakeNotification = async (data = {}) => {
   });
 };
 
+/**
+ * Pass `hooks: false` to `sequelizeParams` to prevent triggering a notification.
+ */
 export const fakeActivity = async (data = {}, sequelizeParams) => {
   return models.Activity.create(
     {
@@ -459,15 +497,18 @@ export const fakeActivity = async (data = {}, sequelizeParams) => {
 /**
  * Creates a fake connectedAccount. All params are optionals.
  */
-export const fakeConnectedAccount = async (connectedAccountData = {}) => {
-  const CollectiveId = connectedAccountData.CollectiveId || (await fakeCollective()).id;
+export const fakeConnectedAccount = async (connectedAccountData = {}, sequelizeParams = {}) => {
+  const CollectiveId = connectedAccountData.CollectiveId || (await fakeCollective({}, sequelizeParams)).id;
   const service = sample(['github', 'twitter', 'stripe', 'transferwise']);
 
-  return models.ConnectedAccount.create({
-    service,
-    ...connectedAccountData,
-    CollectiveId,
-  });
+  return models.ConnectedAccount.create(
+    {
+      service,
+      ...connectedAccountData,
+      CollectiveId,
+    },
+    sequelizeParams,
+  );
 };
 
 /**
@@ -482,25 +523,30 @@ export const fakeTransaction = async (
   const FromCollectiveId = transactionData.FromCollectiveId || (await fakeCollective()).id;
   const CollectiveId = transactionData.CollectiveId || (await fakeCollective()).id;
   const createMethod = createDoubleEntry ? 'createDoubleEntry' : 'create';
-  const transaction = await models.Transaction[createMethod]({
-    type: amount < 0 ? 'DEBIT' : 'CREDIT',
-    currency: 'USD',
-    hostCurrency: 'USD',
-    hostCurrencyFxRate: 1,
-    netAmountInCollectiveCurrency: amount,
-    amountInHostCurrency: amount,
-    TransactionGroup: uuid(),
-    kind: transactionData.ExpenseId ? TransactionKind.EXPENSE : null,
-    isDebt: Boolean(settlementStatus),
-    hostFeeInHostCurrency: 0,
-    platformFeeInHostCurrency: 0,
-    paymentProcessorFeeInHostCurrency: 0,
-    ...transactionData,
-    amount,
-    CreatedByUserId,
-    FromCollectiveId,
-    CollectiveId,
-  });
+  const transaction = await models.Transaction[createMethod](
+    {
+      type: amount < 0 ? 'DEBIT' : 'CREDIT',
+      currency: transactionData.currency || 'USD',
+      hostCurrency: transactionData.hostCurrency || 'USD',
+      hostCurrencyFxRate: 1,
+      netAmountInCollectiveCurrency: amount,
+      amountInHostCurrency: amount,
+      TransactionGroup: uuid(),
+      kind: transactionData.ExpenseId ? TransactionKind.EXPENSE : null,
+      isDebt: Boolean(settlementStatus),
+      hostFeeInHostCurrency: 0,
+      platformFeeInHostCurrency: 0,
+      paymentProcessorFeeInHostCurrency: 0,
+      ...transactionData,
+      amount,
+      CreatedByUserId,
+      FromCollectiveId,
+      CollectiveId,
+    },
+    // In the context of tests, we disable hooks because they can conflict with SQL transactions
+    // E.g.: afterCreate: transaction => Transaction.createActivity(transaction)
+    { hooks: false },
+  );
 
   if (settlementStatus) {
     await models.TransactionSettlement.create({
@@ -529,15 +575,26 @@ export const fakeMember = async data => {
   });
 };
 
+const fakePaymentMethodToken = (service, type) => {
+  if (service === 'stripe' && type === 'creditcard') {
+    return `pm_${randStrOfLength(24)}`;
+  } else {
+    return randStr();
+  }
+};
+
 /**
  * Creates a fake Payment Method. All params are optionals.
  */
 export const fakePaymentMethod = async data => {
+  const service = data.service || sample(PAYMENT_METHOD_SERVICES);
+  const type = data.type || sample(PAYMENT_METHOD_TYPES);
+  const token = data.token || fakePaymentMethodToken(service, type);
   return models.PaymentMethod.create({
-    token: randStr(),
     ...data,
-    type: data.type || sample(PAYMENT_METHOD_TYPES),
-    service: data.service || sample(PAYMENT_METHOD_SERVICES),
+    type,
+    service,
+    token,
     CollectiveId: data.CollectiveId || (await fakeCollective().then(c => c.id)),
     currency: data.currency || 'USD',
   });
@@ -607,5 +664,20 @@ export const fakePaypalPlan = async (data = {}) => {
     id: randStr('PaypalPlan-'),
     ...data,
     ProductId: product.id,
+  });
+};
+
+export const fakeApplication = async (data = {}) => {
+  const CollectiveId = data.CollectiveId || (await fakeCollective()).id;
+  return models.Application.create({
+    type: sample(['apiKey', 'oAuth']),
+    apiKey: randStr('ApiKey-'),
+    clientId: randStr('Client-'),
+    clientSecret: randStr('Secret-'),
+    callbackUrl: randUrl(),
+    name: randStr('Name '),
+    description: randStr('Description '),
+    ...data,
+    CollectiveId,
   });
 };

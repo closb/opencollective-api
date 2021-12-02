@@ -1,6 +1,7 @@
 import {
   GraphQLBoolean,
   GraphQLEnumType,
+  GraphQLFloat,
   GraphQLInt,
   GraphQLInterfaceType,
   GraphQLList,
@@ -21,10 +22,12 @@ import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE } from '../../constants/pay
 import roles from '../../constants/roles';
 import { getContributorsForCollective } from '../../lib/contributors';
 import queries from '../../lib/queries';
+import { canSeeLegalName } from '../../lib/user-permissions';
 import models, { Op } from '../../models';
 import { hostResolver } from '../common/collective';
 import { getContextPermission, PERMISSION_TYPE } from '../common/context-permissions';
 import { getFeatureStatusResolver } from '../common/features';
+import { getIdEncodeResolver, IDENTIFIER_TYPES } from '../v2/identifiers';
 
 import { ApplicationType } from './Application';
 import { TransactionInterfaceType } from './TransactionInterface';
@@ -246,7 +249,7 @@ export const CollectivesStatsType = new GraphQLObjectType({
 export const PlanType = new GraphQLObjectType({
   name: 'PlanType',
   description: 'The name of the current plan and its characteristics.',
-  fields: {
+  fields: () => ({
     // We always have to return an id for apollo's caching
     id: {
       type: GraphQLInt,
@@ -296,7 +299,7 @@ export const PlanType = new GraphQLObjectType({
     platformTips: {
       type: GraphQLBoolean,
     },
-  },
+  }),
 });
 
 export const ExpensesStatsType = new GraphQLObjectType({
@@ -603,6 +606,7 @@ export const CollectiveInterfaceType = new GraphQLInterfaceType({
       type: { type: GraphQLString },
       isActive: { type: GraphQLBoolean },
       name: { type: GraphQLString },
+      legalName: { type: GraphQLString },
       company: { type: GraphQLString },
       description: { type: GraphQLString },
       longDescription: { type: GraphQLString },
@@ -620,7 +624,7 @@ export const CollectiveInterfaceType = new GraphQLInterfaceType({
       startsAt: { type: DateString },
       endsAt: { type: DateString },
       timezone: { type: GraphQLString },
-      hostFeePercent: { type: GraphQLInt },
+      hostFeePercent: { type: GraphQLFloat },
       platformFeePercent: { type: GraphQLInt },
       currency: { type: GraphQLString },
       image: { type: GraphQLString },
@@ -667,7 +671,7 @@ export const CollectiveInterfaceType = new GraphQLInterfaceType({
       isArchived: { type: GraphQLBoolean },
       isApproved: { type: GraphQLBoolean },
       isDeletable: { type: GraphQLBoolean },
-      hasVirtualCards: { type: GraphQLBoolean },
+      hasVirtualCards: { type: GraphQLBoolean, deprecationReason: '2021-10-12: Use features.VIRTUAL_CARDS === ACTIVE' },
       host: { type: CollectiveInterfaceType },
       hostCollective: { type: CollectiveInterfaceType },
       members: {
@@ -841,7 +845,7 @@ export const CollectiveInterfaceType = new GraphQLInterfaceType({
             description: 'Only return confirmed payment methods',
             defaultValue: true,
           },
-          types: {
+          type: {
             type: new GraphQLList(GraphQLString),
             description: 'Filter on given types  (creditcard, giftcard, etc.)',
           },
@@ -915,14 +919,19 @@ const CollectiveFields = () => {
     },
     createdByUser: {
       type: UserType,
-      resolve(collective, args, req) {
-        if (
-          collective.isIncognito &&
-          !getContextPermission(req, PERMISSION_TYPE.SEE_INCOGNITO_ACCOUNT_DETAILS, collective.id)
-        ) {
+      async resolve(collective, args, req) {
+        // Vendors don't have a `createdByUser`
+        if (!collective.CreatedByUserId) {
+          return null;
+        }
+
+        // If the profile is incognito, remoteUser must be allowed to see its `createdByUser`
+        const user = await req.loaders.User.byId.load(collective.CreatedByUserId);
+        if (user && (!collective.isIncognito || (await req.loaders.User.canSeeUserPrivateInfo.load(user)))) {
+          return user;
+        } else {
           return {};
         }
-        return models.User.findByPk(collective.CreatedByUserId);
       },
     },
     parentCollective: {
@@ -947,6 +956,19 @@ const CollectiveFields = () => {
       type: GraphQLString,
       resolve(collective) {
         return collective.name;
+      },
+    },
+    legalName: {
+      type: GraphQLString,
+      resolve(collective, _, req) {
+        if (
+          canSeeLegalName(req.remoteUser, collective) ||
+          getContextPermission(req, PERMISSION_TYPE.SEE_ACCOUNT_LEGAL_NAME, collective.id)
+        ) {
+          return collective.legalName;
+        } else {
+          return null;
+        }
       },
     },
     company: {
@@ -1027,7 +1049,7 @@ const CollectiveFields = () => {
       },
     },
     hostFeePercent: {
-      type: GraphQLInt,
+      type: GraphQLFloat,
       resolve(collective) {
         return collective.hostFeePercent;
       },
@@ -1664,13 +1686,7 @@ const CollectiveFields = () => {
         },
       },
       resolve(collective, args) {
-        const query = {
-          where: { type: 'EVENT', ParentCollectiveId: collective.id },
-          order: [
-            ['startsAt', 'DESC'],
-            ['endsAt', 'DESC'],
-          ],
-        };
+        const query = { where: {} };
 
         if (args.limit) {
           query.limit = args.limit;
@@ -1702,7 +1718,7 @@ const CollectiveFields = () => {
           };
         }
 
-        return models.Collective.findAll(query);
+        return collective.getEvents(args);
       },
     },
     projects: {
@@ -1712,22 +1728,7 @@ const CollectiveFields = () => {
         offset: { type: GraphQLInt },
       },
       resolve(collective, args) {
-        const query = {
-          where: { type: 'PROJECT', ParentCollectiveId: collective.id },
-          order: [
-            ['startsAt', 'DESC'],
-            ['endsAt', 'DESC'],
-          ],
-        };
-
-        if (args.limit) {
-          query.limit = args.limit;
-        }
-        if (args.offset) {
-          query.offset = args.offset;
-        }
-
-        return models.Collective.findAll(query);
+        return collective.getProjects(args);
       },
     },
     paymentMethods: {
@@ -1737,7 +1738,7 @@ const CollectiveFields = () => {
         limit: { type: GraphQLInt },
         hasBalanceAboveZero: { type: GraphQLBoolean },
         isConfirmed: { type: GraphQLBoolean, defaultValue: true },
-        types: { type: new GraphQLList(GraphQLString) },
+        type: { type: new GraphQLList(GraphQLString) },
         orderBy: {
           type: PaymentMethodOrderFieldType,
           defaultValue: 'type',
@@ -1767,10 +1768,10 @@ const CollectiveFields = () => {
         paymentMethods = paymentMethods.filter(pm => !(pm.data && pm.data.hidden));
 
         if (args.service) {
-          paymentMethods = paymentMethods.filter(pm => pm.service === args.service);
+          paymentMethods = paymentMethods.filter(pm => pm.service === args.service.toLowerCase());
         }
-        if (args.types) {
-          paymentMethods = paymentMethods.filter(pm => args.types.includes(pm.type));
+        if (args.type) {
+          paymentMethods = paymentMethods.filter(pm => args.type.map(t => t.toLowerCase()).includes(pm.type));
         }
         if (args.isConfirmed !== undefined) {
           paymentMethods = paymentMethods.filter(pm => pm.isConfirmed() === args.isConfirmed);
@@ -1844,7 +1845,7 @@ const CollectiveFields = () => {
         const offset = args.offset || 0;
         const limit = args.limit || 15;
         const query = {
-          where: { type: PAYMENT_METHOD_TYPE.GIFT_CARD, service: PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE },
+          where: { type: PAYMENT_METHOD_TYPE.GIFTCARD, service: PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE },
           limit: args.limit,
           offset: args.offset,
           order: [
@@ -1917,6 +1918,7 @@ const CollectiveFields = () => {
     },
     hasVirtualCards: {
       type: new GraphQLNonNull(GraphQLBoolean),
+      deprecationReason: '2021-10-12: Use features.VIRTUAL_CARDS === ACTIVE',
       resolve(collective) {
         return models.VirtualCard.count({ where: { CollectiveId: collective.id } });
       },
@@ -1944,9 +1946,14 @@ export const CollectiveFeatureStatus = new GraphQLEnumType({
 
 export const CollectiveFeatures = new GraphQLObjectType({
   name: 'CollectiveFeatures',
-  description: 'Describes the features enabled and available for this collective',
+  description: 'Describes the features enabled and available for this account',
   fields: () => {
     return {
+      id: {
+        type: new GraphQLNonNull(GraphQLString),
+        description: 'The id of the account',
+        resolve: getIdEncodeResolver(IDENTIFIER_TYPES.ACCOUNT),
+      },
       ...FeaturesFields(),
     };
   },
@@ -1969,35 +1976,30 @@ export const UserCollectiveType = new GraphQLObjectType({
       firstName: {
         type: GraphQLString,
         deprecationReason: '2020-03-27: These field are now deprecated in favor of collective.name',
-        resolve(userCollective, args, req) {
-          return (
-            userCollective && req.loaders.getUserDetailsByCollectiveId.load(userCollective.id).then(u => u.firstName)
-          );
+        resolve() {
+          return null;
         },
       },
       lastName: {
         type: GraphQLString,
         deprecationReason: '2020-03-27: These field are now deprecated in favor of collective.name',
-        resolve(userCollective, args, req) {
-          return (
-            userCollective && req.loaders.getUserDetailsByCollectiveId.load(userCollective.id).then(u => u.lastName)
-          );
+        resolve() {
+          return null;
         },
       },
       email: {
         type: GraphQLString,
-        resolve(userCollective, args, req) {
+        async resolve(userCollective, args, req) {
           if (!req.remoteUser) {
             return null;
-          } else if (userCollective.isIncognito) {
-            if (getContextPermission(req, PERMISSION_TYPE.SEE_INCOGNITO_ACCOUNT_DETAILS, userCollective.id)) {
-              return req.loaders.User.byId.load(userCollective.CreatedByUserId).then(u => u.email);
-            }
           } else {
-            return (
-              userCollective &&
-              req.loaders.getUserDetailsByCollectiveId.load(userCollective.id).then(user => user.email)
-            );
+            const user = await (userCollective.isIncognito
+              ? req.loaders.User.byId.load(userCollective.CreatedByUserId) // TODO: Should rely on Member
+              : req.loaders.User.byCollectiveId.load(userCollective.id));
+
+            if (user && (await req.loaders.User.canSeeUserPrivateInfo.load(user))) {
+              return user.email;
+            }
           }
         },
       },

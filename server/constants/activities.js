@@ -32,6 +32,7 @@ export default {
   COLLECTIVE_UPDATE_PUBLISHED: 'collective.update.published',
   COLLECTIVE_CONTACT: 'collective.contact',
   COLLECTIVE_VIRTUAL_CARD_ASSIGNED: 'collective.virtualcard.assigned',
+  COLLECTIVE_VIRTUAL_CARD_CREATED: 'collective.virtualcard.created',
   ORGANIZATION_COLLECTIVE_CREATED: 'organization.collective.created',
   SUBSCRIPTION_ACTIVATED: 'subscription.activated',
   SUBSCRIPTION_CONFIRMED: 'subscription.confirmed',
@@ -43,12 +44,13 @@ export default {
   COLLECTIVE_MONTHLY: 'collective.monthly',
   ORDERS_SUSPICIOUS: 'orders.suspicious',
   BACKYOURSTACK_DISPATCH_CONFIRMED: 'backyourstack.dispatch.confirmed',
-  ADDED_FUND_TO_ORG: 'added.fund.to.org',
   ACTIVATED_COLLECTIVE_AS_HOST: 'activated.collective.as.host',
+  ACTIVATED_COLLECTIVE_AS_INDEPENDENT: 'activated.collective.as.independent',
   DEACTIVATED_COLLECTIVE_AS_HOST: 'deactivated.collective.as.host',
   VIRTUAL_CARD_REQUESTED: 'virtual_card.requested',
 
   // Not used anymore, leaving for historical reference
+  ADDED_FUND_TO_ORG: 'added.fund.to.org',
   COLLECTIVE_TRANSACTION_PAID: 'collective.transaction.paid', // replaced with COLLECTIVE_EXPENSE_PAID
   COLLECTIVE_USER_ADDED: 'collective.user.added',
 };

@@ -5,7 +5,7 @@ import { TransactionKind } from '../constants/transaction-kind';
 import models from '../models';
 
 export function isPrepaidBudgetOrder(order) {
-  return order.tier && order.tier.slug == 'prepaid-budget' && order.collective.slug === 'opensource';
+  return order.tier && order.tier.slug === 'prepaid-budget' && order.collective.slug === 'opensource';
 }
 
 export async function createPrepaidPaymentMethod(originalCreditTransaction) {
@@ -15,6 +15,7 @@ export async function createPrepaidPaymentMethod(originalCreditTransaction) {
     originalCreditTransaction.platformFeeInHostCurrency +
     originalCreditTransaction.paymentProcessorFeeInHostCurrency;
 
+  // Credit Prepaid Budget to the profile
   const paymentMethodTransaction = {
     ...pick(originalCreditTransaction, ['currency', 'hostCurrency', 'CreatedByUserId']),
     description: 'Prepaid Budget',
@@ -38,6 +39,6 @@ export async function createPrepaidPaymentMethod(originalCreditTransaction) {
     service: 'opencollective',
     type: 'prepaid',
     uuid: uuid(),
-    data: { HostCollectiveId: originalCreditTransaction.HostCollectiveId },
+    data: { HostCollectiveId: originalCreditTransaction.HostCollectiveId, hostFeePercent: 0 },
   });
 }

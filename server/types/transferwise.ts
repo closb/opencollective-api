@@ -21,6 +21,7 @@ export type Quote = {
 
 export type QuoteV2PaymentOption = {
   disabled: boolean;
+  disabledReason?: { message: string };
   estimatedDelivery: string;
   formattedEstimatedDelivery: string;
   estimatedDeliveryDelays: [];
@@ -302,3 +303,13 @@ export type Webhook = {
 };
 
 export type WebhookCreateInput = Pick<Webhook, 'name' | 'delivery' | 'trigger_on'>;
+
+export type BatchGroup = {
+  id: string;
+  version: number;
+  name: string;
+  sourceCurrency: string;
+  status: 'NEW' | 'COMPLETED' | 'MARKED_FOR_CANCELLATION' | 'PROCESSING_CANCEL' | 'CANCELLED';
+  transferIds: Array<number>;
+  payInDetails?: Array<Record<string, any>>;
+};

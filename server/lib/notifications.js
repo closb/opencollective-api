@@ -3,17 +3,21 @@ import Promise from 'bluebird';
 import config from 'config';
 import debugLib from 'debug';
 import { get, remove } from 'lodash';
+import sanitizeHtml from 'sanitize-html';
 
 import { activities, channels } from '../constants';
 import activityType from '../constants/activities';
+import { TransactionKind } from '../constants/transaction-kind';
+import { TransactionTypes } from '../constants/transactions';
 import activitiesLib from '../lib/activities';
 import emailLib, { NO_REPLY_EMAIL } from '../lib/email';
 import models from '../models';
+import { sanitizerOptions as updateSanitizerOptions } from '../models/Update';
 
 import { getTransactionPdf } from './pdf';
 import slackLib from './slack';
 import twitter from './twitter';
-import { toIsoDateStr } from './utils';
+import { parseToBoolean, toIsoDateStr } from './utils';
 import { enrichActivity, sanitizeActivity } from './webhooks';
 
 const debug = debugLib('notifications');
@@ -23,6 +27,10 @@ export default async activity => {
 
   // process notification entries for slack, twitter, gitter
   if (!activity.CollectiveId || !activity.type) {
+    return;
+  }
+
+  if (shouldSkipActivity(activity)) {
     return;
   }
 
@@ -60,6 +68,18 @@ export default async activity => {
     );
   });
 };
+
+function shouldSkipActivity(activity) {
+  if (activity.type === activityType.COLLECTIVE_TRANSACTION_CREATED) {
+    if (parseToBoolean(config.activities?.skipTransactions)) {
+      return true;
+    } else if (!['CONTRIBUTION', 'ADDED_FUNDS'].includes(activity.data?.transaction?.kind)) {
+      return true;
+    }
+  }
+
+  return false;
+}
 
 function publishToGitter(activity, notifConfig) {
   const { message } = activitiesLib.formatMessageForPublicChannel(activity, 'markdown');
@@ -131,7 +151,7 @@ async function notifyUserId(UserId, activity, options = {}) {
     options.attachments = [{ filename: `${event.slug}.ics`, content: ics }];
 
     const transaction = await models.Transaction.findOne({
-      where: { OrderId: activity.data.order.id, type: 'CREDIT' },
+      where: { OrderId: activity.data.order.id, type: TransactionTypes.CREDIT, kind: TransactionKind.CONTRIBUTION },
     });
 
     if (transaction) {
@@ -206,6 +226,9 @@ export async function notifyConversationFollowers(conversation, activity, option
 }
 
 const notifyUpdateSubscribers = async activity => {
+  if (activity.data.update?.isChangelog) {
+    return;
+  }
   const collective = await models.Collective.findByPk(activity.data.collective.id);
   activity.data.fromCollective = (await models.Collective.findByPk(activity.data.fromCollective.id))?.info;
   activity.data.collective = collective.info;
@@ -215,8 +238,73 @@ const notifyUpdateSubscribers = async activity => {
   const emailOpts = { from: activity.data.fromEmail };
   const update = await models.Update.findByPk(activity.data.update.id);
   const allUsers = await update.getUsersToNotify();
-  return notifySubscribers(allUsers, activity, emailOpts);
+  const modifiedActivity = replaceVideosByImagePreviews(activity);
+  return notifySubscribers(allUsers, modifiedActivity, emailOpts);
 };
+
+function replaceVideosByImagePreviews(activity) {
+  const sanitizerOptions = {
+    ...updateSanitizerOptions,
+    transformTags: {
+      ...updateSanitizerOptions.transformTags,
+      iframe: (tagName, attribs) => {
+        if (!attribs.src) {
+          return '';
+        }
+        const { service, id } = parseServiceLink(attribs.src);
+        const imgSrc = constructPreviewImageURL(service, id);
+        if (imgSrc) {
+          return {
+            tagName: 'img',
+            attribs: {
+              src: imgSrc,
+              alt: `${service} content`,
+            },
+          };
+        } else {
+          return '';
+        }
+      },
+    },
+  };
+  activity.data.update.html = sanitizeHtml(activity.data.update.html, sanitizerOptions);
+  return activity;
+}
+
+function constructPreviewImageURL(service, id) {
+  if (service === 'youtube' && id.match('[a-zA-Z0-9_-]{11}')) {
+    return `https://img.youtube.com/vi/${id}/0.jpg`;
+  } else if (service === 'anchorFm') {
+    return `https://opencollective.com/static/images/anchor-fm-logo.png`;
+  } else {
+    return null;
+  }
+}
+
+function parseServiceLink(videoLink) {
+  const regexps = {
+    youtube: new RegExp(
+      '(?:https?://)?(?:www\\.)?youtu(?:\\.be/|be(-nocookie)?\\.com/\\S*(?:watch|embed)(?:(?:(?=/[^&\\s?]+(?!\\S))/)|(?:\\S*v=|v/)))([^&\\s?]+)',
+      'i',
+    ),
+    anchorFm: /^(http|https)?:\/\/(www\.)?anchor\.fm\/([^/]+)(\/embed)?(\/episodes\/)?([^/]+)?\/?$/,
+  };
+  for (const service in regexps) {
+    videoLink = videoLink.replace('/?showinfo=0', '');
+    const matches = regexps[service].exec(videoLink);
+    if (matches) {
+      if (service === 'anchorFm') {
+        const podcastName = matches[3];
+        const episodeId = matches[6];
+        const podcastUrl = `${podcastName}/embed`;
+        return { service, id: episodeId ? `${podcastUrl}/episodes/${episodeId}` : podcastUrl };
+      } else {
+        return { service, id: matches[matches.length - 1] };
+      }
+    }
+  }
+  return {};
+}
 
 async function notifyByEmail(activity) {
   debug('notifyByEmail', activity.type);
@@ -436,6 +524,11 @@ async function notifyByEmail(activity) {
         break;
       }
 
+      // Disable for the-social-change-nest
+      if (get(activity, 'data.host.slug') === 'the-social-change-nest') {
+        break;
+      }
+
       // Normal case
       notifyAdminsOfCollective(activity.data.collective.id, activity);
       break;
@@ -456,15 +549,15 @@ async function notifyByEmail(activity) {
       });
       break;
 
-    case activityType.ADDED_FUND_TO_ORG:
-      notifyAdminsOfCollective(activity.data.collective.id, activity, {
-        template: 'added.fund.to.org',
-      });
-      break;
-
     case activityType.ACTIVATED_COLLECTIVE_AS_HOST:
       notifyAdminsOfCollective(activity.data.collective.id, activity, {
         template: 'activated.collective.as.host',
+      });
+      break;
+
+    case activityType.ACTIVATED_COLLECTIVE_AS_INDEPENDENT:
+      notifyAdminsOfCollective(activity.data.collective.id, activity, {
+        template: 'activated.collective.as.independent',
       });
       break;
 
@@ -477,7 +570,12 @@ async function notifyByEmail(activity) {
     case activityType.COLLECTIVE_EXPENSE_INVITE_DRAFTED:
       // New User
       if (activity.data.payee?.email) {
-        await emailLib.send(activity.type, activity.data.payee.email, activity.data, { sendEvenIfNotProduction: true });
+        const collectiveId = activity.data.user?.id; // TODO: It's confusing that we store a collective ID in `data.user.id`, should rather be a User id
+        const sender = collectiveId && (await models.User.findOne({ where: { CollectiveId: collectiveId } }));
+        await emailLib.send(activity.type, activity.data.payee.email, activity.data, {
+          sendEvenIfNotProduction: true,
+          replyTo: sender?.email,
+        });
       } else if (activity.data.payee.id) {
         await notifyAdminsOfCollective(activity.data.payee.id, activity, { sendEvenIfNotProduction: true });
       }

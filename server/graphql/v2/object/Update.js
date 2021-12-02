@@ -1,5 +1,6 @@
 import { GraphQLBoolean, GraphQLInt, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
 import { GraphQLDateTime } from 'graphql-iso-date';
+import { GraphQLJSON } from 'graphql-type-json';
 
 import { types as CollectiveType } from '../../../constants/collectives';
 import models from '../../../models';
@@ -55,6 +56,7 @@ const Update = new GraphQLObjectType({
         },
       },
       isPrivate: { type: new GraphQLNonNull(GraphQLBoolean) },
+      isChangelog: { type: new GraphQLNonNull(GraphQLBoolean) },
       title: { type: new GraphQLNonNull(GraphQLString) },
       createdAt: { type: new GraphQLNonNull(GraphQLDateTime) },
       updatedAt: { type: new GraphQLNonNull(GraphQLDateTime) },
@@ -137,12 +139,28 @@ const Update = new GraphQLObjectType({
           return req.loaders.Collective.byId.load(update.CollectiveId);
         },
       },
+      reactions: {
+        type: GraphQLJSON,
+        description: 'Returns a map of reactions counts for this update',
+        async resolve(update, args, req) {
+          return req.loaders.Update.reactionsByUpdateId.load(update.id);
+        },
+      },
+      userReactions: {
+        type: new GraphQLList(GraphQLString),
+        description: 'Returns the list of reactions added to this update by logged in user',
+        async resolve(update, args, req) {
+          if (req.remoteUser) {
+            return req.loaders.Update.remoteUserReactionsByUpdateId.load(update.id);
+          }
+        },
+      },
       comments: {
         type: CommentCollection,
         description: "List the comments for this update. Not backed by a loader, don't use this in lists.",
         args: {
-          limit: { type: GraphQLInt },
-          offset: { type: GraphQLInt },
+          limit: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 150 },
+          offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
         },
         async resolve(update, args, req) {
           if (!(await canSeeUpdateDetails(req, update))) {
