@@ -3,9 +3,11 @@ import '../../server/env';
 
 import config from 'config';
 import HelloWorks from 'helloworks-sdk';
+import { uniqBy } from 'lodash';
 import moment from 'moment';
 import pThrottle from 'p-throttle';
 
+import { reportErrorToSentry } from '../../server/lib/sentry';
 import { findAccountsThatNeedToBeSentTaxForm, sendHelloWorksUsTaxForm } from '../../server/lib/tax-forms';
 import { sequelize } from '../../server/models';
 
@@ -27,7 +29,19 @@ const throttle = pThrottle({ limit: MAX_REQUESTS_PER_SECOND, interval: ONE_SECON
 
 const init = async () => {
   console.log('>>>> Running tax form job');
-  const accounts = await findAccountsThatNeedToBeSentTaxForm(year);
+
+  // In January, we keep looking at tax forms for the previous year as they might have been missed because of the limit
+  let accountsFromLastYear = [];
+  if (moment().month() === 0) {
+    accountsFromLastYear = await findAccountsThatNeedToBeSentTaxForm(year - 1);
+    if (accountsFromLastYear.length > 0) {
+      console.log(`>> Found ${accountsFromLastYear.length} accounts from last year that still need their tax form`);
+    }
+  }
+
+  const accountsFromThisYear = await findAccountsThatNeedToBeSentTaxForm(year);
+  const allAccounts = uniqBy([...accountsFromLastYear, ...accountsFromThisYear], 'id'); // The order is important here, we want to prioritize accounts from last year
+
   const throttledFunc = throttle(account => {
     console.log(`>> Sending tax form to account: ${account.name} (@${account.slug})`);
     if (!process.env.DRY_RUN) {
@@ -35,12 +49,13 @@ const init = async () => {
     }
   });
 
-  return Promise.all(accounts.map(throttledFunc));
+  return Promise.all(allAccounts.map(throttledFunc));
 };
 
 init()
   .catch(error => {
     console.error(error);
+    reportErrorToSentry(error);
   })
   .finally(() => {
     sequelize.close();

@@ -27,7 +27,7 @@ export const createOrUpdate = async (req, res, next, accessToken, data) => {
       userCollective.locationName = userCollective.locationName || profile.location;
       userCollective.website = userCollective.website || profile.blog || profile.html_url;
       userCollective.image = userCollective.image || `https://avatars.githubusercontent.com/${data.profile.username}`;
-      userCollective.githubHandle = data.profile.username;
+      userCollective.repositoryUrl = `https://github.com/${data.profile.username}`;
 
       await userCollective.save();
 
@@ -50,7 +50,11 @@ export const createOrUpdate = async (req, res, next, accessToken, data) => {
 
       const token = req.remoteUser.generateConnectedAccountVerifiedToken(connectedAccount.id, data.profile.username);
       if (context === 'createCollective') {
-        res.redirect(`${config.host.website}/create/opensource?token=${token}`);
+        res.redirect(
+          `${config.host.website}/opensource/apply/pick-repo?token=${token}${
+            CollectiveId ? `&collectiveSlug=${CollectiveId}` : ''
+          }`,
+        );
       } else {
         res.redirect(`${config.host.website}/${userCollective.slug}/admin/connected-accounts`);
       }
@@ -175,9 +179,13 @@ export const fetchAllRepositories = async (req, res, next) => {
     req.setTimeout(GITHUB_REPOS_FETCH_TIMEOUT);
     let repos = await github.getAllUserPublicRepos(githubAccount.token);
     if (repos.length !== 0) {
-      repos = repos.filter(repo => {
-        return repo.stargazers_count >= config.githubFlow.minNbStars && repo.fork === false;
-      });
+      repos = repos
+        .filter(repo => {
+          return repo.fork === false;
+        })
+        .sort((a, b) => {
+          return b.stargazers_count - a.stargazers_count;
+        });
     }
     res.send(repos);
   } catch (e) {

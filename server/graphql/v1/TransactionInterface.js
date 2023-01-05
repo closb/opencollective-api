@@ -6,9 +6,11 @@ import {
   GraphQLObjectType,
   GraphQLString,
 } from 'graphql';
-import { get } from 'lodash';
+import { get, round } from 'lodash';
 
 import models from '../../models';
+import { getContextPermission, PERMISSION_TYPE } from '../common/context-permissions';
+import { TaxInfo } from '../v2/object/TaxInfo';
 
 import { CollectiveInterfaceType, UserCollectiveType } from './CollectiveInterface';
 import { DateString, ExpenseType, OrderType, PaymentMethodType, SubscriptionType, UserType } from './types';
@@ -19,9 +21,9 @@ export const TransactionInterfaceType = new GraphQLInterfaceType({
   resolveType: transaction => {
     switch (transaction.type) {
       case 'CREDIT':
-        return TransactionOrderType;
+        return 'Order';
       case 'DEBIT':
-        return TransactionExpenseType;
+        return 'Expense';
       default:
         return null;
     }
@@ -46,6 +48,9 @@ export const TransactionInterfaceType = new GraphQLInterfaceType({
           },
         },
       },
+      amountInHostCurrency: {
+        type: GraphQLInt,
+      },
       hostFeeInHostCurrency: {
         type: GraphQLInt,
         description: 'Fee kept by the host in the lowest unit of the currency of the host (ie. in cents)',
@@ -60,6 +65,7 @@ export const TransactionInterfaceType = new GraphQLInterfaceType({
       platformFeeInHostCurrency: { type: GraphQLInt },
       paymentProcessorFeeInHostCurrency: { type: GraphQLInt },
       taxAmount: { type: GraphQLInt },
+      taxInfo: { type: TaxInfo },
       createdByUser: { type: UserType },
       host: { type: CollectiveInterfaceType },
       paymentMethod: { type: PaymentMethodType },
@@ -72,6 +78,7 @@ export const TransactionInterfaceType = new GraphQLInterfaceType({
       createdAt: { type: DateString },
       updatedAt: { type: DateString },
       refundTransaction: { type: TransactionInterfaceType },
+      invoiceTemplate: { type: GraphQLString },
     };
   },
 });
@@ -98,15 +105,7 @@ const TransactionFields = () => {
     },
     uuid: {
       type: GraphQLString,
-      resolve(transaction, args, req) {
-        if (!req.remoteUser) {
-          return null;
-        }
-        // If it's a sequelize model transaction, it means it has the method getDetailsForUser
-        // otherwise we return transaction.uuid
-        if (transaction && transaction.getDetailsForUser) {
-          return transaction.getDetailsForUser(req.remoteUser);
-        }
+      resolve(transaction) {
         return transaction.uuid;
       },
     },
@@ -184,6 +183,31 @@ const TransactionFields = () => {
       type: GraphQLInt,
       description: 'The amount paid in tax (for example VAT) for this transaction',
     },
+    taxInfo: {
+      type: TaxInfo,
+      description: 'If taxAmount is set, this field will contain more info about the tax',
+      resolve(transaction, _, req) {
+        const tax = transaction.data?.tax;
+        if (!tax) {
+          return null;
+        } else {
+          return {
+            id: tax.id,
+            type: tax.id,
+            percentage: Math.round(tax.percentage ?? tax.rate * 100), // Does not support float
+            rate: tax.rate ?? round(tax.percentage / 100, 2),
+            idNumber: () => {
+              const collectiveId = transaction.paymentMethodProviderCollectiveId();
+              const canSeeDetails =
+                getContextPermission(req, PERMISSION_TYPE.SEE_PAYOUT_METHOD_DETAILS, collectiveId) ||
+                req.remoteUser.isAdmin(transaction.HostCollectiveId);
+
+              return canSeeDetails ? tax.idNumber : null;
+            },
+          };
+        }
+      },
+    },
     netAmountInCollectiveCurrency: {
       type: GraphQLInt,
       description: 'Amount after fees received by the collective in the lowest unit of its own currency (ie. cents)',
@@ -202,6 +226,12 @@ const TransactionFields = () => {
           return models.Transaction.calculateNetAmountInCollectiveCurrency(transaction);
         }
         return transaction.netAmountInCollectiveCurrency;
+      },
+    },
+    amountInHostCurrency: {
+      type: GraphQLInt,
+      async resolve(transaction) {
+        return transaction.amountInHostCurrency;
       },
     },
     host: {
@@ -308,6 +338,12 @@ const TransactionFields = () => {
         }
         // TODO: put behind a login check
         return req.loaders.PaymentMethod.byId.load(paymentMethodId);
+      },
+    },
+    invoiceTemplate: {
+      type: GraphQLString,
+      async resolve(transaction) {
+        return transaction.data?.invoiceTemplate;
       },
     },
   };

@@ -9,6 +9,7 @@ import { TransactionTypes } from '../../constants/transactions';
 import { getFxRate } from '../../lib/currency';
 import logger from '../../lib/logger';
 import { getHostFee, getHostFeeSharePercent } from '../../lib/payments';
+import { reportErrorToSentry, reportMessageToSentry } from '../../lib/sentry';
 import models from '../../models';
 
 const AES_ENCRYPTION_KEY = config.thegivingblock.aesEncryptionKey;
@@ -29,7 +30,7 @@ async function apiRequest(path, options = {}, account) {
 
 /*
  * Whenever and api request is made we check if access token is expired and if so we login again.
- * Refer: https://app.gitbook.com/@the-giving-block/s/public-api-documentation/#authentication-flow.
+ * Refer: https://the-giving-block.gitbook.io/public-api-documentation/#authentication-flow.
  * Access tokens are only valid for 2 hours.
  */
 async function handleErrorsAndRetry(result, path, options = {}, account = null) {
@@ -52,10 +53,12 @@ async function handleErrorsAndRetry(result, path, options = {}, account = null) 
         return result.data;
       } catch (err) {
         logger.error(err.message);
+        reportErrorToSentry(err);
         throw new Error(GENERIC_ERROR_MSG);
       }
     }
     logger.error(`The Giving Block: ${result.data.errorMessage} ${result.data.meta.errorCode}`);
+    reportMessageToSentry(`The Giving Block: ${result.data.errorMessage}`, { extra: result.data });
     throw new Error(GENERIC_ERROR_MSG);
   }
   return result.data;
@@ -193,7 +196,6 @@ export const confirmOrder = async order => {
     description: order.description,
     paymentProcessorFeeInHostCurrency,
     data: {
-      isFeesOnTop: false,
       hasPlatformTip: !!platformTip,
       isSharedRevenue,
       platformTipEligible,

@@ -3,11 +3,12 @@ import config from 'config';
 import gql from 'fake-tag';
 import { cloneDeep } from 'lodash';
 import nock from 'nock';
-import sinon from 'sinon';
+import { createSandbox } from 'sinon';
 import { v4 as uuid } from 'uuid';
 
 import { maxInteger } from '../../../../server/constants/math';
 import emailLib from '../../../../server/lib/email';
+import stripe from '../../../../server/lib/stripe';
 import twitter from '../../../../server/lib/twitter';
 import models from '../../../../server/models';
 import * as store from '../../../stores';
@@ -77,6 +78,8 @@ const constants = Object.freeze({
     data: {
       expMonth: 11,
       expYear: 2025,
+      country: 'USA',
+      fingerprint: 'dummy',
     },
   },
 });
@@ -100,7 +103,7 @@ describe('server/graphql/v1/createOrder', () => {
 
   beforeEach(async () => {
     await utils.resetTestDB();
-    sandbox = sinon.createSandbox();
+    sandbox = createSandbox();
     tweetStatusSpy = sandbox.spy(twitter, 'tweetStatus');
     emailSendMessageSpy = sandbox.spy(emailLib, 'sendMessage');
 
@@ -142,8 +145,6 @@ describe('server/graphql/v1/createOrder', () => {
     thisOrder.collective.id = collective.id;
 
     const remoteUser = await models.User.createUserWithCollective({
-      firstName: 'John',
-      lastName: 'Smith',
       email: 'jsmith@email.com',
       twitterHandle: 'johnsmith',
       newsletterOptIn: true,
@@ -176,8 +177,6 @@ describe('server/graphql/v1/createOrder', () => {
     thisOrder.interval = 'month';
 
     const remoteUser = await models.User.createUserWithCollective({
-      firstName: 'John',
-      lastName: 'Smith',
       email: 'jsmith@email.com',
       twitterHandle: 'johnsmith',
       newsletterOptIn: true,
@@ -199,11 +198,7 @@ describe('server/graphql/v1/createOrder', () => {
   });
 
   it('creates a pending order if the collective is active and the payment method type is manual', async () => {
-    const hostAdmin = await models.User.createUserWithCollective({
-      firstName: 'Mike',
-      lastName: 'Doe',
-      email: store.randEmail(),
-    });
+    const hostAdmin = await models.User.createUserWithCollective({ email: store.randEmail() });
     const host = await models.Collective.create({
       slug: 'host-collective',
       name: 'Open Collective 501c3',
@@ -257,8 +252,6 @@ describe('server/graphql/v1/createOrder', () => {
     thisOrder.quantity = 2;
     thisOrder.totalAmount = 2000;
     const remoteUser = await models.User.createUserWithCollective({
-      firstName: 'John',
-      lastName: 'Smith',
       email: 'jsmith@email.com',
       twitterHandle: 'johnsmith',
     });
@@ -293,7 +286,7 @@ describe('server/graphql/v1/createOrder', () => {
     expect(actionRequiredEmailArgs[0]).to.equal(remoteUser.email);
     expect(actionRequiredEmailArgs[2]).to.match(/IBAN 1234567890987654321/);
     expect(actionRequiredEmailArgs[2]).to.match(
-      /for the amount of <strong>\$20\.00<\/strong> with the mention: <strong>webpack event<\/strong> <strong>backer<\/strong> order: <strong>[0-9]+<\/strong>/,
+      /for the amount of <strong>\$20\.00<\/strong> with the mention: <strong>meetup<\/strong> <strong>backer<\/strong> order: <strong>[0-9]+<\/strong>/,
     );
     expect(actionRequiredEmailArgs[1]).to.equal('ACTION REQUIRED: your $20.00 registration to meetup is pending');
   });
@@ -317,8 +310,7 @@ describe('server/graphql/v1/createOrder', () => {
     // And given an order
     order.collective = { id: fearlesscitiesbrussels.id };
     const remoteUser = await models.User.createUserWithCollective({
-      firstName: 'John',
-      lastName: 'Smith',
+      name: 'John Smith',
       email: 'jsmith@email.com',
       twitterHandle: 'johnsmith',
       newsletterOptIn: true,
@@ -474,10 +466,9 @@ describe('server/graphql/v1/createOrder', () => {
       },
     };
     const remoteUser = await models.User.createUserWithCollective({
-      firstName: '',
-      lastName: '',
       email: store.randEmail('rejectedcard@protonmail.ch'),
     });
+    stripe.paymentIntents.confirm.rejects(new Error('Your card was declined.'));
     const res = await utils.graphqlQuery(createOrderMutation, { order: newOrder }, remoteUser);
     expect(res.errors[0].message).to.equal('Your card was declined.');
     const pm = await models.PaymentMethod.findOne({ where: { name: uniqueName } });
@@ -637,6 +628,7 @@ describe('server/graphql/v1/createOrder', () => {
     const collective = orderCreated.collective;
     const transactions = await models.Transaction.findAll({
       where: { OrderId: orderCreated.id },
+      order: [['id', 'ASC']],
     });
     expect(fromCollective.website).to.equal('https://newco.com'); // api should prepend https://
     expect(transactions.length).to.equal(4);
@@ -697,6 +689,7 @@ describe('server/graphql/v1/createOrder', () => {
     const collective = orderCreated.collective;
     const transactions = await models.Transaction.findAll({
       where: { OrderId: orderCreated.id },
+      order: [['id', 'ASC']],
     });
     expect(orderCreated.createdByUser.id).to.equal(duc.id);
     expect(transactions.length).to.equal(4);
@@ -740,7 +733,7 @@ describe('server/graphql/v1/createOrder', () => {
     await models.Member.create({
       CollectiveId: newco.id,
       MemberCollectiveId: duc.CollectiveId,
-      role: 'MEMBER',
+      role: 'ADMIN',
       CreatedByUserId: duc.id,
     });
 
@@ -822,9 +815,12 @@ describe('server/graphql/v1/createOrder', () => {
         CreatedByUserId: hostAdmin.id,
         HostCollectiveId: fromCollective.HostCollectiveId,
         CollectiveId: fromCollective.id,
+        amount: 746149,
+        amountInHostCurrency: 746149,
         netAmountInCollectiveCurrency: 746149,
         type: 'CREDIT',
         currency: 'USD',
+        hostCurrency: 'USD',
       });
     });
 
@@ -870,9 +866,12 @@ describe('server/graphql/v1/createOrder', () => {
       CreatedByUserId: xdamman.id,
       HostCollectiveId: fromCollective.HostCollectiveId,
       CollectiveId: fromCollective.id,
+      amount: 746149,
+      amountInHostCurrency: 746149,
       netAmountInCollectiveCurrency: 746149,
       type: 'CREDIT',
       currency: 'USD',
+      hostCurrency: 'USD',
     });
 
     order.fromCollective = { id: fromCollective.id };
@@ -903,6 +902,7 @@ describe('server/graphql/v1/createOrder', () => {
     const orderCreated = res.data.createOrder;
     const transactions = await models.Transaction.findAll({
       where: { OrderId: orderCreated.id },
+      order: [['id', 'ASC']],
     });
     expect(orderCreated.createdByUser.id).to.equal(xdamman.id);
     expect(transactions.length).to.equal(2);

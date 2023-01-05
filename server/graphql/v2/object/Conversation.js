@@ -1,5 +1,5 @@
 import { GraphQLInt, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
-import { GraphQLDateTime } from 'graphql-iso-date';
+import { GraphQLDateTime } from 'graphql-scalars';
 
 import models, { Op } from '../../../models';
 import { AccountCollection } from '../collection/AccountCollection';
@@ -26,11 +26,25 @@ const Conversation = new GraphQLObjectType({
       summary: { type: new GraphQLNonNull(GraphQLString) },
       collective: {
         type: Account,
+        deprecationReason: '2022-09-14: Please use account',
+        resolve(conversation, args, req) {
+          return req.loaders.Collective.byId.load(conversation.CollectiveId);
+        },
+      },
+      account: {
+        type: Account,
         resolve(conversation, args, req) {
           return req.loaders.Collective.byId.load(conversation.CollectiveId);
         },
       },
       fromCollective: {
+        type: Account,
+        deprecationReason: '2022-09-14: Please use fromAccount',
+        resolve(conversation, args, req) {
+          return req.loaders.Collective.byId.load(conversation.FromCollectiveId);
+        },
+      },
+      fromAccount: {
         type: Account,
         resolve(conversation, args, req) {
           return req.loaders.Collective.byId.load(conversation.FromCollectiveId);

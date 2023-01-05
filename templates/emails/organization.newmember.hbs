@@ -1,14 +1,10 @@
-Subject: {{remoteUser.collective.name}} added you as {{role}} to {{{collective.name}}} on Open Collective
+Subject: {{{remoteUser.collective.name}}} added you as {{role}} to {{{collective.name}}} on Open Collective
 
 {{> header}}
 
 {{> toplogo}}
 
-{{#if recipient.collective.name}}
-<p>{{recipient.collective.name}},</p>
-{{else}}
-<p>Hi,</p>
-{{/if}}
+<p>{{> greeting}}</p>
 
 <p>{{remoteUser.collective.name}} (cced) added you as {{role}} for <a href="https://opencollective.com/{{collective.slug}}">{{collective.name}}</a> on Open Collective.</p>
 

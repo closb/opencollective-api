@@ -1,16 +1,27 @@
 import { expect } from 'chai';
 import _ from 'lodash';
-import sinon from 'sinon';
+import { assert, createSandbox, stub } from 'sinon';
 import request from 'supertest';
 
+import { Service } from '../../../server/constants/connected_account';
 import app from '../../../server/index';
-import stripe from '../../../server/lib/stripe';
+import * as stripeLib from '../../../server/lib/stripe';
 import originalStripeMock from '../../mocks/stripe';
+import { fakeConnectedAccount } from '../../test-helpers/fake-data';
+import { resetTestDB } from '../../utils';
 
 describe('server/routes/webhooks.stripe', () => {
   let sandbox, expressApp;
 
   before(async () => {
+    await resetTestDB();
+    await fakeConnectedAccount({
+      service: Service.STRIPE,
+      username: 'acc_mock',
+      data: {
+        webhookSigningSecret: 'whsec_mock',
+      },
+    });
     expressApp = await app();
   });
 
@@ -38,67 +49,59 @@ describe('server/routes/webhooks.stripe', () => {
 
   describe('Webhook events: ', () => {
     beforeEach(() => {
-      sandbox = sinon.createSandbox();
+      sandbox = createSandbox();
     });
 
     afterEach(() => {
       sandbox.restore();
     });
 
-    it('returns an error if the event does not exist', done => {
-      const stripeMock = _.cloneDeep(originalStripeMock);
-
-      // eslint-disable-next-line camelcase
-      stripeMock.event_payment_succeeded = {
-        error: {
-          type: 'invalid_request_error',
-          message: 'No such event',
-          param: 'id',
-          requestId: 'req_7Y8TeQytYKcs1k',
-        },
+    it('should return HTTP 200 if event is not supported', async () => {
+      const event = {
+        type: 'application_fee.created',
+        account: 'acc_mock',
       };
 
-      sandbox.stub(stripe.events, 'retrieve').callsFake(() => Promise.resolve(stripeMock.event_payment_succeeded));
+      sandbox.stub(stripeLib, 'StripeCustomToken').returns({
+        webhooks: {
+          constructEvent: stub().returns(event),
+        },
+      });
 
-      request(expressApp)
-        .post('/webhooks/stripe')
-        .send({
-          id: 123,
-        })
-        .expect(400, {
-          error: {
-            code: 400,
-            type: 'bad_request',
-            message: 'Event not found',
-          },
-        })
-        .end(done);
+      await request(expressApp).post('/webhooks/stripe').send(event).expect(200);
     });
 
-    it('error out on `source.chargeable`', done => {
-      const stripeMock = _.cloneDeep(originalStripeMock);
+    it('should return HTTP 500 if event is not signed', async () => {
+      const event = {
+        type: 'issuing_card.updated',
+        account: 'acc_mock',
+      };
 
-      sandbox.stub(stripe.events, 'retrieve').callsFake(() => Promise.resolve(stripeMock.event_source_chargeable));
-      request(expressApp).post('/webhooks/stripe').send(stripeMock.webhook_source_chargeable).expect(400).end(done);
+      sandbox.stub(stripeLib, 'StripeCustomToken').returns({
+        webhooks: {
+          constructEvent: stub().throws(new Error('bad signature')),
+        },
+      });
+
+      await request(expressApp).post('/webhooks/stripe').send(event).expect(500);
     });
 
-    it('returns an error if the event is `source.chargeable`', done => {
-      const stripeMock = _.cloneDeep(originalStripeMock);
-      stripeMock.event_source_chargeable.type = 'application_fee.created';
+    it('should return HTTP 500 if account is not recognized', async () => {
+      const event = {
+        type: 'issuing_card.updated',
+        account: 'acc_mock_test',
+      };
 
-      sandbox.stub(stripe.events, 'retrieve').callsFake(() => Promise.resolve(stripeMock.event_source_chargeable));
+      const constructEventMock = stub();
+      sandbox.stub(stripeLib, 'StripeCustomToken').returns({
+        webhooks: {
+          constructEvent: constructEventMock,
+        },
+      });
 
-      request(expressApp)
-        .post('/webhooks/stripe')
-        .send(stripeMock.webhook_payment_succeeded)
-        .expect(400, {
-          error: {
-            code: 400,
-            type: 'bad_request',
-            message: 'Wrong event type received',
-          },
-        })
-        .end(done);
+      await request(expressApp).post('/webhooks/stripe').send(event).expect(500);
+
+      assert.notCalled(constructEventMock);
     });
   });
 });

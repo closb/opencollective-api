@@ -9,6 +9,7 @@ import debugLib from 'debug';
 import { get, pick, set, uniq } from 'lodash';
 
 import { types as collectiveTypes } from '../../server/constants/collectives';
+import { reportErrorToSentry } from '../../server/lib/sentry';
 import slackLib from '../../server/lib/slack';
 import twitter from '../../server/lib/twitter';
 import { pluralize } from '../../server/lib/utils';
@@ -36,7 +37,9 @@ const init = async () => {
     include: [{ model: models.Collective, where: { type: { [Op.ne]: collectiveTypes.EVENT } }, as: 'collective' }],
   });
 
-  console.log(`${transactionsGroups.length} different collectives got new backers since ${TenMinutesAgo}`);
+  console.log(
+    `${transactionsGroups.length} different collectives got new financial contributors since ${TenMinutesAgo}`,
+  );
 
   return Promise.map(transactionsGroups, processNewMembersCount).then(() => {
     const timeLapsed = new Date() - startTime;
@@ -109,7 +112,7 @@ const processNewMembersCount = async newMembersCount => {
 
   const backersCount = await collective.getBackersCount();
   if (backersCount < 10) {
-    debug(`${collective.slug} only has ${backersCount} ${pluralize('backer', backersCount)}, skipping`);
+    debug(`${collective.slug} only has ${backersCount} financial ${pluralize('contributor', backersCount)}, skipping`);
     return;
   }
 
@@ -118,15 +121,21 @@ const processNewMembersCount = async newMembersCount => {
     backersCount - count < numberOfBackers && backersCount >= numberOfBackers;
 
   if (hasPassedMilestone(1000)) {
-    console.log(`🎉 ${collective.slug} just passed the 1,000 backers milestone with ${backersCount} backers`);
+    console.log(
+      `🎉 ${collective.slug} just passed the 1,000 financial contributors milestone with ${backersCount} financial contributors`,
+    );
     return await processMilestone('oneThousandBackers', collective);
   }
   if (hasPassedMilestone(100)) {
-    console.log(`🎉 ${collective.slug} just passed the 100 backers milestone with ${backersCount} backers`);
+    console.log(
+      `🎉 ${collective.slug} just passed the 100 financial contributors milestone with ${backersCount} financial contributors`,
+    );
     return await processMilestone('oneHundredBackers', collective);
   }
   if (hasPassedMilestone(50)) {
-    console.log(`🎉 ${collective.slug} just passed the 50 backers milestone with ${backersCount} backers`);
+    console.log(
+      `🎉 ${collective.slug} just passed the 50 financial contributors milestone with ${backersCount} financial contributors`,
+    );
     return await processMilestone('fiftyBackers', collective);
   }
   if (hasPassedMilestone(10)) {
@@ -134,7 +143,7 @@ const processNewMembersCount = async newMembersCount => {
       `🎉 ${collective.slug} got ${count} new ${pluralize(
         'backer',
         count,
-      )} and just passed the 10 backers milestone with ${backersCount} backers`,
+      )} and just passed the 10 financial contributors milestone with ${backersCount} financial contributors`,
     );
     return await processMilestone('tenBackers', collective);
   }
@@ -219,6 +228,7 @@ const sendTweet = async (tweet, twitterAccount, template) => {
       return res;
     } catch (e) {
       console.error('Unable to tweet', tweet, e);
+      reportErrorToSentry(e);
     }
   }
 };

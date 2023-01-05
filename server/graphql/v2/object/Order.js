@@ -1,6 +1,6 @@
-import { GraphQLInt, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
-import { GraphQLDateTime } from 'graphql-iso-date';
-import GraphQLJSON from 'graphql-type-json';
+import { GraphQLBoolean, GraphQLInt, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
+import { GraphQLDateTime } from 'graphql-scalars';
+import { GraphQLJSON } from 'graphql-type-json';
 import { pick } from 'lodash';
 
 import roles from '../../../constants/roles';
@@ -43,13 +43,18 @@ export const Order = new GraphQLObjectType({
       },
       amount: {
         type: new GraphQLNonNull(Amount),
+        description: 'Base order amount (without platform tip)',
         resolve(order) {
-          let value = order.totalAmount;
           // We remove Platform Tip from totalAmount
-          if (order.data?.isFeesOnTop && order.data?.platformFee) {
-            value = value - order.data.platformFee;
-          }
+          const value = order.totalAmount - order.platformTipAmount;
           return { value, currency: order.currency };
+        },
+      },
+      totalAmount: {
+        type: new GraphQLNonNull(Amount),
+        description: 'Total order amount, including all taxes and platform tip',
+        resolve(order) {
+          return { value: order.totalAmount, currency: order.currency };
         },
       },
       quantity: {
@@ -144,28 +149,15 @@ export const Order = new GraphQLObjectType({
           }
         },
       },
-      platformContributionAmount: {
-        type: Amount,
-        deprecationReason: '2021-06-07: Please use platformTipAmount',
-        description: 'Platform contribution attached to the Order.',
-        resolve(order) {
-          if (order.data?.isFeesOnTop && order.data?.platformFee) {
-            return { value: order.data.platformFee, currency: order.currency };
-          } else {
-            return null;
-          }
-        },
-      },
       platformTipAmount: {
         type: Amount,
         description: 'Platform Tip attached to the Order.',
         resolve(order) {
-          if (order.data?.isFeesOnTop && order.data?.platformFee) {
-            return { value: order.data.platformFee, currency: order.currency };
-          } else {
-            return null;
-          }
+          return { value: order.platformTipAmount, currency: order.currency };
         },
+      },
+      platformTipEligible: {
+        type: GraphQLBoolean,
       },
       tags: {
         type: new GraphQLNonNull(new GraphQLList(GraphQLString)),
@@ -227,6 +219,41 @@ export const Order = new GraphQLObjectType({
           } else {
             return order.data?.customData || {};
           }
+        },
+      },
+      memo: {
+        type: GraphQLString,
+        description:
+          'Memo field which adds additional details about the order. For example in added funds this can be a note to mark what method (cheque, money order) the funds were received.',
+        async resolve(order, _, { loaders, remoteUser }) {
+          const collective = order.collective || (await loaders.Collective.byId.load(order.CollectiveId));
+          const hostCollectiveId = collective?.HostCollectiveId;
+          if (remoteUser && remoteUser.hasRole([roles.ACCOUNTANT, roles.ADMIN], hostCollectiveId)) {
+            return order.data?.memo;
+          } else {
+            return null;
+          }
+        },
+      },
+      processedAt: {
+        type: GraphQLDateTime,
+        description: 'Date the funds were received.',
+        async resolve(order) {
+          return order?.processedAt;
+        },
+      },
+      needsConfirmation: {
+        type: GraphQLBoolean,
+        description: 'Whether the order needs confirmation (3DSecure/SCA)',
+        async resolve(order, _, req) {
+          order.fromCollective =
+            order.fromCollective || (await req.loaders.Collective.byId.load(order.FromCollectiveId));
+          if (!req.remoteUser?.isAdminOfCollective(order.fromCollective)) {
+            return null;
+          }
+          return Boolean(
+            ['REQUIRE_CLIENT_CONFIRMATION', 'ERROR', 'PENDING'].includes(order.status) && order.data?.needsConfirmation,
+          );
         },
       },
     };

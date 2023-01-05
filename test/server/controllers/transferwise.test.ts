@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import sinon from 'sinon';
+import { createSandbox } from 'sinon';
 
 import { expenseStatus } from '../../../server/constants';
 import * as transferwiseController from '../../../server/controllers/transferwise';
@@ -15,7 +15,7 @@ import {
 } from '../../test-helpers/fake-data';
 
 describe('server/controllers/transferwise', () => {
-  const sandbox = sinon.createSandbox();
+  const sandbox = createSandbox();
 
   after(sandbox.restore);
 
@@ -106,7 +106,7 @@ describe('server/controllers/transferwise', () => {
         },
       ],
     });
-    payExpensesBatchGroup = sandbox.stub(transferwise, 'payExpensesBatchGroup').resolves();
+    payExpensesBatchGroup = sandbox.stub(transferwise, 'payExpensesBatchGroup').resolves({ status: 'COMPLETED' });
   });
 
   it('should throw if remote user is not a host admin', async () => {
@@ -126,7 +126,7 @@ describe('server/controllers/transferwise', () => {
 
     expect(res.status.called).to.be.true;
     expect(res.status.firstCall.firstArg).to.equal(404);
-    expect(res.send.firstCall.firstArg).to.equal('Error: Could not find every expense requested');
+    expect(res.send.firstCall.firstArg).to.equal('Error: Could not find requested expenses');
   });
 
   it('should throw if an expense is not scheduled for payment', async () => {
@@ -135,7 +135,7 @@ describe('server/controllers/transferwise', () => {
 
     expect(res.status.called).to.be.true;
     expect(res.status.firstCall.firstArg).to.equal(500);
-    expect(res.send.firstCall.firstArg).to.equal('Error: Expense must be scheduled for payment');
+    expect(res.send.firstCall.firstArg).to.include('must be scheduled for payment');
   });
 
   it('should proxy OTT headers from TransferWise', async () => {
@@ -150,15 +150,14 @@ describe('server/controllers/transferwise', () => {
     expect(res.sendStatus.firstCall.firstArg).to.equal(403);
   });
 
-  it('should create transactions for paid expenses when retrying with OTT header', async () => {
+  it('should mark expense as processing when retrying with OTT header', async () => {
     req.headers['x-2fa-approval'] = 'hash';
     // Simulate paid expenses because we stub fundExpensesBatchGroup
     await expense.update({ data: { ...expense.data, transfer: { id: 1234 } } });
     await transferwiseController.payBatch(req, res);
 
     await expense.reload();
-    const transactions = await expense.getTransactions();
-    expect(transactions).to.be.an('array').with.length(2);
     expect(expense).to.have.property('status', expenseStatus.PROCESSING);
+    expect(expense).to.have.nested.property('data.batchGroup.status', 'COMPLETED');
   });
 });

@@ -1,27 +1,23 @@
 import config from 'config';
-import { DataTypes, Model, Transaction } from 'sequelize';
+import { DataTypes, ForeignKey, Model, Transaction } from 'sequelize';
 
 import { diffDBEntries } from '../lib/data';
 import { isValidUploadedImage } from '../lib/images';
-import restoreSequelizeAttributesOnClass from '../lib/restore-sequelize-attributes-on-class';
 import sequelize from '../lib/sequelize';
 
+import User from './User';
 import models from '.';
 
 /**
  * Sequelize model to represent an ExpenseAttachedFile, linked to the `ExpenseAttachedFiles` table.
  */
 export class ExpenseAttachedFile extends Model {
-  public readonly id!: number;
-  public ExpenseId!: number;
-  public CreatedByUserId: number;
-  public url!: string;
-  public createdAt!: Date;
-
-  constructor(...args) {
-    super(...args);
-    restoreSequelizeAttributesOnClass(new.target, this);
-  }
+  public declare readonly id: number;
+  public declare ExpenseId: number;
+  public declare CreatedByUserId: ForeignKey<User['id']>;
+  public declare url: string;
+  public declare name: string;
+  public declare createdAt: Date;
 
   /**
    * Create an attachment from user-submitted data.
@@ -30,13 +26,13 @@ export class ExpenseAttachedFile extends Model {
    * @param expense: The linked expense
    */
   static async createFromData(
-    url: string,
-    user: typeof models.User,
+    { url, name }: { url: string; name?: string },
+    user: User,
     expense: typeof models.Expense,
     dbTransaction: Transaction | null,
   ): Promise<ExpenseAttachedFile> {
     return ExpenseAttachedFile.create(
-      { ExpenseId: expense.id, CreatedByUserId: user.id, url },
+      { ExpenseId: expense.id, CreatedByUserId: user.id, url, name },
       { transaction: dbTransaction },
     );
   }
@@ -54,55 +50,53 @@ export class ExpenseAttachedFile extends Model {
   };
 }
 
-function setupModel(ExpenseAttachedFile) {
-  // Link the model to database fields
-  ExpenseAttachedFile.init(
-    {
-      id: {
-        type: DataTypes.INTEGER,
-        primaryKey: true,
-        autoIncrement: true,
-      },
-      ExpenseId: {
-        type: DataTypes.INTEGER,
-        references: { model: 'Expenses', key: 'id' },
-        onDelete: 'CASCADE',
-        onUpdate: 'CASCADE',
-        allowNull: false,
-      },
-      CreatedByUserId: {
-        type: DataTypes.INTEGER,
-        references: { key: 'id', model: 'Users' },
-        onDelete: 'SET NULL',
-        onUpdate: 'CASCADE',
-        allowNull: false,
-      },
-      url: {
-        type: DataTypes.STRING,
-        allowNull: false,
-        validate: {
-          isValid(url: string): void {
-            if (url && !isValidUploadedImage(url) && !url.startsWith(config.host.rest)) {
-              throw new Error('The attached file URL is not valid');
-            }
-          },
+// Link the model to database fields
+ExpenseAttachedFile.init(
+  {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true,
+    },
+    ExpenseId: {
+      type: DataTypes.INTEGER,
+      references: { model: 'Expenses', key: 'id' },
+      onDelete: 'CASCADE',
+      onUpdate: 'CASCADE',
+      allowNull: false,
+    },
+    CreatedByUserId: {
+      type: DataTypes.INTEGER,
+      references: { key: 'id', model: 'Users' },
+      onDelete: 'SET NULL',
+      onUpdate: 'CASCADE',
+      allowNull: false,
+    },
+    url: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      validate: {
+        isValid(url: string): void {
+          if (url && !isValidUploadedImage(url) && !url.startsWith(config.host.rest)) {
+            throw new Error('The attached file URL is not valid');
+          }
         },
       },
-      createdAt: {
-        type: DataTypes.DATE,
-        defaultValue: DataTypes.NOW,
-        allowNull: false,
-      },
     },
-    {
-      sequelize,
-      tableName: 'ExpenseAttachedFiles',
+    name: {
+      type: DataTypes.STRING,
+      allowNull: true,
     },
-  );
-}
-
-// We're using the setupModel function to keep the indentation and have a clearer git history.
-// Please consider this if you plan to refactor.
-setupModel(ExpenseAttachedFile);
+    createdAt: {
+      type: DataTypes.DATE,
+      defaultValue: DataTypes.NOW,
+      allowNull: false,
+    },
+  },
+  {
+    sequelize,
+    tableName: 'ExpenseAttachedFiles',
+  },
+);
 
 export default ExpenseAttachedFile;

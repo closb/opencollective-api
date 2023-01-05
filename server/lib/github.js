@@ -1,10 +1,11 @@
 import { createOAuthAppAuth } from '@octokit/auth-oauth-app';
 import { Octokit } from '@octokit/rest';
 import config from 'config';
-import { get, has, pick } from 'lodash';
+import { get, has, pick, trim, trimEnd, trimStart } from 'lodash';
 
 import cache from './cache';
 import logger from './logger';
+import { reportMessageToSentry } from './sentry';
 
 const compactRepo = repo => {
   repo = pick(repo, [
@@ -14,6 +15,7 @@ const compactRepo = repo => {
     'owner', // (1) (4)
     'stargazers_count', // (1) (2) (4)
     'fork', // (3)
+    'license', // (4)
   ]);
   repo.owner = pick(repo.owner, [
     'login', // (1)
@@ -23,7 +25,7 @@ const compactRepo = repo => {
   // https://github.com/opencollective/opencollective-website/blob/master/frontend/src/reducers/github.js
   // 2) Required for the pledge feature in /graphql/v1/orders.js
   // 3) Required for update-contributions
-  // 4) Required on the frontend in the "GitHub flow" (OpenSourceApplyPage)
+  // 4) Required on the frontend in the "OSC application flow"
   return repo;
 };
 
@@ -78,6 +80,10 @@ export async function getAllUserPublicRepos(accessToken) {
 
   if (parameters.page === maxNbPages) {
     logger.error(`Aborted: Too many repos to fetch for user with token ${accessToken}`);
+    reportMessageToSentry('Aborted: Too many repos to fetch for user', {
+      severity: 'warning',
+      accessToken: accessToken.replace(/^(.{3})(.+)(.{3})$/, '$1****$3'), // abcdefghijkl -> abc****jkl
+    });
   }
 
   repos = repos.map(compactRepo);
@@ -200,3 +206,116 @@ export async function checkGithubStars(githubHandle, accessToken) {
     }
   }
 }
+
+export async function getValidatorInfo(githubHandle, accessToken) {
+  const octokit = getOctokit(accessToken);
+  const [owner, repo] = githubHandle.split('/');
+  const { repository } = await octokit.graphql(
+    `
+      query Repository($owner: String!, $repo: String!) {
+        repository(owner: $owner, name: $repo) {
+          isFork
+          stargazerCount
+          viewerCanAdminister
+          owner {
+            ... on Organization {
+              login
+            }
+          }
+          licenseInfo {
+            name
+            spdxId
+          }
+          defaultBranchRef {
+            target {
+              ... on Commit {
+                committedDate
+              }
+            }
+          }
+          collaborators {
+            totalCount
+          }
+        }
+      }
+    `,
+    {
+      owner,
+      repo,
+    },
+  );
+
+  return {
+    lastCommitDate: repository.defaultBranchRef.target.committedDate,
+    starsCount: repository.stargazerCount,
+    collaboratorsCount: repository.collaborators.totalCount,
+    isFork: repository.isFork,
+    isOwnedByOrg: !!repository.owner?.login,
+    isAdmin: repository.viewerCanAdminister,
+    licenseSpdxId: repository.licenseInfo?.spdxId,
+  };
+}
+
+const githubUsernameRegex = new RegExp('[a-z\\d](?:[a-z\\d]|-(?=[a-z\\d])){0,38}', 'i');
+const githubRepositoryRegex = new RegExp('\\.?[a-z\\d](?:[a-z\\.\\d]|-(?=[a-z\\.\\d])){1,100}', 'i');
+export const githubHandleRegex = new RegExp(
+  `^${githubUsernameRegex.source}(/(${githubRepositoryRegex.source})?)?$`,
+  'i',
+);
+const githubPathnameRegex = new RegExp(`^/${githubUsernameRegex.source}(/(${githubRepositoryRegex.source})?)?`, 'i');
+
+/**
+ * Return the github handle from a URL
+ *
+ * @param {string} url
+ * @returns {string|null} handle
+ *
+ * @example
+ * getGithubHandleFromUrl('https://github.com/opencollective/opencollective-frontend')
+ * => 'opencollective/opencollective-frontend'
+ */
+export const getGithubHandleFromUrl = url => {
+  try {
+    const { hostname, pathname } = new URL(url);
+    if (hostname !== 'github.com' || pathname.length < 2) {
+      return null;
+    }
+
+    const regexResult = pathname.match(githubPathnameRegex);
+    if (regexResult) {
+      const handle = trim(regexResult[0], '/');
+      if (githubHandleRegex.test(handle)) {
+        return handle;
+      }
+    }
+  } catch {
+    // Ignore invalid URLs
+  }
+
+  return null;
+};
+
+/**
+ * Generate a Github URL from a handle. Return null if handle is invalid
+ *
+ * @param {string} handle
+ * @returns {string|null}
+ */
+export const getGithubUrlFromHandle = handle => {
+  // "  @@@test//   " => "@test"
+  const cleanHandle = trimStart(trimEnd(handle?.trim(), '/'), '@');
+  if (cleanHandle) {
+    // In case handle is a Github URL, we return it with the proper format
+    const handleFromUrl = getGithubHandleFromUrl(cleanHandle);
+    if (handleFromUrl) {
+      return `https://github.com/${handleFromUrl}`;
+    }
+
+    if (githubHandleRegex.test(cleanHandle)) {
+      const [org, repo] = cleanHandle.replace(/^@/, '').split('/');
+      return `https://github.com/${repo ? `${org}/${repo}` : org}`;
+    }
+  }
+
+  return null;
+};

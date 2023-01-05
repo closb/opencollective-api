@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import gqlV2 from 'fake-tag';
 import { describe, it } from 'mocha';
-import sinon from 'sinon';
+import { assert, createSandbox } from 'sinon';
 
 import roles from '../../../../../server/constants/roles';
 import { idEncode, IDENTIFIER_TYPES } from '../../../../../server/graphql/v2/identifiers';
@@ -21,7 +21,7 @@ describe('server/graphql/v2/mutation/UpdateMutations', () => {
   */
 
   before(() => {
-    sandbox = sinon.createSandbox();
+    sandbox = createSandbox();
     sendEmailSpy = sandbox.spy(emailLib, 'sendMessage');
     sendTweetSpy = sandbox.spy(twitterLib, 'tweetStatus');
   });
@@ -92,7 +92,7 @@ describe('server/graphql/v2/mutation/UpdateMutations', () => {
     it('fails if not authenticated', async () => {
       const result = await utils.graphqlQueryV2(createUpdateMutation, { update });
       expect(result.errors).to.have.length(1);
-      expect(result.errors[0].message).to.equal('You must be logged in to create an update');
+      expect(result.errors[0].extensions.code).to.equal('Unauthorized');
     });
 
     it('fails if authenticated but cannot edit collective', async () => {
@@ -115,7 +115,7 @@ describe('server/graphql/v2/mutation/UpdateMutations', () => {
     before(async () => {
       sendEmailSpy.resetHistory();
       user3 = await models.User.createUserWithCollective(utils.data('user3'));
-      opencollective = await models.Collective.create({ slug: 'opencollective', id: 8686 });
+      opencollective = await models.Collective.create({ name: 'Open Collective', slug: 'opencollective', id: 8686 });
       opencollective.addUserWithRole(user3, roles.ADMIN);
       changelogUpdate = {
         title: 'Monthly changelog update',
@@ -138,7 +138,7 @@ describe('server/graphql/v2/mutation/UpdateMutations', () => {
     it('fails if not authenticated', async () => {
       const result = await utils.graphqlQueryV2(createUpdateMutation, { update: changelogUpdate });
       expect(result.errors).to.have.length(1);
-      expect(result.errors[0].message).to.equal('You must be logged in to create an update');
+      expect(result.errors[0].extensions.code).to.equal('Unauthorized');
     });
 
     it('fails if authenticated but cannot edit collective', async () => {
@@ -178,7 +178,7 @@ describe('server/graphql/v2/mutation/UpdateMutations', () => {
         notificationAudience: update1.notificationAudience,
       });
       expect(result.errors).to.exist;
-      expect(result.errors[0].message).to.equal('You must be logged in to edit this update');
+      expect(result.errors[0].extensions.code).to.equal('Unauthorized');
     });
 
     it('fails if not authenticated as admin of collective', async () => {
@@ -209,7 +209,7 @@ describe('server/graphql/v2/mutation/UpdateMutations', () => {
     });
 
     describe('publishes an update', async () => {
-      let result, user4;
+      let result, noOneAudienceResult, update2, user4;
 
       before(async () => {
         sendEmailSpy.resetHistory();
@@ -253,18 +253,38 @@ describe('server/graphql/v2/mutation/UpdateMutations', () => {
           tag: 'first update & "love"',
         });
         expect(sendEmailSpy.callCount).to.equal(3);
-        expect(sendEmailSpy.args[0][0]).to.equal(user1.email);
-        expect(sendEmailSpy.args[0][1]).to.equal('first update & "love"');
-        expect(sendEmailSpy.args[1][0]).to.equal(user2.email);
-        expect(sendEmailSpy.args[1][1]).to.equal('first update & "love"');
-        expect(sendEmailSpy.args[2][0]).to.equal(user4.email);
-        expect(sendEmailSpy.args[2][1]).to.equal('first update & "love"');
+        assert.calledWithMatch(sendEmailSpy, user1.email, 'first update & "love"');
+        assert.calledWithMatch(sendEmailSpy, user2.email, 'first update & "love"');
+        assert.calledWithMatch(sendEmailSpy, user4.email, 'first update & "love"');
       });
 
       it('sends a tweet', async () => {
         expect(sendTweetSpy.callCount).to.equal(1);
         expect(sendTweetSpy.firstCall.args[1]).to.equal('Latest update from the collective: first update & "love"');
         expect(sendTweetSpy.firstCall.args[2]).to.contain('/scouts/updates/first-update-and-love');
+      });
+
+      it('should publish update without notifying anyone', async () => {
+        sendEmailSpy.resetHistory();
+
+        update2 = await models.Update.create({
+          CollectiveId: collective1.id,
+          FromCollectiveId: user1.CollectiveId,
+          CreatedByUserId: user1.id,
+          notificationAudience: 'NO_ONE',
+          title: 'second update',
+          html: 'long text for the update #2 <a href="https://google.com">here is a link</a>',
+        });
+
+        noOneAudienceResult = await utils.graphqlQueryV2(
+          publishUpdateMutation,
+          { id: idEncode(update2.id, IDENTIFIER_TYPES.UPDATE), notificationAudience: update2.notificationAudience },
+          user1,
+        );
+
+        expect(sendEmailSpy.callCount).to.equal(0);
+        expect(noOneAudienceResult.data.publishUpdate.slug).to.equal('second-update');
+        expect(noOneAudienceResult.data.publishUpdate.publishedAt).to.not.be.null;
       });
     });
   });
@@ -285,7 +305,7 @@ describe('server/graphql/v2/mutation/UpdateMutations', () => {
         update: { id: idEncode(update1.id, IDENTIFIER_TYPES.UPDATE) },
       });
       expect(result.errors).to.exist;
-      expect(result.errors[0].message).to.equal('You must be logged in to edit this update');
+      expect(result.errors[0].extensions.code).to.equal('Unauthorized');
     });
 
     it('fails if not authenticated as admin of collective', async () => {
@@ -348,7 +368,7 @@ describe('server/graphql/v2/mutation/UpdateMutations', () => {
         id: idEncode(update1.id, IDENTIFIER_TYPES.UPDATE),
       });
       expect(result.errors).to.exist;
-      expect(result.errors[0].message).to.equal('You must be logged in to edit this update');
+      expect(result.errors[0].extensions.code).to.equal('Unauthorized');
       return models.Update.findByPk(update1.id).then(updateFound => {
         expect(updateFound).to.not.be.null;
       });

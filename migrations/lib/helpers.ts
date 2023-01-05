@@ -90,3 +90,55 @@ export const removeMigration = async (queryInterface: QueryInterface, migrationN
     { replacements: { migrationName } },
   );
 };
+
+/*
+ * A simple wrapper to help check the queries being executed
+ */
+const executeQuery = async (queryInterface, query) => {
+  // console.log(query);
+  await queryInterface.sequelize.query(query);
+};
+
+/*
+ * Convert an array into a SQL formatted list
+ */
+const formatEnum = values => values.map(value => `'${value}'`).join(', ');
+
+/*
+ * Update an enum list on a given table, column
+ */
+export const updateEnum = async (queryInterface, table, column, enumName, values) => {
+  // See https://blog.yo1.dog/updating-enum-values-in-postgresql-the-safe-and-easy-way/
+  await executeQuery(queryInterface, `ALTER TYPE "${enumName}" RENAME TO "${enumName}_old"`);
+  await executeQuery(queryInterface, `CREATE TYPE "${enumName}" AS ENUM(${formatEnum(values)})`);
+  await executeQuery(
+    queryInterface,
+    `ALTER TABLE "${table}" ALTER COLUMN ${column} TYPE "${enumName}" ARRAY USING ${column}::text::"${enumName}"[]`,
+  );
+  await executeQuery(queryInterface, `DROP TYPE "${enumName}_old"`);
+};
+
+/**
+ * Helper to check whether a column exists. Useful for migrations that need to be idempotent.
+ * Would be nice to have this in Sequelize: https://github.com/sequelize/sequelize/issues/14928
+ */
+export const doesColumnExist = async (queryInterface, table, column) => {
+  const tableDescription = await queryInterface.describeTable(table);
+  return Boolean(tableDescription[column]);
+};
+
+export const renameInJSONB = (
+  column: string,
+  oldPath: string[],
+  newPath: string[],
+  createIfNotExist = true,
+): string => {
+  const oldPathStr = oldPath.join(',');
+  const newPathStr = newPath.join(',');
+  return `JSONB_SET(
+    "${column}" #- '{${oldPathStr}}', -- Remove old path
+    '{${newPathStr}}', -- New path
+    "${column}" #> '{${oldPathStr}}', -- Get old value
+    ${createIfNotExist.toString()} -- Whether to create the new path if it doesn't exist
+  )`;
+};

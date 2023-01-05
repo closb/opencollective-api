@@ -1,9 +1,16 @@
 import { expect } from 'chai';
-import sinon from 'sinon';
+import { stub } from 'sinon';
 
 import { TransactionKind } from '../../../server/constants/transaction-kind';
 import models from '../../../server/models';
-import { fakeCollective, fakeHost, fakeOrder, fakeUser } from '../../test-helpers/fake-data';
+import {
+  fakeCollective,
+  fakeHost,
+  fakeOrder,
+  fakePaymentMethod,
+  fakeTransaction,
+  fakeUser,
+} from '../../test-helpers/fake-data';
 import * as utils from '../../utils';
 
 const { Transaction } = models;
@@ -44,7 +51,7 @@ describe('server/models/Transaction', () => {
   beforeEach(() => utils.resetTestDB());
 
   beforeEach(async () => {
-    user = await fakeUser({}, { id: 10, name: 'User' });
+    user = await fakeUser({}, { name: 'User' });
     inc = await fakeHost({
       id: 8686,
       slug: 'opencollectiveinc',
@@ -53,12 +60,10 @@ describe('server/models/Transaction', () => {
       HostCollectiveId: 8686,
     });
     host = await fakeHost({
-      id: 2,
       name: 'Random Host',
       CreatedByUserId: user.id,
     });
     collective = await fakeCollective({
-      id: 3,
       HostCollectiveId: host.id,
       CreatedByUserId: user.id,
       name: 'Collective',
@@ -116,7 +121,7 @@ describe('server/models/Transaction', () => {
     };
 
     return Transaction.createFromContributionPayload(transactionPayload).then(() => {
-      return Transaction.findAll().then(transactions => {
+      return Transaction.findAll({ order: [['id', 'ASC']] }).then(transactions => {
         utils.snapshotTransactions(transactions, { columns: SNAPSHOT_COLUMNS });
 
         expect(transactions.length).to.equal(4);
@@ -193,7 +198,7 @@ describe('server/models/Transaction', () => {
   });
 
   it('createFromContributionPayload() generates a new activity', done => {
-    const createActivityStub = sinon.stub(Transaction, 'createActivity').callsFake(t => {
+    const createActivityStub = stub(Transaction, 'createActivity').callsFake(t => {
       expect(Math.abs(t.amount)).to.equal(Math.abs(transactionsData[7].amount));
       createActivityStub.restore();
       done();
@@ -223,15 +228,12 @@ describe('server/models/Transaction', () => {
         currency: 'USD',
         hostCurrency: 'USD',
         hostCurrencyFxRate: 1,
-        platformFeeInHostCurrency: 1000,
+        platformTipAmount: 1000,
         hostFeeInHostCurrency: 500,
         paymentProcessorFeeInHostCurrency: 300,
         type: 'CREDIT',
         createdAt: '2015-05-29T07:00:00.000Z',
         PaymentMethodId: 1,
-        data: {
-          isFeesOnTop: true,
-        },
       };
 
       const t = await Transaction.createFromContributionPayload(transactionPayload);
@@ -266,16 +268,13 @@ describe('server/models/Transaction', () => {
         currency: 'USD',
         hostCurrency: 'USD',
         hostCurrencyFxRate: 1,
-        platformFeeInHostCurrency: 1000,
         hostFeeInHostCurrency: 500,
         paymentProcessorFeeInHostCurrency: 200,
         type: 'CREDIT',
         createdAt: '2015-05-29T07:00:00.000Z',
         PaymentMethodId: 1,
         OrderId: order.id,
-        data: {
-          isFeesOnTop: true,
-        },
+        platformTipAmount: 1000,
       };
 
       const createdTransaction = await Transaction.createFromContributionPayload(transactionPayload);
@@ -284,7 +283,7 @@ describe('server/models/Transaction', () => {
       // - 2 for contributions
       // - 2 for platform tip (contributor -> Open Collective)
       // - 2 for platform tip debt (host -> Open Collective)
-      const sqlOrder = [['createdAt', 'ASC']];
+      const sqlOrder = [['id', 'ASC']];
       const include = [{ association: 'host' }];
       const allTransactions = await Transaction.findAll({ where: { OrderId: order.id }, order: sqlOrder, include });
       await models.TransactionSettlement.attachStatusesToTransactions(allTransactions);
@@ -336,16 +335,13 @@ describe('server/models/Transaction', () => {
         currency: 'EUR',
         hostCurrency: 'EUR',
         hostCurrencyFxRate: 1,
-        platformFeeInHostCurrency: 1000,
+        platformTipAmount: 1000,
         hostFeeInHostCurrency: 500,
         paymentProcessorFeeInHostCurrency: 200,
         type: 'CREDIT',
         createdAt: '2015-05-29T07:00:00.000Z',
         PaymentMethodId: 1,
         OrderId: order.id,
-        data: {
-          isFeesOnTop: true,
-        },
       };
 
       await Transaction.createFromContributionPayload(transactionPayload);
@@ -393,16 +389,13 @@ describe('server/models/Transaction', () => {
         currency: 'EUR',
         hostCurrency: 'EUR',
         hostCurrencyFxRate: 1,
-        platformFeeInHostCurrency: 0,
+        platformTipAmount: 0,
         hostFeeInHostCurrency: 500,
         paymentProcessorFeeInHostCurrency: 200,
         type: 'CREDIT',
         createdAt: '2015-05-29T07:00:00.000Z',
         PaymentMethodId: 1,
         OrderId: order.id,
-        data: {
-          isFeesOnTop: true,
-        },
       };
 
       await Transaction.createFromContributionPayload(transactionPayload);
@@ -456,5 +449,49 @@ describe('server/models/Transaction', () => {
     expect(credit).to.have.property('currency').equal('EUR');
 
     expect(credit).to.have.property('amount').equal(402);
+  });
+
+  describe('createHostFeeShareTransactions', () => {
+    it('applies different host fees share based on the payment method / host plan', async () => {
+      await host.update({
+        plan: 'default',
+        hostFeePercent: 10,
+        data: {
+          plan: {
+            hostFeeSharePercent: 20,
+            creditCardHostFeeSharePercent: 0,
+            paypalHostFeeSharePercent: 0,
+          },
+        },
+      });
+
+      const amount = 1000;
+
+      // Helper to test with a given payment provider
+      const testFeesWithPaymentMethod = async (service, type) => {
+        const paymentMethod = await fakePaymentMethod({ service, type });
+        const order = await fakeOrder({
+          CollectiveId: collective.id,
+          totalAmount: amount,
+          PaymentMethodId: paymentMethod.id,
+        });
+        const transaction = await fakeTransaction({ OrderId: order.id, amount }, { createDoubleEntry: true });
+        const hostFeeTransaction = { amountInHostCurrency: amount * 0.1, hostCurrency: host.currency };
+        return Transaction.createHostFeeShareTransactions({ transaction, hostFeeTransaction }, host);
+      };
+
+      // Paypal payment
+      let result = await testFeesWithPaymentMethod('paypal', 'payment');
+      expect(result).to.be.undefined; // no host fee share
+
+      // Stripe
+      result = await testFeesWithPaymentMethod('stripe', 'creditcard');
+      expect(result).to.be.undefined; // no host fee share
+
+      // Manual
+      result = await testFeesWithPaymentMethod('opencollective', 'manual');
+      expect(result.hostFeeShareTransaction.amount).to.equal(Math.round(amount * 0.1 * 0.2));
+      expect(result.hostFeeShareDebtTransaction.amount).to.equal(-Math.round(amount * 0.1 * 0.2));
+    });
   });
 });

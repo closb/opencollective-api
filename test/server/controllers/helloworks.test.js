@@ -1,13 +1,20 @@
 import { expect } from 'chai';
 import config from 'config';
 import { get } from 'lodash';
-import Sinon from 'sinon';
+import { assert, createSandbox, spy } from 'sinon';
 
 import helloworksController from '../../../server/controllers/helloworks';
-import s3 from '../../../server/lib/awsS3';
+import * as awsS3Lib from '../../../server/lib/awsS3';
 import models from '../../../server/models';
 import { randEmail, randUrl } from '../../stores';
-import { fakeCollective, fakeExpense, fakeHost, fakeLegalDocument, fakeUser } from '../../test-helpers/fake-data';
+import {
+  fakeCollective,
+  fakeExpense,
+  fakeHost,
+  fakeLegalDocument,
+  fakeOrganization,
+  fakeUser,
+} from '../../test-helpers/fake-data';
 
 const HELLO_WORKS_WORKFLOW_ID = get(config, 'helloworks.workflowId');
 
@@ -55,11 +62,12 @@ const mockCallbackPayload = ({ accountType, accountId, userId, year }) => {
 };
 
 const getMockedRes = () => ({
-  sendStatus: Sinon.spy(),
+  sendStatus: spy(),
 });
 
 describe('server/controllers/helloworks', () => {
   let collective, host, s3Stub, expectedDocLocation;
+  const sandbox = createSandbox();
 
   before(async () => {
     host = await fakeHost();
@@ -67,21 +75,20 @@ describe('server/controllers/helloworks', () => {
     const requiredDoc = { HostCollectiveId: host.id, documentType: 'US_TAX_FORM' };
     await models.RequiredLegalDocument.create(requiredDoc);
     expectedDocLocation = randUrl();
-    s3Stub = Sinon.stub(s3, 'upload');
+    s3Stub = sandbox.stub(awsS3Lib, 'uploadToS3').resolves({ Location: expectedDocLocation });
   });
 
   after(() => {
-    s3Stub.restore();
+    sandbox.restore();
   });
 
   beforeEach(() => {
-    s3Stub.reset();
-    s3Stub.callsFake((_, callback) => callback(null, { Location: expectedDocLocation }));
+    sandbox.resetHistory();
   });
 
   it('works with individuals', async () => {
     const user = await fakeUser();
-    const year = new Date().getFullYear();
+    const year = 2023;
     await fakeExpense({
       status: 'APPROVED',
       FromCollectiveId: user.collective.id,
@@ -101,19 +108,19 @@ describe('server/controllers/helloworks', () => {
     const res = getMockedRes();
 
     await helloworksController.callback(req, res);
-    Sinon.assert.calledWith(res.sendStatus, 200);
+    assert.calledWith(res.sendStatus, 200);
     await document.reload();
 
-    expect(s3Stub.args[0][0].Key).to.eq(`US_TAX_FORM_${year}_${user.collective.name}.pdf`);
+    expect(s3Stub.args[0][0].Key).to.eq(`US_TAX_FORM/${year}/${user.collective.name}.pdf`);
     expect(document.requestStatus).to.eq('RECEIVED');
     expect(document.documentLink).to.eq(expectedDocLocation);
   });
 
   it('works with organizations', async () => {
-    const organization = await fakeCollective({ type: 'ORGANIZATION' });
+    const organization = await fakeOrganization();
     const user = await fakeUser();
     await organization.addUserWithRole(user, 'ADMIN');
-    const year = new Date().getFullYear();
+    const year = 2023;
     await fakeExpense({
       status: 'APPROVED',
       FromCollectiveId: organization.id,
@@ -133,7 +140,35 @@ describe('server/controllers/helloworks', () => {
     const res = getMockedRes();
 
     await helloworksController.callback(req, res);
-    Sinon.assert.calledWith(res.sendStatus, 200);
+    assert.calledWith(res.sendStatus, 200);
+    await document.reload();
+
+    expect(s3Stub.args[0][0].Key).to.eq(`US_TAX_FORM/${year}/${organization.name}.pdf`);
+    expect(document.requestStatus).to.eq('RECEIVED');
+    expect(document.documentLink).to.eq(expectedDocLocation);
+  });
+
+  it('generates pre-2023 tax forms with a different filename', async () => {
+    const organization = await fakeOrganization();
+    const user = await fakeUser();
+    await organization.addUserWithRole(user, 'ADMIN');
+    const year = 2022;
+    await fakeExpense({
+      status: 'APPROVED',
+      FromCollectiveId: organization.id,
+      amount: 8000,
+      currency: 'USD',
+      CollectiveId: collective.id,
+    });
+    const document = await fakeLegalDocument({ status: 'REQUESTED', CollectiveId: organization.id, year });
+
+    const req = {
+      body: mockCallbackPayload({ accountType: organization.type, accountId: organization.id, userId: user.id, year }),
+    };
+    const res = getMockedRes();
+
+    await helloworksController.callback(req, res);
+    assert.calledWith(res.sendStatus, 200);
     await document.reload();
 
     expect(s3Stub.args[0][0].Key).to.eq(`US_TAX_FORM_${year}_${organization.name}.pdf`);

@@ -12,14 +12,13 @@ If you see a step below that could be improved (or is outdated), please update t
 
 ### Prerequisite
 
-1. Make sure you have Node.js version >= 14.
+1. Make sure you have Node.js version 16.x and NPM version 8.x.
 
 - We recommend using [nvm](https://github.com/creationix/nvm): `nvm install && nvm use`.
 
 2. Make sure you have a PostgreSQL database available
 
 - Check the version: 11.0, 10.3, 9.6.8, 9.5.12, 9.4.17, 9.3.22 or newer
-- Check that the [PostGIS](https://postgis.net/install/) extension is available
 - More info in our [PostgreSQL Database](docs/postgres.md) documentation
 
 3. For [node-gyp](https://github.com/nodejs/node-gyp), make sure you have Python 2 available and configured as the active version.
@@ -44,6 +43,8 @@ npm run dev
 
 - API is started on http://localhost:3060
 - A local email inbox is started on http://localhost:1080
+
+See the [dev docs](docs/dev.md) for querying basics.
 
 #### Troubleshooting
 

@@ -1,7 +1,20 @@
+import debugLib from 'debug';
 import { map } from 'lodash';
 
 import errors from '../lib/errors';
 import logger from '../lib/logger';
+import { HandlerType, reportErrorToSentry } from '../lib/sentry';
+
+const debug = debugLib('error-handler');
+
+const isKnownError = error => {
+  try {
+    return Object.keys(errors).some(errorClass => error instanceof errors[errorClass]);
+  } catch (e) {
+    debug('isKnownError crash', error, Object.keys(errors), errors);
+    return false;
+  }
+};
 
 /**
  * error handler of the api
@@ -43,6 +56,11 @@ export default (err, req, res, next) => {
   }
 
   logger.error(`Express Error: ${err.message}`);
+
+  // Log unknown errors to Sentry
+  if (!isKnownError(err)) {
+    reportErrorToSentry(err, { handler: HandlerType.REST });
+  }
 
   res.status(err.code).send({ error: err });
 };

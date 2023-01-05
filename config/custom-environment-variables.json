@@ -19,7 +19,8 @@
         "min": "PG_MIN_CONNECTIONS",
         "max": "PG_MAX_CONNECTIONS"
       }
-    }
+    },
+    "readOnly": "DATABASE_READ_ONLY"
   },
   "graphql": {
     "apolloEngineAPIKey": "APOLLO_ENGINE_API_KEY",
@@ -55,7 +56,8 @@
   "stripe": {
     "secret": "STRIPE_SECRET",
     "key": "STRIPE_KEY",
-    "clientId": "STRIPE_CLIENT_ID"
+    "clientId": "STRIPE_CLIENT_ID",
+    "webhookSigningSecret": "STRIPE_WEBHOOK_SIGNING_SECRET"
   },
   "aws": {
     "s3": {
@@ -73,7 +75,6 @@
   },
   "paypal": {
     "classic": {
-      "email": "PAYPAL_EMAIL",
       "appId": "PAYPAL_APP_ID",
       "userId": "PAYPAL_USER_ID",
       "password": "PAYPAL_PASSWORD",
@@ -159,12 +160,10 @@
     "clientSecret": "TRANSFERWISE_CLIENT_SECRET",
     "redirectUri": "TRANSFERWISE_REDIRECT_URI",
     "privateKey": "TRANSFERWISE_PRIVATE_KEY",
+    "blockedCountries": "TRANSFERWISE_BLOCKED_COUNTRIES",
     "blockedCurrencies": "TRANSFERWISE_BLOCKED_CURRENCIES",
     "blockedCurrenciesForBusinessProfiles": "TRANSFERWISE_BLOCKED_CURRENCIES_BUSINESS",
     "blockedCurrenciesForNonProfits": "TRANSFERWISE_BLOCKED_CURRENCIES_NONPROFIT"
-  },
-  "fixie": {
-    "url": "FIXIE_URL"
   },
   "hyperwatch": {
     "enabled": "HYPERWATCH_ENABLED",
@@ -185,13 +184,14 @@
     "fetchHostTransactionsCsv": "FETCH_HOST_TRANSACTIONS_CSV"
   },
   "sentry": {
-    "dsn": "SENTRY_DSN"
+    "dsn": "SENTRY_DSN",
+    "tracesSampleRate": "SENTRY_TRACES_SAMPLE_RATE"
   },
   "privacy": {
     "apiUrl": "PRIVACY_API_URL"
   },
   "ledger": {
-    "separateHostFees": "LEDGER_SEPARATE_HOST_FEES"
+    "fastBalance": "LEDGER_FAST_BALANCE"
   },
   "activities": {
     "skipTransactions": "SKIP_TRANSACTION_ACTIVITIES"
@@ -203,5 +203,17 @@
     "aesEncryptionIv": "THEGIVINGBLOCK_AES_ENCRYPTION_IV",
     "aesEncryptionMethod": "THEGIVINGBLOCK_AES_ENCRYPTION_METHOD",
     "apiUrl": "THEGIVINGBLOCK_API_URL"
+  },
+  "twoFactorAuthentication": {
+    "enabled": "TWO_FACTOR_AUTHENTICATION_ENABLED"
+  },
+  "fraud": {
+    "order": {
+      "user": "FRAUD_ORDER_USER",
+      "card": "FRAUD_ORDER_CARD",
+      "email": "FRAUD_ORDER_EMAIL",
+      "ip": "FRAUD_ORDER_IP"
+    },
+    "enforceSuspendedAsset": "FRAUD_PROTECTION_SUSPEND_ASSET"
   }
 }

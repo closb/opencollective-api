@@ -1,10 +1,13 @@
 /* eslint-disable camelcase */
 import { isEmpty, omit } from 'lodash';
 
+import VirtualCardProviders from '../../constants/virtual_card_providers';
+import logger from '../../lib/logger';
 import * as privacy from '../../lib/privacy';
+import { reportMessageToSentry } from '../../lib/sentry';
 import models from '../../models';
 import VirtualCardModel from '../../models/VirtualCard';
-import { Transaction } from '../../types/privacy';
+import { PrivacyVirtualCardLimitIntervalToOCInterval, Transaction } from '../../types/privacy';
 import { CardProviderService } from '../types';
 import { getVirtualCardForTransaction, persistTransaction } from '../utils';
 
@@ -15,6 +18,12 @@ const processTransaction = async (
   privacyEvent: any,
 ): Promise<typeof models.Expense | undefined> => {
   const virtualCard = await getVirtualCardForTransaction(privacyTransaction.card.token);
+
+  if (!virtualCard) {
+    logger.error(`Privacy: could not find virtual card ${privacyTransaction.card.token}`, privacyEvent);
+    reportMessageToSentry('Privacy: could not find virtual card', { extra: { privacyEvent, privacyTransaction } });
+    return;
+  }
 
   if (privacyEvent) {
     const host = virtualCard.host;
@@ -38,7 +47,7 @@ const processTransaction = async (
 
 const assignCardToCollective = async (
   cardNumber: string,
-  expireDate: string,
+  expiryDate: string,
   cvv: string,
   name: string,
   collectiveId: number,
@@ -54,21 +63,19 @@ const assignCardToCollective = async (
     throw new Error('Could not find a Privacy Card matching the submitted card');
   }
 
-  const cardData = {
+  return await models.VirtualCard.create({
     id: card.token,
     name,
     last4: card.last_four,
-    privateData: { cardNumber, expireDate, cvv },
+    privateData: { cardNumber, expiryDate, cvv },
     data: omit(card, ['pan', 'cvv', 'exp_year', 'exp_month']),
     CollectiveId: collectiveId,
     HostCollectiveId: host.id,
     UserId: userId,
-    provider: 'PRIVACY',
+    provider: VirtualCardProviders.PRIVACY,
     spendingLimitAmount: card['spend_limit'] === 0 ? null : card['spend_limit'],
-    spendingLimitInterval: card['spend_limit_duration'],
-  };
-
-  return await models.VirtualCard.create(cardData);
+    spendingLimitInterval: PrivacyVirtualCardLimitIntervalToOCInterval[card['spend_limit_duration']],
+  });
 };
 
 const setCardState = async (virtualCard: VirtualCardModel, state: 'OPEN' | 'PAUSED'): Promise<VirtualCardModel> => {
@@ -102,8 +109,6 @@ const deleteCard = async (virtualCard: VirtualCardModel): Promise<void> => {
     // eslint-disable-next-line camelcase
     await privacy.updateCard(connectedAccount.token, { card_token: virtualCard.id, state: 'CLOSED' });
   }
-
-  return virtualCard.destroy();
 };
 
 const autoPauseResumeCard = async (virtualCard: VirtualCardModel) => {

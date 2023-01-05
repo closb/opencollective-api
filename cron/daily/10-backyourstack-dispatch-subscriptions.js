@@ -7,6 +7,7 @@ import { Op } from 'sequelize';
 import activities from '../../server/constants/activities';
 import status from '../../server/constants/order_status';
 import { dispatchFunds, needsDispatching } from '../../server/lib/backyourstack/dispatcher';
+import { reportErrorToSentry } from '../../server/lib/sentry';
 import models from '../../server/models';
 
 async function run() {
@@ -68,7 +69,10 @@ async function run() {
           await models.Activity.create({
             type: activities.BACKYOURSTACK_DISPATCH_CONFIRMED,
             UserId: order.CreatedByUserId,
-            CollectiveId: order.fromCollective.id,
+            CollectiveId: order.fromCollective.id, // TODO(InconsistentActivities): Should be Order.CollectiveId
+            FromCollectiveId: order.fromCollective.id,
+            HostCollectiveId: order.collective.approvedAt ? order.collective.HostCollectiveId : null,
+            OrderId: order.id,
             data: {
               orders: dispatchedOrders,
               collective: order.fromCollective.info,
@@ -79,6 +83,7 @@ async function run() {
         .catch(error => {
           console.log(`Error occurred processing and dispatching order ${order.id}`);
           console.error(error);
+          reportErrorToSentry(error);
         });
     },
     { concurrency: 3 },
@@ -93,5 +98,6 @@ run()
   .catch(error => {
     console.log('Error when dispatching fund');
     console.error(error);
+    reportErrorToSentry(error);
     process.exit(1);
   });

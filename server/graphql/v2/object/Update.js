@@ -1,24 +1,16 @@
 import { GraphQLBoolean, GraphQLInt, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
-import { GraphQLDateTime } from 'graphql-iso-date';
+import { GraphQLDateTime } from 'graphql-scalars';
 import { GraphQLJSON } from 'graphql-type-json';
 
 import { types as CollectiveType } from '../../../constants/collectives';
 import models from '../../../models';
+import { canSeeUpdate } from '../../common/update';
 import { CommentCollection } from '../collection/CommentCollection';
 import { UpdateAudienceType } from '../enum';
 import { getIdEncodeResolver, IDENTIFIER_TYPES } from '../identifiers';
 import { Account } from '../interface/Account';
 
 import { UpdateAudienceStats } from './UpdateAudienceStats';
-
-const canSeeUpdateDetails = async (req, update) => {
-  if (!update.publishedAt || update.isPrivate) {
-    update.collective = update.collective || (await req.loaders.Collective.byId.load(update.CollectiveId));
-    return Boolean(req.remoteUser?.canSeePrivateUpdatesForCollective(update.collective));
-  } else {
-    return true;
-  }
-};
 
 const Update = new GraphQLObjectType({
   name: 'Update',
@@ -40,7 +32,7 @@ const Update = new GraphQLObjectType({
         description: 'Indicates whether or not the user is allowed to see the content of this update',
         type: new GraphQLNonNull(GraphQLBoolean),
         resolve(update, _, req) {
-          return canSeeUpdateDetails(req, update);
+          return canSeeUpdate(update, req);
         },
       },
       userCanPublishUpdate: {
@@ -86,6 +78,18 @@ const Update = new GraphQLObjectType({
           let membersStats = {};
           let hostedCollectivesCount = 0;
 
+          if (audience === 'NO_ONE') {
+            return {
+              id: `${update.id}-${audience}`,
+              individuals: 0,
+              organizations: 0,
+              collectives: 0,
+              coreContributors: 0,
+              hosted: 0,
+              total: 0,
+            };
+          }
+
           if (audience !== 'COLLECTIVE_ADMINS') {
             membersStats = await update.getAudienceMembersStats(audience);
           }
@@ -109,7 +113,7 @@ const Update = new GraphQLObjectType({
       summary: {
         type: GraphQLString,
         async resolve(update, _, req) {
-          if (!(await canSeeUpdateDetails(req, update))) {
+          if (!(await canSeeUpdate(update, req))) {
             return null;
           } else {
             return update.summary || '';
@@ -119,7 +123,7 @@ const Update = new GraphQLObjectType({
       html: {
         type: GraphQLString,
         async resolve(update, _, req) {
-          if (!(await canSeeUpdateDetails(req, update))) {
+          if (!(await canSeeUpdate(update, req))) {
             return null;
           } else {
             return update.html;
@@ -163,7 +167,7 @@ const Update = new GraphQLObjectType({
           offset: { type: new GraphQLNonNull(GraphQLInt), defaultValue: 0 },
         },
         async resolve(update, args, req) {
-          if (!(await canSeeUpdateDetails(req, update))) {
+          if (!(await canSeeUpdate(update, req))) {
             return null;
           }
 

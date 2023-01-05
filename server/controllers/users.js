@@ -1,16 +1,15 @@
 import config from 'config';
 
+import { activities } from '../constants';
 import { BadRequest } from '../graphql/errors';
 import * as auth from '../lib/auth';
 import emailLib from '../lib/email';
 import errors from '../lib/errors';
 import logger from '../lib/logger';
 import RateLimit, { ONE_HOUR_IN_SECONDS } from '../lib/rate-limit';
-import {
-  verifyTwoFactorAuthenticationRecoveryCode,
-  verifyTwoFactorAuthenticatorCode,
-} from '../lib/two-factor-authentication';
-import { isValidEmail } from '../lib/utils';
+import { verifyTwoFactorAuthenticationRecoveryCode } from '../lib/two-factor-authentication';
+import { validateTOTPToken } from '../lib/two-factor-authentication/totp';
+import { isValidEmail, parseToBoolean } from '../lib/utils';
 import models from '../models';
 
 const { Unauthorized, ValidationFailed, TooManyRequests } = errors;
@@ -51,31 +50,66 @@ export const exists = async (req, res) => {
 
 /**
  * Login or create a new user
+ *
+ * TODO: we are passing createProfile from frontend to specify if we need to
+ * create a new account. In the future once signin.js is fully deprecated (replaced by signinV2.js)
+ * this function should be refactored to remove createProfile.
  */
-export const signin = (req, res, next) => {
-  const { user, redirect, websiteUrl } = req.body;
-  let loginLink;
-  let clientIP;
-  return models.User.findOne({ where: { email: user.email.toLowerCase() } })
-    .then(u => u || models.User.createUserWithCollective(user))
-    .then(u => {
-      loginLink = u.generateLoginLink(redirect || '/', websiteUrl);
-      clientIP = req.ip;
-      if (config.env === 'development') {
-        logger.info(`Login Link: ${loginLink}`);
-      }
-      return emailLib.send('user.new.token', u.email, { loginLink, clientIP }, { sendEvenIfNotProduction: true });
-    })
-    .then(() => {
-      const response = { success: true };
-      // For e2e testing, we enable testuser+(admin|member)@opencollective.com to automatically receive the login link
-      if (config.env !== 'production' && user.email.match(/.*test.*@opencollective.com$/)) {
-        response.redirect = loginLink;
-      }
-      return response;
-    })
-    .then(response => res.send(response))
-    .catch(next);
+export const signin = async (req, res, next) => {
+  const { redirect, websiteUrl, createProfile = true } = req.body;
+  try {
+    const rateLimit = new RateLimit(
+      `user_signin_attempt_ip_${req.ip}`,
+      config.limits.userSigninAttemptsPerHourPerIp,
+      ONE_HOUR_IN_SECONDS,
+      true,
+    );
+    if (!(await rateLimit.registerCall())) {
+      return res.status(403).send({
+        error: { message: 'Rate limit exceeded' },
+      });
+    }
+    let user = await models.User.findOne({ where: { email: req.body.user.email.toLowerCase() } });
+    if (!user && !createProfile) {
+      return res.status(400).send({
+        errorCode: 'EMAIL_DOES_NOT_EXIST',
+        message: 'Email does not exist',
+      });
+    } else if (!user && createProfile) {
+      user = await models.User.createUserWithCollective(req.body.user);
+    }
+    const loginLink = user.generateLoginLink(redirect || '/', websiteUrl);
+    const clientIP = req.ip;
+    if (config.env === 'development') {
+      logger.info(`Login Link: ${loginLink}`);
+    }
+
+    await emailLib.send(
+      activities.USER_NEW_TOKEN,
+      user.email,
+      { loginLink, clientIP },
+      { sendEvenIfNotProduction: true },
+    );
+
+    if (!parseToBoolean(config.database.readOnly)) {
+      await models.Activity.create({
+        type: activities.USER_NEW_TOKEN,
+        UserId: user.id,
+        FromCollectiveId: user.CollectiveId,
+        CollectiveId: user.CollectiveId,
+        data: { notify: false },
+      });
+    }
+
+    const response = { success: true };
+    // For e2e testing, we enable testuser+(admin|member)@opencollective.com to automatically receive the login link
+    if (config.env !== 'production' && user.email.match(/.*test.*@opencollective.com$/)) {
+      response.redirect = loginLink;
+    }
+    res.send(response);
+  } catch (e) {
+    next(e);
+  }
 };
 
 /**
@@ -87,11 +121,15 @@ export const signin = (req, res, next) => {
  * the 2FA flow on the frontend
  */
 export const updateToken = async (req, res) => {
-  if (req.remoteUser.twoFactorAuthToken !== null) {
-    const token = req.remoteUser.jwt({ scope: 'twofactorauth' }, auth.TOKEN_EXPIRATION_SESSION);
+  const twoFactorAuthenticationEnabled = parseToBoolean(config.twoFactorAuthentication.enabled);
+  if (twoFactorAuthenticationEnabled && req.remoteUser.twoFactorAuthToken !== null) {
+    const token = req.remoteUser.jwt(
+      { scope: 'twofactorauth', sessionId: req.jwtPayload?.sessionId },
+      auth.TOKEN_EXPIRATION_SESSION,
+    );
     res.send({ token });
   } else {
-    const token = req.remoteUser.jwt({}, auth.TOKEN_EXPIRATION_SESSION);
+    const token = req.remoteUser.jwt({ sessionId: req.jwtPayload?.sessionId }, auth.TOKEN_EXPIRATION_SESSION);
     res.send({ token });
   }
 };
@@ -103,6 +141,7 @@ export const twoFactorAuthAndUpdateToken = async (req, res, next) => {
   const { twoFactorAuthenticatorCode, twoFactorAuthenticationRecoveryCode } = req.body;
 
   const userId = Number(req.jwtPayload.sub);
+  const sessionId = req.jwtPayload.sessionId;
 
   // Both 2FA and recovery codes rate limited to 10 tries per hour
   const rateLimit = new RateLimit(`user_2FA_endpoint_${userId}`, 10, ONE_HOUR_IN_SECONDS);
@@ -124,7 +163,7 @@ export const twoFactorAuthAndUpdateToken = async (req, res, next) => {
 
   if (twoFactorAuthenticatorCode) {
     // if there is a 2FA code, we need to verify it before returning the token
-    const verified = verifyTwoFactorAuthenticatorCode(user.twoFactorAuthToken, twoFactorAuthenticatorCode);
+    const verified = validateTOTPToken(user.twoFactorAuthToken, twoFactorAuthenticatorCode);
     if (!verified) {
       return fail(new Unauthorized('Two-factor authentication code failed. Please try again'));
     }
@@ -146,6 +185,6 @@ export const twoFactorAuthAndUpdateToken = async (req, res, next) => {
     return fail(new BadRequest('This endpoint requires you to provide a 2FA code or a recovery code'));
   }
 
-  const token = user.jwt({}, auth.TOKEN_EXPIRATION_SESSION);
+  const token = user.jwt({ sessionId }, auth.TOKEN_EXPIRATION_SESSION);
   res.send({ token: token });
 };

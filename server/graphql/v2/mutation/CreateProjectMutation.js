@@ -4,7 +4,8 @@ import { pick } from 'lodash';
 import roles from '../../../constants/roles';
 import { isCollectiveSlugReserved } from '../../../lib/collectivelib';
 import models from '../../../models';
-import { NotFound, Unauthorized } from '../../errors';
+import { checkRemoteUserCanUseAccount } from '../../common/scope-check';
+import { Forbidden, NotFound } from '../../errors';
 import { AccountReferenceInput, fetchAccountWithReference } from '../input/AccountReferenceInput';
 import { ProjectCreateInput } from '../input/ProjectCreateInput';
 import { Project } from '../object/Project';
@@ -29,28 +30,24 @@ const DEFAULT_PROJECT_SETTINGS = {
 };
 
 async function createProject(_, args, req) {
-  const { loaders, remoteUser } = req;
-
-  if (!remoteUser) {
-    throw new Unauthorized('You need to be logged in to create a Project');
-  }
+  checkRemoteUserCanUseAccount(req);
 
   const parent = await fetchAccountWithReference(args.parent);
   if (!parent) {
     throw new NotFound('Parent not found');
   }
   if (!req.remoteUser.hasRole([roles.ADMIN, roles.MEMBER], parent.id)) {
-    throw new Unauthorized(`You must be logged in as a member of the ${parent.slug} collective to create a Project`);
+    throw new Forbidden(`You must be logged in as a member of the ${parent.slug} collective to create a Project`);
   }
 
   const projectData = {
     type: 'PROJECT',
     slug: args.project.slug.toLowerCase(),
     ...pick(args.project, ['name', 'description']),
-    ...pick(parent.info, ['currency', 'HostCollectiveId', 'isActive', 'platformFeePercent', 'hostFeePercent']),
+    ...pick(parent, ['currency', 'isActive', 'platformFeePercent', 'hostFeePercent', 'data.useCustomHostFee']),
     approvedAt: parent.isActive ? new Date() : null,
     ParentCollectiveId: parent.id,
-    CreatedByUserId: remoteUser.id,
+    CreatedByUserId: req.remoteUser.id,
     settings: { ...DEFAULT_PROJECT_SETTINGS, ...args.project.settings },
   };
 
@@ -64,18 +61,26 @@ async function createProject(_, args, req) {
 
   const project = await models.Collective.create(projectData);
 
-  if (project.HostCollectiveId) {
-    const host = await loaders.Collective.byId.load(project.HostCollectiveId);
+  if (parent.HostCollectiveId) {
+    const host = await req.loaders.Collective.byId.load(parent.HostCollectiveId);
     if (host) {
-      await project.addHost(host, remoteUser);
+      await project.addHost(host, req.remoteUser);
+
+      // Inherit fees from parent collective after setting its host
+      await project.update({
+        hostFeePercent: parent.hostFeePercent,
+        data: { ...project.data, useCustomHostFee: Boolean(parent.data?.useCustomHostFee) },
+      });
     }
   }
 
+  project.generateCollectiveCreatedActivity(req.remoteUser, req.userToken);
   return project;
 }
 
 const createProjectMutation = {
   type: Project,
+  description: 'Create a Project. Scope: "account".',
   args: {
     project: {
       description: 'Information about the Project to create (name, slug, description, tags, settings)',

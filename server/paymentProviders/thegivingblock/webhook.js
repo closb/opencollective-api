@@ -16,7 +16,7 @@ export async function webhook(req) {
   logger.info(`payload: ${JSON.stringify(payload)}`);
 
   if (req.body.eventType === 'TRANSACTION_CONVERTED') {
-    // See: https://app.gitbook.com/@the-giving-block/s/public-api-documentation/webhook-notifications
+    // See: https://the-giving-block.gitbook.io/public-api-documentation/webhook-notifications
     const { pledgeId, valueAtDonationTimeUSD } = payload;
 
     const order = await models.Order.findOne({
@@ -39,6 +39,9 @@ export async function webhook(req) {
       status: OrderStatus.PAID,
       data: { ...order.data, payload },
     });
+
+    // Create BACKER
+    await order.getOrCreateMembers();
 
     // process as paid
     const transaction = await confirmOrder(order);

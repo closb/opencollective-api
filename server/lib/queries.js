@@ -2,13 +2,18 @@ import Promise from 'bluebird';
 import config from 'config';
 import { get, pick } from 'lodash';
 
-import { TAX_FORM_IGNORED_EXPENSE_TYPES, US_TAX_FORM_VALIDITY_IN_YEARS } from '../constants/tax-form';
+import {
+  TAX_FORM_IGNORED_EXPENSE_STATUSES,
+  TAX_FORM_IGNORED_EXPENSE_TYPES,
+  US_TAX_FORM_VALIDITY_IN_YEARS,
+} from '../constants/tax-form';
 import { PayoutMethodTypes } from '../models/PayoutMethod';
 
 import { memoize } from './cache';
 import { convertToCurrency } from './currency';
 import sequelize, { Op } from './sequelize';
 import { amountsRequireTaxForm } from './tax-forms';
+import { ifStr } from './utils';
 
 const twoHoursInSeconds = 2 * 60 * 60;
 const models = sequelize.models;
@@ -97,7 +102,10 @@ const getTotalAnnualBudgetForHost = HostCollectiveId => {
       `
   WITH
     "collectiveids" AS (
-      SELECT id FROM "Collectives" WHERE "HostCollectiveId"=:HostCollectiveId AND "isActive"=true
+      SELECT id FROM "Collectives"
+      WHERE "HostCollectiveId" = :HostCollectiveId
+      AND "isActive"=true
+      AND "deletedAt" IS NULL
     ),
     "monthlyOrdersWithAmountInHostCurrency" AS (
       SELECT o.id, MAX(o."CollectiveId") as "CollectiveId", MAX(t.currency) AS currency, MAX(t."amountInHostCurrency") as "amountInHostCurrency"
@@ -106,7 +114,9 @@ const getTotalAnnualBudgetForHost = HostCollectiveId => {
       LEFT JOIN "Transactions" t ON t."OrderId" = o.id
       WHERE s.interval = 'month' AND s."isActive" = true
         AND o."CollectiveId" IN (SELECT id FROM collectiveids)
+        AND o."deletedAt" IS NULL
         AND s."deletedAt" IS NULL
+        AND t."deletedAt" IS NULL
       GROUP BY o.id
     ),
     "yearlyAndOneTimeOrdersWithAmountInHostCurrency" AS (
@@ -116,8 +126,10 @@ const getTotalAnnualBudgetForHost = HostCollectiveId => {
       LEFT JOIN "Transactions" t ON t."OrderId" = o.id
       WHERE ((s.interval = 'year' AND s."isActive" = true) OR s.interval IS NULL)
         AND o."CollectiveId" IN (SELECT id FROM collectiveids)
+        AND o."deletedAt" IS NULL
         AND s."deletedAt" IS NULL
         AND t."createdAt" > (current_date - INTERVAL '12 months')
+        AND t."deletedAt" IS NULL
       GROUP BY o.id
     )
 
@@ -133,7 +145,10 @@ const getTotalAnnualBudgetForHost = HostCollectiveId => {
       WHERE t.type='CREDIT' AND t."CollectiveId" IN (SELECT id FROM collectiveids)
         AND t."deletedAt" IS NULL
         AND t."createdAt" > (current_date - INTERVAL '12 months')
-        AND s.interval = 'month' AND s."isActive" IS FALSE AND s."deletedAt" IS NULL)
+        AND s.interval = 'month' AND s."isActive" IS FALSE AND s."deletedAt" IS NULL
+        AND t."deletedAt" IS NULL
+        AND o."deletedAt" IS NULL
+    )
     "yearlyIncome"
   `,
       {
@@ -191,40 +206,6 @@ const getTotalAnnualBudget = async () => {
 };
 
 /**
- * Returns the total amount of donations made by collective type (USER/ORGANIZATION/COLLECTIVE) (in cents in the currency of the CollectiveId)
- * @param {*} CollectiveId
- */
-const getTotalDonationsByCollectiveType = CollectiveId => {
-  return sequelize.query(
-    `
-    SELECT MAX(c.type) as type, SUM("netAmountInCollectiveCurrency") as "totalDonations" FROM "Transactions" t LEFT JOIN "Collectives" c ON t."FromCollectiveId" = c.id WHERE c.type='USER' AND t."CollectiveId"=:CollectiveId and t.type='CREDIT' GROUP BY c.type ORDER BY "totalDonations" DESC
-  `,
-    {
-      replacements: { CollectiveId },
-      type: sequelize.QueryTypes.SELECT,
-    },
-  );
-};
-
-/**
- * Returns an array with the top (default 3) donors for a given CollectiveId (where the money comes from)
- * @param {*} CollectiveId
- * @param {*} options
- */
-const getTopDonorsForCollective = (CollectiveId, options = {}) => {
-  options.limit = options.limit || 3;
-  return sequelize.query(
-    `
-    SELECT MAX(c.slug) as slug, MAX(c.image) as image, MAX(c.name) as name, SUM("netAmountInCollectiveCurrency") as "totalDonations" FROM "Transactions" t LEFT JOIN "Collectives" c ON t."FromCollectiveId" = c.id WHERE t."CollectiveId"=:CollectiveId and t.type='CREDIT' GROUP BY c.id ORDER BY "totalDonations" DESC LIMIT :limit
-  `,
-    {
-      replacements: { CollectiveId, limit: options.limit },
-      type: sequelize.QueryTypes.SELECT,
-    },
-  );
-};
-
-/**
  * Returns the top backers (Collectives) in a given time range in given tags
  * E.g. top backers in open source collectives last June
  */
@@ -249,6 +230,7 @@ const getTopBackers = (since, until, tags, limit) => {
     LEFT JOIN "Collectives" collective ON collective.id = t."CollectiveId"
     WHERE
       t.type='CREDIT'
+      AND t."deletedAt" IS NULL
       ${sinceClause}
       ${untilClause}
       ${tagsClause}
@@ -326,7 +308,7 @@ export const usersToNotifyForUpdateSQLQuery = `
   WITH collective AS (
     SELECT c.*
     FROM "Collectives" c
-    WHERE id = :collectiveId
+    WHERE id = :collectiveId OR "ParentCollectiveId" = :collectiveId
   ), hosted_collectives AS (
     SELECT hc.*
     FROM "Collectives" hc
@@ -361,6 +343,11 @@ export const usersToNotifyForUpdateSQLQuery = `
         collective."ParentCollectiveId" IS NOT NULL
         AND m."CollectiveId" = collective."ParentCollectiveId"
         AND m."role" IN ('ADMIN', 'MEMBER')
+      ) OR (
+        --- Include child collective's contributors
+        collective."ParentCollectiveId" = :collectiveId
+        AND collective.id = m."CollectiveId"
+        AND m."role" IN (:targetRoles)
       )
     )
     GROUP BY mc.id
@@ -408,16 +395,21 @@ export const countMembersToNotifyForUpdateSQLQuery = `
     SELECT mc.id, mc."type", array_agg(m."role")::text[] && ARRAY['ADMIN', 'MEMBER'] AS is_core_contributor
     FROM "Members" m
     INNER JOIN "Collectives" mc ON m."MemberCollectiveId" = mc.id
-    FULL OUTER JOIN "Collectives" collective ON collective.id = :collectiveId
+    FULL OUTER JOIN "Collectives" collective ON (collective.id = :collectiveId OR collective."ParentCollectiveId" = :collectiveId)
     WHERE m."deletedAt" IS NULL
     AND mc."deletedAt" IS NULL
     AND ((
         m."CollectiveId" = collective.id AND m."role" IN (:targetRoles)
       ) OR (
-        -- Inlcude parent collective's core contributors
+        -- Include parent collective's core contributors
         collective."ParentCollectiveId" IS NOT NULL
         AND m."CollectiveId" = collective."ParentCollectiveId"
         AND m."role" IN ('ADMIN', 'MEMBER')
+      ) OR (
+        --- Include child collective's contributors
+        collective."ParentCollectiveId" = :collectiveId
+        AND collective.id = m."CollectiveId"
+        AND m."role" IN (:targetRoles)
       )
     )
     GROUP BY mc.id
@@ -763,8 +755,6 @@ const getMembersWithTotalDonations = (where, options = {}) => {
       max(c."ParentCollectiveId") as "ParentCollectiveId",
       max(c.name) as name,
       max(c.description) as description,
-      max(u."firstName") as "firstName",
-      max(u."lastName") as "lastName",
       max(c.slug) as slug,
       max(c.image) as image,
       max(c.website) as website,
@@ -860,8 +850,6 @@ const getMembersWithBalance = (where, options = {}) => {
       max(c."HostCollectiveId") as "HostCollectiveId",
       max(c."ParentCollectiveId") as "ParentCollectiveId",
       max(c.name) as name,
-      max(u."firstName") as "firstName",
-      max(u."lastName") as "lastName",
       max(c.slug) as slug,
       max(c.image) as image,
       max(c.website) as website,
@@ -1044,9 +1032,13 @@ const getTaxFormsRequiredForExpenses = async expenseIds => {
       ON all_expenses_collectives.id = all_expenses."CollectiveId"
       AND all_expenses_collectives."HostCollectiveId" = d."HostCollectiveId"
     LEFT JOIN "LegalDocuments" ld
-      ON ld."CollectiveId" = analyzed_expenses."FromCollectiveId"
-      AND ld.year + :validityInYears >= date_part('year', analyzed_expenses."incurredAt")
+      ON ld.year + :validityInYears >= date_part('year', analyzed_expenses."incurredAt")
       AND ld."documentType" = 'US_TAX_FORM'
+      AND ld."requestStatus" = 'RECEIVED'
+      AND (
+        ld."CollectiveId" = from_collective.id -- Either use the payee's legal document
+        OR (from_collective."HostCollectiveId" IS NOT NULL AND ld."CollectiveId" = from_collective."HostCollectiveId") -- Or the host's legal document
+      )
     LEFT JOIN "PayoutMethods" pm
       ON all_expenses."PayoutMethodId" = pm.id
     WHERE analyzed_expenses.id IN (:expenseIds)
@@ -1056,9 +1048,10 @@ const getTaxFormsRequiredForExpenses = async expenseIds => {
     AND analyzed_expenses."deletedAt" IS NULL
     AND (from_collective."HostCollectiveId" IS NULL OR from_collective."HostCollectiveId" != c."HostCollectiveId")
     AND all_expenses.type NOT IN (:ignoredExpenseTypes)
-    AND all_expenses.status NOT IN ('ERROR', 'REJECTED', 'DRAFT', 'UNVERIFIED')
+    AND all_expenses.status NOT IN (:ignoredExpenseStatuses)
     AND all_expenses."deletedAt" IS NULL
     AND date_trunc('year', all_expenses."incurredAt") = date_trunc('year', analyzed_expenses."incurredAt")
+    AND ld.id IS NULL -- Ignore documents that have already been received
     GROUP BY analyzed_expenses.id, analyzed_expenses."FromCollectiveId", d."documentType", COALESCE(pm."type", 'OTHER')
   `,
     {
@@ -1068,6 +1061,7 @@ const getTaxFormsRequiredForExpenses = async expenseIds => {
         expenseIds,
         validityInYears: US_TAX_FORM_VALIDITY_IN_YEARS,
         ignoredExpenseTypes: TAX_FORM_IGNORED_EXPENSE_TYPES,
+        ignoredExpenseStatuses: TAX_FORM_IGNORED_EXPENSE_STATUSES,
       },
     },
   );
@@ -1096,18 +1090,23 @@ const getTaxFormsRequiredForAccounts = async (accountIds = [], year) => {
       ON d."HostCollectiveId" = c."HostCollectiveId"
       AND d."documentType" = 'US_TAX_FORM'
     LEFT JOIN "LegalDocuments" ld
-      ON ld."CollectiveId" = account.id
-      AND ld.year + :validityInYears >= :year
+      ON ld.year + :validityInYears >= :year
       AND ld."documentType" = 'US_TAX_FORM'
+      AND ld."requestStatus" = 'RECEIVED'
+      AND (
+        ld."CollectiveId" = account.id -- Either use the account's legal document
+        OR (account."HostCollectiveId" IS NOT NULL AND ld."CollectiveId" = account."HostCollectiveId") -- Or the host's legal document
+      )
     LEFT JOIN "PayoutMethods" pm
       ON all_expenses."PayoutMethodId" = pm.id
     WHERE all_expenses.type NOT IN (:ignoredExpenseTypes)
-    ${accountIds?.length ? 'AND account.id IN (:accountIds)' : ''}
+    ${ifStr(accountIds?.length, 'AND account.id IN (:accountIds)')}
     AND account.id != d."HostCollectiveId"
-    AND (account."HostCollectiveId" IS NULL OR account."HostCollectiveId" != d."HostCollectiveId")
-    AND all_expenses.status NOT IN ('ERROR', 'REJECTED', 'DRAFT', 'UNVERIFIED')
+    AND (account."HostCollectiveId" IS NULL OR account."HostCollectiveId" != d."HostCollectiveId") -- Ignore tax forms when the submitter is hosted by a host that has tax form enabled (OCF, OSC, OC)
+    AND all_expenses.status NOT IN (:ignoredExpenseStatuses)
     AND all_expenses."deletedAt" IS NULL
     AND EXTRACT('year' FROM all_expenses."incurredAt") = :year
+    AND ld.id IS NULL -- Ignore documents that have already been received
     GROUP BY account.id, d."documentType", COALESCE(pm."type", 'OTHER')
   `,
     {
@@ -1118,43 +1117,12 @@ const getTaxFormsRequiredForAccounts = async (accountIds = [], year) => {
         year: year,
         validityInYears: US_TAX_FORM_VALIDITY_IN_YEARS,
         ignoredExpenseTypes: TAX_FORM_IGNORED_EXPENSE_TYPES,
+        ignoredExpenseStatuses: TAX_FORM_IGNORED_EXPENSE_STATUSES,
       },
     },
   );
 
   return getTaxFormsOverTheLimit(results, 'collectiveId');
-};
-
-/**
- * Returns the contribution or expense amounts over time.
- */
-const getTransactionsTimeSeries = async (kind, type, hostCollectiveId, timeUnit, collectiveIds, dateFrom, dateTo) => {
-  return sequelize.query(
-    `SELECT DATE_TRUNC(:timeUnit, "createdAt") AS "date", sum("amountInHostCurrency") as "amount", "hostCurrency" as "currency"
-       FROM "Transactions"
-       WHERE kind = :kind
-         AND "HostCollectiveId" = :hostCollectiveId
-         AND type = :type
-         AND "deletedAt" IS NULL
-         ${collectiveIds ? `AND "CollectiveId" IN (:collectiveIds)` : ``}
-         ${dateFrom ? `AND "createdAt" >= :dateFrom` : ``}
-         ${dateTo ? `AND "createdAt" <= :dateTo` : ``}
-       GROUP BY DATE_TRUNC(:timeUnit, "createdAt"), "hostCurrency"
-       ORDER BY DATE_TRUNC(:timeUnit, "createdAt")
-      `,
-    {
-      type: sequelize.QueryTypes.SELECT,
-      replacements: {
-        kind,
-        type,
-        hostCollectiveId,
-        timeUnit,
-        collectiveIds,
-        dateFrom,
-        dateTo,
-      },
-    },
-  );
 };
 
 const serializeCollectivesResult = JSON.stringify;
@@ -1193,16 +1161,13 @@ const queries = {
   getTaxFormsRequiredForAccounts,
   getTaxFormsRequiredForExpenses,
   getTopBackers,
-  getTopDonorsForCollective,
   getTopSponsors,
   getTotalAnnualBudget,
   getTotalAnnualBudgetForHost,
-  getTotalDonationsByCollectiveType,
   getTotalNumberOfActiveCollectives,
   getTotalNumberOfDonors,
   getUniqueCollectiveTags,
   getGiftCardBatchesForCollective,
-  getTransactionsTimeSeries,
 };
 
 export default queries;

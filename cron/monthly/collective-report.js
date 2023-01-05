@@ -6,10 +6,13 @@ import config from 'config';
 import { omit, pick } from 'lodash';
 import moment from 'moment';
 
+import { roles } from '../../server/constants';
+import ActivityTypes from '../../server/constants/activities';
 import { TransactionKind } from '../../server/constants/transaction-kind';
 import { generateHostFeeAmountForTransactionLoader } from '../../server/graphql/loaders/transactions';
 import { getCollectiveTransactionsCsv } from '../../server/lib/csv';
-import { notifyAdminsOfCollective } from '../../server/lib/notifications';
+import { notify } from '../../server/lib/notifications/email';
+import { reportErrorToSentry } from '../../server/lib/sentry';
 import { getTiersStats, parseToBoolean } from '../../server/lib/utils';
 import models, { Op } from '../../server/models';
 
@@ -139,8 +142,8 @@ const processCollective = async collective => {
     }),
   ];
 
-  let emailData = {};
-  const options = { attachments: [] };
+  let emailData = { isSystem: true };
+  const options = { attachments: [], role: [roles.ADMIN, roles.ACCOUNTANT] };
   const csvFilename = `${collective.slug}-${moment(d).format(dateFormat)}-transactions.csv`;
 
   return Promise.all(promises)
@@ -210,13 +213,15 @@ const processCollective = async collective => {
     })
     .then(async collective => {
       const activity = {
-        type: 'collective.monthlyreport',
+        type: ActivityTypes.COLLECTIVE_MONTHLY_REPORT,
+        CollectiveId: collective.id,
         data: emailData,
       };
-      return notifyAdminsOfCollective(collective.id, activity, options);
+      return notify.collective(activity, options);
     })
     .catch(e => {
       console.error('Error in processing collective', collective.slug, e);
+      reportErrorToSentry(e);
     });
 };
 

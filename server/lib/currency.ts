@@ -1,7 +1,6 @@
-import Promise from 'bluebird';
 import config from 'config';
 import debugLib from 'debug';
-import { get, has, keys, zipObject } from 'lodash';
+import { difference, get, has, keys, merge, uniq, zipObject } from 'lodash';
 import fetch from 'node-fetch';
 
 import { currencyFormats, SUPPORTED_CURRENCIES } from '../constants/currencies';
@@ -9,6 +8,7 @@ import models from '../models';
 
 import cache from './cache';
 import logger from './logger';
+import { reportErrorToSentry, reportMessageToSentry } from './sentry';
 
 const debug = debugLib('currency');
 
@@ -90,6 +90,9 @@ export const getRatesFromDb = async (
     // If some currencies are still missing, we have no choice but to throw an error
     if (missingCurrencies.length > 0) {
       logger.error(`FX rate error: missing currencies in CurrencyExchangeRate: ${missingCurrencies.join(', ')}`);
+      reportMessageToSentry('FX rate error: missing currencies in CurrencyExchangeRate', {
+        extra: { fromCurrency, toCurrencies, missingCurrencies },
+      });
       throw new Error(
         'We are not able to fetch the currency FX rates for some currencies at the moment, some statistics may be unavailable',
       );
@@ -106,41 +109,53 @@ export async function fetchFxRates(
 ): Promise<Record<string, number>> {
   date = getDate(date);
 
-  const params = {
-    access_key: config.fixer.accessKey, // eslint-disable-line camelcase
-    base: fromCurrency,
-    symbols: toCurrencies.join(','),
-  };
+  const useFixerApi = Boolean(get(config, 'fixer.accessKey'));
+  const isLiveEnv = ['staging', 'production'].includes(config.env);
 
-  const searchParams = Object.keys(params)
-    .map(key => `${key}=${params[key]}`)
-    .join('&');
+  // Try to fetch the FX rates from fixer.io
+  if (!useFixerApi) {
+    logger.info('Fixer API is not configured, lib/currency will always return 1.1');
+  } else {
+    const params = {
+      access_key: config.fixer.accessKey, // eslint-disable-line camelcase
+      base: fromCurrency,
+      symbols: toCurrencies.join(','),
+    };
 
-  try {
-    const res = await fetch(`https://data.fixer.io/${date}?${searchParams}`);
-    const json = await res.json();
-    if (json.error) {
-      throw new Error(json.error.info);
+    const searchParams = Object.keys(params)
+      .map(key => `${key}=${params[key]}`)
+      .join('&');
+
+    try {
+      const res = await fetch(`https://data.fixer.io/${date}?${searchParams}`);
+      const json = await res.json();
+      if (json.error) {
+        throw new Error(json.error.info);
+      }
+      const rates = {};
+      keys(json.rates).forEach(to => {
+        rates[to] = parseFloat(json.rates[to]);
+        const cacheTtl = date === 'latest' ? 60 * 60 /* 60 minutes */ : null; /* no expiration */
+        cache.set(`${date}-${fromCurrency}-${to}`, rates[to], cacheTtl);
+      });
+
+      return rates;
+    } catch (error) {
+      if (!isLiveEnv) {
+        logger.info(`Unable to fetch fxRate with Fixer API: ${error.message}. Returning 1.1`);
+      } else {
+        logger.error(`Unable to fetch fxRate with Fixer API: ${error.message}. Using DB fallback`);
+        reportErrorToSentry(error);
+      }
     }
-    const rates = {};
-    keys(json.rates).forEach(to => {
-      rates[to] = parseFloat(json.rates[to]);
-      const cacheTtl = date === 'latest' ? 60 * 60 /* 60 minutes */ : null; /* no expiration */
-      cache.set(`${date}-${fromCurrency}-${to}`, rates[to], cacheTtl);
-    });
+  }
 
-    return rates;
-  } catch (error) {
-    if (!config.env || !['staging', 'production'].includes(config.env)) {
-      logger.info(`Unable to fetch fxRate with Fixer API: ${error.message}. Returning 1.1`);
-      return zipObject(
-        toCurrencies,
-        toCurrencies.map(() => 1.1),
-      );
-    } else {
-      logger.error(`Unable to fetch fxRate with Fixer API: ${error.message}`);
-      return getRatesFromDb(fromCurrency, toCurrencies, date);
-    }
+  // In case of error or if Fixer API is not configured, fallback to DB/mock values
+  if (!isLiveEnv) {
+    const ratesValues = toCurrencies.map(() => 1.1);
+    return zipObject(toCurrencies, ratesValues);
+  } else {
+    return getRatesFromDb(fromCurrency, toCurrencies, date);
   }
 }
 
@@ -177,6 +192,43 @@ export async function getFxRate(
   return rates[toCurrency];
 }
 
+/**
+ * Same as getFxRate, but optimized to handle multiple `toCurrency`
+ */
+export async function getFxRates(
+  fromCurrency: string,
+  toCurrencies: string[],
+  date: string | Date = 'latest',
+): Promise<Record<string, number>> {
+  fromCurrency = fromCurrency?.toUpperCase();
+  toCurrencies = uniq(toCurrencies.map(c => c.toUpperCase()));
+  date = getDate(date);
+
+  // Retrieve everything we can from the cache
+  const rates = {};
+  await Promise.all(
+    toCurrencies.map(async currency => {
+      if (currency === fromCurrency) {
+        rates[fromCurrency] = 1;
+      } else {
+        const fromCache = await cache.get(`${date}-${fromCurrency}-${currency}`);
+        if (fromCache) {
+          rates[currency] = fromCache;
+        }
+      }
+    }),
+  );
+
+  // Return directly if we have everything, fetch additional rates form Fixed/DB otherwise
+  if (Object.keys(rates).length === toCurrencies.length) {
+    return rates;
+  } else {
+    const currenciesLeftToFetch = difference(toCurrencies, Object.keys(rates));
+    const missingRates = await fetchFxRates(fromCurrency, currenciesLeftToFetch, date);
+    return merge(rates, missingRates);
+  }
+}
+
 export function convertToCurrency(
   amount: number,
   fromCurrency: string,
@@ -184,7 +236,7 @@ export function convertToCurrency(
   date: string | Date = 'latest',
 ): Promise<number> {
   if (amount === 0) {
-    return 0;
+    return Promise.resolve(0);
   }
   if (fromCurrency === toCurrency) {
     return Promise.resolve(amount);
@@ -210,7 +262,7 @@ type AmountWithCurrencyAndDate = {
  * @param {*} array [ { currency, amount[, date] }]
  */
 export function reduceArrayToCurrency(array: AmountWithCurrencyAndDate[], currency: string): Promise<number> {
-  return Promise.map(array, entry => convertToCurrency(entry.amount, entry.currency, currency, entry.date)).then(
+  return Promise.all(array.map(entry => convertToCurrency(entry.amount, entry.currency, currency, entry.date))).then(
     arrayInBaseCurrency => {
       return arrayInBaseCurrency.reduce((accumulator, amount) => accumulator + amount, 0);
     },

@@ -1,4 +1,4 @@
-Subject: {{#if erratumMessage}}Erratum{{#if erratumNumber}} {{erratumNumber}}{{/if}}: {{/if}}{{host.name}} Host {{reportName}}
+Subject: {{#if erratumMessage}}Erratum{{#if erratumNumber}} {{erratumNumber}}{{/if}}: {{/if}}{{{host.name}}} Host {{reportName}}
 
 {{> header}}
 
@@ -85,7 +85,7 @@ Subject: {{#if erratumMessage}}Erratum{{#if erratumNumber}} {{erratumNumber}}{{/
       <strong>Erratum:</strong> <span style="white-space: pre-wrap;">{{erratumMessage}}</span>
     </p>
   {{/if}}
-  <p>Hi {{recipient.firstName}}!</p>
+  <p>{{> greeting}}</p>
   <p>Here is your {{#if month}}monthly{{else}}yearly{{/if}} stats report, from {{moment startDate}} to
     {{moment endDateIncluded}}.</p>
   <center>
@@ -243,19 +243,29 @@ Subject: {{#if erratumMessage}}Erratum{{#if erratumNumber}} {{erratumNumber}}{{/
     <tr>
       <td colspan=3 height=10></td>
     </tr>
-    {{#if stats.totalTaxAmountCollected}}
-    <tr>
-      <td>Taxes collected</td>
-      <td></td>
-      <td align="right">
-        {{currency stats.totalTaxAmountCollected currency=host.currency}}</td>
-    </tr>
-    <tr>
-      <td colspan=3 class="muted">{{taxType}} received</td>
-    </tr>
-    <tr>
-      <td colspan=3 height=10></td>
-    </tr>
+    {{#if stats.taxesSummary}}
+      <tr>
+        <td>Taxes</td>
+        <td></td>
+        <td align="right"></td>
+      </tr>
+
+      {{#each stats.taxesSummary}}
+        <tr class="indent1">
+          <td>{{@key}} collected</td>
+          <td></td>
+          <td align="right">{{currency this.collected currency=../host.currency}}</td>
+        </tr>
+        <tr class="indent1">
+          <td>{{@key}} paid</td>
+          <td></td>
+          <td align="right">{{currency this.paid currency=../host.currency}}</td>
+        </tr>
+      {{/each}}
+
+      <tr>
+        <td colspan="3" height="10"></td>
+      </tr>
     {{/if}}
 
     {{#if stats.totalAmountDebts}}
@@ -422,7 +432,7 @@ Subject: {{#if erratumMessage}}Erratum{{#if erratumNumber}} {{erratumNumber}}{{/
     {{#each transactions}}
     <tr>
       <td valign="top"><a
-          href="{{@root.config.host.website}}/{{collective.slug}}/expenses/{{id}}">{{moment
+          href="{{@root.config.host.website}}/{{collective.slug}}/transactions?searchTerm=%23{{id}}&kind=ALL">{{moment
           createdAt format="MM/DD"}}</a>
       </td>
       <td valign="top"><a href="{{@root.config.host.website}}/{{collective.slug}}">{{collective.shortSlug}}</a></td>

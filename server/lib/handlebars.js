@@ -56,6 +56,13 @@ handlebars.registerHelper('toLowerCase', str => {
   return str.toLowerCase();
 });
 
+handlebars.registerHelper('toUpperCase', str => {
+  if (!str) {
+    return '';
+  }
+  return str.toUpperCase();
+});
+
 handlebars.registerHelper('increment', str => {
   if (isNaN(str)) {
     return '';
@@ -221,7 +228,7 @@ handlebars.registerHelper('debug', console.log);
  * ```
  */
 handlebars.registerHelper('escapeForSubject', str => {
-  return str ? str.replace(/[\r\n]/g, ' ') : '';
+  return str ? str.replaceAll(/[\r\n]/g, ' ') : '';
 });
 
 export default handlebars;

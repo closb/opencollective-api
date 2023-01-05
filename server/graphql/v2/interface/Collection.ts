@@ -27,7 +27,7 @@ const CollectionFields = {
 const Collection = new GraphQLInterfaceType({
   name: 'Collection',
   description: 'Collection interface shared by all collection types',
-  fields: CollectionFields,
+  fields: () => CollectionFields,
 });
 
 /**
@@ -48,7 +48,7 @@ const CollectionArgs = {
 };
 
 export interface CollectionReturnType {
-  nodes: Record<string, unknown>[];
+  nodes: unknown[];
   totalCount: number;
   limit: number;
   offset: number;

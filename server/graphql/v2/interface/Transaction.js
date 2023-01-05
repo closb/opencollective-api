@@ -1,5 +1,6 @@
 import {
   GraphQLBoolean,
+  GraphQLFloat,
   GraphQLInt,
   GraphQLInterfaceType,
   GraphQLList,
@@ -7,15 +8,15 @@ import {
   GraphQLObjectType,
   GraphQLString,
 } from 'graphql';
-import { GraphQLDateTime } from 'graphql-iso-date';
-import { pick } from 'lodash';
+import { GraphQLDateTime } from 'graphql-scalars';
+import { isNil, round } from 'lodash';
 
 import orderStatus from '../../../constants/order_status';
 import roles from '../../../constants/roles';
 import { TransactionKind as TransactionKinds } from '../../../constants/transaction-kind';
 import { generateDescription } from '../../../lib/transactions';
 import models from '../../../models';
-import { allowContextPermission, PERMISSION_TYPE } from '../../common/context-permissions';
+import { allowContextPermission, getContextPermission, PERMISSION_TYPE } from '../../common/context-permissions';
 import * as TransactionLib from '../../common/transactions';
 import { TransactionKind } from '../enum/TransactionKind';
 import { TransactionType } from '../enum/TransactionType';
@@ -24,6 +25,7 @@ import { Amount } from '../object/Amount';
 import { Expense } from '../object/Expense';
 import { Order } from '../object/Order';
 import { PaymentMethod } from '../object/PaymentMethod';
+import PayoutMethod from '../object/PayoutMethod';
 import { TaxInfo } from '../object/TaxInfo';
 
 import { Account } from './Account';
@@ -94,6 +96,11 @@ const transactionFieldsDefinition = () => ({
   },
   amountInHostCurrency: {
     type: new GraphQLNonNull(Amount),
+  },
+  hostCurrencyFxRate: {
+    type: GraphQLFloat,
+    description:
+      'Exchange rate between the currency of the transaction and the currency of the host (transaction.amount * transaction.hostCurrencyFxRate = transaction.amountInHostCurrency)',
   },
   netAmount: {
     type: new GraphQLNonNull(Amount),
@@ -176,8 +183,17 @@ const transactionFieldsDefinition = () => ({
   isRefund: {
     type: GraphQLBoolean,
   },
+  isDisputed: {
+    type: GraphQLBoolean,
+  },
+  isInReview: {
+    type: GraphQLBoolean,
+  },
   paymentMethod: {
     type: PaymentMethod,
+  },
+  payoutMethod: {
+    type: PayoutMethod,
   },
   permissions: {
     type: TransactionPermissions,
@@ -200,6 +216,16 @@ const transactionFieldsDefinition = () => ({
   merchantId: {
     type: GraphQLString,
     description: 'Merchant id related to the Transaction (Stripe, PayPal, Wise, Privacy)',
+  },
+  balanceInHostCurrency: {
+    type: Amount,
+    description: 'The balance after the Transaction has run. Only for financially active accounts.',
+  },
+  invoiceTemplate: {
+    type: GraphQLString,
+    async resolve(transaction) {
+      return transaction.data?.invoiceTemplate;
+    },
   },
 });
 
@@ -259,6 +285,11 @@ export const TransactionFields = () => {
       resolve(transaction) {
         return { value: transaction.amountInHostCurrency, currency: transaction.hostCurrency };
       },
+    },
+    hostCurrencyFxRate: {
+      type: GraphQLFloat,
+      description:
+        'Exchange rate between the currency of the transaction and the currency of the host (transaction.amount * transaction.hostCurrencyFxRate = transaction.amountInHostCurrency)',
     },
     netAmount: {
       type: new GraphQLNonNull(Amount),
@@ -320,11 +351,25 @@ export const TransactionFields = () => {
     taxInfo: {
       type: TaxInfo,
       description: 'If taxAmount is set, this field will contain more info about the tax',
-      resolve(transaction) {
-        if (!transaction.data?.tax) {
+      resolve(transaction, _, req) {
+        const tax = transaction.data?.tax;
+        if (!tax) {
           return null;
         } else {
-          return pick(transaction.data.tax, ['id', 'percentage']);
+          return {
+            id: tax.id,
+            type: tax.id,
+            percentage: Math.round(tax.percentage ?? tax.rate * 100), // Does not support float
+            rate: tax.rate ?? round(tax.percentage / 100, 2),
+            idNumber: () => {
+              const collectiveId = transaction.paymentMethodProviderCollectiveId();
+              const canSeeDetails =
+                getContextPermission(req, PERMISSION_TYPE.SEE_PAYOUT_METHOD_DETAILS, collectiveId) ||
+                req.remoteUser.isAdmin(transaction.HostCollectiveId);
+
+              return canSeeDetails ? tax.idNumber : null;
+            },
+          };
         }
       },
     },
@@ -442,6 +487,16 @@ export const TransactionFields = () => {
         }
       },
     },
+    payoutMethod: {
+      type: PayoutMethod,
+      resolve(transaction, _, req) {
+        if (transaction.PayoutMethodId) {
+          return req.loaders.PayoutMethod.byId.load(transaction.PayoutMethodId);
+        } else {
+          return null;
+        }
+      },
+    },
     permissions: {
       type: new GraphQLNonNull(TransactionPermissions),
       description: 'The permissions given to current logged in user for this transaction',
@@ -499,7 +554,7 @@ export const TransactionFields = () => {
     merchantId: {
       type: GraphQLString,
       description: 'Merchant id related to the Transaction (Stripe, PayPal, Wise, Privacy)',
-      resolve(transaction, _, req) {
+      async resolve(transaction, _, req) {
         if (!req.remoteUser || !req.remoteUser.hasRole([roles.ACCOUNTANT, roles.ADMIN], transaction.HostCollectiveId)) {
           return;
         }
@@ -513,13 +568,30 @@ export const TransactionFields = () => {
         }
 
         if (transaction.kind === TransactionKinds.EXPENSE) {
+          let expense = transaction.expense;
+          if (!expense && transaction.ExpenseId) {
+            expense = await req.loaders.Expense.byId.load(transaction.ExpenseId);
+          }
+
           const wiseId = transaction.data?.transfer?.id;
           // TODO: PayPal Adaptive is missing
           // https://github.com/opencollective/opencollective/issues/4891
-          const paypalPayoutId = transaction.data?.payout_item_id;
+          const paypalPayoutId = transaction.data?.transaction_id;
           const privacyId = transaction.data?.token;
 
-          return wiseId || paypalPayoutId || privacyId;
+          // NOTE: We don't have transaction?.data?.transaction stored for transactions < 2022-09-27, but we have it available in expense.data
+          const stripeVirtualCardId = transaction?.data?.transaction?.id || expense?.data?.transactionId;
+
+          return wiseId || paypalPayoutId || privacyId || stripeVirtualCardId;
+        }
+      },
+    },
+    balanceInHostCurrency: {
+      type: Amount,
+      async resolve(transaction, _, req) {
+        const result = await req.loaders.Transaction.balanceById.load(transaction.id);
+        if (!isNil(result?.balance)) {
+          return { value: result.balance, currency: transaction.hostCurrency };
         }
       },
     },

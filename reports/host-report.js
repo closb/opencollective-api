@@ -1,7 +1,7 @@
 import Promise from 'bluebird';
 import config from 'config';
 import debugLib from 'debug';
-import { groupBy, keyBy, pick, sumBy } from 'lodash';
+import { groupBy, keyBy, mapValues, pick, sumBy } from 'lodash';
 import moment from 'moment';
 
 import MemberRoles from '../server/constants/roles.ts';
@@ -10,6 +10,7 @@ import { getHostTransactionsCsvAsAdmin } from '../server/lib/csv';
 import emailLib from '../server/lib/email';
 import { getBackersStats, getHostedCollectives, sumTransactions } from '../server/lib/hostlib';
 import { stripHTML } from '../server/lib/sanitize-html';
+import { reportErrorToSentry, reportMessageToSentry } from '../server/lib/sentry';
 import { getTransactions } from '../server/lib/transactions';
 import { exportToPDF, sumByWhen } from '../server/lib/utils';
 import models, { Op, sequelize } from '../server/models';
@@ -46,6 +47,26 @@ const enrichTransactionsWithHostFee = async transactions => {
     }
   });
   return transactions;
+};
+
+/**
+ * From a list of transactions, generates an object like:
+ * {
+ *   [TaxId]: { totalCollected: number, totalPaid: number }
+ * }
+ */
+const getTaxesSummary = allTransactions => {
+  const transactionsWithTaxes = allTransactions.filter(t => t.taxAmount);
+  if (!transactionsWithTaxes.length) {
+    return null;
+  }
+
+  const groupedTransactions = groupBy(transactionsWithTaxes, 'data.tax.id');
+  const getTaxAmountInHostCurrency = transaction => transaction.taxAmount * (transaction.hostCurrencyRate || 1) || 0;
+  return mapValues(groupedTransactions, transactions => ({
+    collected: Math.abs(sumByWhen(transactions, getTaxAmountInHostCurrency, t => t.type === 'CREDIT')),
+    paid: sumByWhen(transactions, getTaxAmountInHostCurrency, t => t.type === 'DEBIT'),
+  }));
 };
 
 async function HostReport(year, month, hostId) {
@@ -99,6 +120,9 @@ async function HostReport(year, month, hostId) {
   if (process.env.SKIP_SLUGS) {
     const slugs = process.env.SKIP_SLUGS.split(',');
     previewCondition = `AND c.slug NOT IN ('${slugs.join("','")}')`;
+  }
+  if (process.env.AFTER_ID) {
+    previewCondition = `AND c.id > ${Number(process.env.AFTER_ID)}`;
   }
 
   const getHostStats = async (host, collectiveids) => {
@@ -206,6 +230,7 @@ async function HostReport(year, month, hostId) {
       const processTransaction = async transaction => {
         const t = {
           ...transaction.info,
+          data: pick(transaction.data, ['tax.id']),
           Expense: transaction.Expense
             ? {
                 ...transaction.Expense.info,
@@ -288,6 +313,7 @@ async function HostReport(year, month, hostId) {
           paper: host.currency === 'USD' ? 'Letter' : 'A4',
         }).catch(error => {
           console.error(error);
+          reportErrorToSentry(error);
           return;
         });
       }
@@ -370,7 +396,7 @@ async function HostReport(year, month, hostId) {
         totalAmountOtherCredits +
         paymentProcessorFeesOtherCredits +
         platformFeesOtherCredits;
-      const totalTaxAmountCollected = sumByWhen(transactions, 'taxAmount', t => t.type === 'CREDIT');
+      const taxesSummary = getTaxesSummary(transactions);
       const totalAmountPaidExpenses = sumByWhen(expenses, 'netAmountInHostCurrency');
       const totalNetAmountReceivedForCollectives = totalNetAmountReceived - totalHostFees;
       const totalAmountSpent =
@@ -435,7 +461,7 @@ async function HostReport(year, month, hostId) {
         totalHostFees,
         totalNetAmountReceived,
         totalNetAmountReceivedForCollectives,
-        totalTaxAmountCollected,
+        taxesSummary,
         totalSharedRevenue,
         hostNetRevenue,
         totalOwedPlatformTips,
@@ -461,6 +487,7 @@ async function HostReport(year, month, hostId) {
       await sendEmail(admins, data, attachments);
     } catch (e) {
       console.error(`Error in processing host ${host.slug}:`, e);
+      reportErrorToSentry(e);
       debug(e);
     }
   };
@@ -469,6 +496,7 @@ async function HostReport(year, month, hostId) {
     debug('Sending email to ', recipients);
     if (!recipients || recipients.length === 0) {
       console.error('Unable to send host report for ', data.host.slug, 'No recipient to send to');
+      reportMessageToSentry(`Unable to send host report for ${data.host.slug} No recipient to send to`);
       return;
     }
     debug('email data stats', JSON.stringify(data.stats, null, 2));

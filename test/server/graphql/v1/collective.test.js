@@ -1,10 +1,12 @@
 import { expect } from 'chai';
 import gql from 'fake-tag';
 import { describe, it } from 'mocha';
-import sinon from 'sinon';
+import { createSandbox } from 'sinon';
 
+import { activities as ACTIVITY } from '../../../../server/constants';
 import * as expenses from '../../../../server/graphql/common/expenses';
 import cache from '../../../../server/lib/cache';
+import * as currency from '../../../../server/lib/currency';
 import models, { Op } from '../../../../server/models';
 import * as store from '../../../stores';
 import { fakeHost, fakeOrganization, fakeUser } from '../../../test-helpers/fake-data';
@@ -116,7 +118,6 @@ describe('server/graphql/v1/collective', () => {
           type
           createdByUser {
             id
-            firstName
             email
             __typename
           }
@@ -124,6 +125,7 @@ describe('server/graphql/v1/collective', () => {
           website
           twitterHandle
           githubHandle
+          repositoryUrl
           image
           description
           longDescription
@@ -796,6 +798,20 @@ describe('server/graphql/v1/collective', () => {
     });
 
     it('gets totalAmountSpent by collective', async () => {
+      const sandbox = createSandbox();
+
+      const stub = sandbox.stub(currency, 'getFxRate');
+
+      stub
+        .withArgs('EUR', 'EUR')
+        .resolves(1)
+        .withArgs('USD', 'USD')
+        .resolves(1)
+        .withArgs('EUR', 'USD')
+        .resolves(1.1)
+        .withArgs('USD', 'EUR')
+        .resolves(1 / 1.1);
+
       const query = gql`
         query TotalCollectiveContributions($slug: String, $type: String) {
           Collective(slug: $slug) {
@@ -824,6 +840,8 @@ describe('server/graphql/v1/collective', () => {
       expect(Number.isInteger(collective.stats.totalAmountSpent)).to.be.true;
       const totalAmountSpent = Math.round(1000 * 1.1 + 1000);
       expect(collective.stats.totalAmountSpent).to.equal(totalAmountSpent);
+
+      sandbox.restore();
     });
   });
 
@@ -990,6 +1008,33 @@ describe('server/graphql/v1/collective', () => {
       expect(updatedCollective.host.id).to.equal(hostCollective.id);
       expect(updatedCollective.currency).to.equal('EUR');
     });
+
+    it('check edit activity is created after', async () => {
+      const user = await fakeUser(null, { legalName: 'Old Legal Name' });
+      const editCollectiveMutation = gql`
+        mutation EditCollective($collective: CollectiveInputType!) {
+          editCollective(collective: $collective) {
+            id
+            legalName
+          }
+        }
+      `;
+
+      const collective = { id: user.collective.id, legalName: 'New Legal Name' };
+      const result = await utils.graphqlQuery(editCollectiveMutation, { collective }, user);
+      expect(result.data.editCollective.legalName).to.eq('New Legal Name');
+      // Check activity
+      const activity = await models.Activity.findOne({
+        where: { UserId: user.id, type: ACTIVITY.COLLECTIVE_EDITED },
+      });
+
+      expect(activity).to.exist;
+      expect(activity.CollectiveId).to.equal(user.collective.id);
+      expect(activity.data).to.deep.equal({
+        previousData: { legalName: 'Old Legal Name' },
+        newData: { legalName: 'New Legal Name' },
+      });
+    });
   });
   describe('edits member public message', () => {
     const editPublicMessageMutation = gql`
@@ -1009,8 +1054,8 @@ describe('server/graphql/v1/collective', () => {
       });
       pubnubCollective = collectiveWithHost.collective;
       pubnubHostCollective = collectiveWithHost.hostCollective;
-      sandbox = sinon.createSandbox();
-      cacheDelSpy = sandbox.spy(cache, 'del');
+      sandbox = createSandbox();
+      cacheDelSpy = sandbox.spy(cache, 'delete');
     });
     afterEach(() => sandbox.restore());
     it('edits public message', async () => {

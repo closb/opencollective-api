@@ -1,8 +1,9 @@
 import { pick } from 'lodash';
+import { CreationOptional, ForeignKey, InferAttributes, InferCreationAttributes } from 'sequelize';
 
-import restoreSequelizeAttributesOnClass from '../lib/restore-sequelize-attributes-on-class';
 import sequelize, { DataTypes, Model } from '../lib/sequelize';
 
+import User from './User';
 import models from '.';
 
 export enum HostApplicationStatus {
@@ -12,32 +13,17 @@ export enum HostApplicationStatus {
   EXPIRED = 'EXPIRED',
 }
 
-interface HostApplicationCreationAttributes {
-  CollectiveId: number;
-  HostCollectiveId: number;
-  status: HostApplicationStatus;
-  customData?: Record<string, unknown> | null;
-  message?: string;
-  createdAt?: Date;
-  updatedAt?: Date;
-  deletedAt?: Date | null;
-}
-
-export class HostApplication extends Model<HostApplication, HostApplicationCreationAttributes> {
-  public readonly id!: number;
-  public CollectiveId!: number;
-  public HostCollectiveId!: number;
-  public status!: HostApplicationStatus;
-  public customData: Record<string, unknown> | null;
-  public message: string;
-  public createdAt!: Date;
-  public updatedAt!: Date;
-  public deletedAt: Date | null;
-
-  constructor(...args) {
-    super(...args);
-    restoreSequelizeAttributesOnClass(new.target, this);
-  }
+export class HostApplication extends Model<InferAttributes<HostApplication>, InferCreationAttributes<HostApplication>> {
+  public declare readonly id: CreationOptional<number>;
+  public declare CollectiveId: number;
+  public declare HostCollectiveId: number;
+  public declare CreatedByUserId: ForeignKey<User['id']>;
+  public declare status: HostApplicationStatus;
+  public declare customData: Record<string, unknown> | null;
+  public declare message: string;
+  public declare createdAt: CreationOptional<Date>;
+  public declare updatedAt: CreationOptional<Date>;
+  public declare deletedAt: CreationOptional<Date>;
 
   // ---- Static ----
 
@@ -59,6 +45,7 @@ export class HostApplication extends Model<HostApplication, HostApplicationCreat
   static async recordApplication(
     host: typeof models.Collective,
     collective: typeof models.Collective,
+    user: User,
     data: Record<string, unknown>,
   ): Promise<HostApplication> {
     const existingApplication = await this.getByStatus(host, collective, HostApplicationStatus.PENDING);
@@ -68,6 +55,7 @@ export class HostApplication extends Model<HostApplication, HostApplicationCreat
       return this.create({
         HostCollectiveId: host.id,
         CollectiveId: collective.id,
+        CreatedByUserId: user.id,
         status: HostApplicationStatus.PENDING,
         ...(<Record<string, unknown>>pick(data, ['message', 'customData'])),
       });
@@ -95,70 +83,76 @@ export class HostApplication extends Model<HostApplication, HostApplicationCreat
   }
 }
 
-function setupModel(HostApplication) {
-  // Link the model to database fields
-  HostApplication.init(
-    {
-      id: {
-        type: DataTypes.INTEGER,
-        primaryKey: true,
-        autoIncrement: true,
-      },
-      CollectiveId: {
-        type: DataTypes.INTEGER,
-        references: { key: 'id', model: 'Collectives' },
-        onDelete: 'CASCADE',
-        onUpdate: 'CASCADE',
-        allowNull: false,
-      },
-      HostCollectiveId: {
-        type: DataTypes.INTEGER,
-        references: { key: 'id', model: 'Collectives' },
-        onDelete: 'CASCADE',
-        onUpdate: 'CASCADE',
-        allowNull: false,
-      },
-      status: {
-        type: DataTypes.ENUM(...Object.values(HostApplicationStatus)),
-        allowNull: false,
-        validate: {
-          isIn: {
-            args: [Object.values(HostApplicationStatus)],
-            msg: `Must be one of: ${Object.values(HostApplicationStatus)}`,
-          },
+// Link the model to database fields
+HostApplication.init(
+  {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true,
+    },
+    CollectiveId: {
+      type: DataTypes.INTEGER,
+      references: { key: 'id', model: 'Collectives' },
+      onDelete: 'CASCADE',
+      onUpdate: 'CASCADE',
+      allowNull: false,
+    },
+    HostCollectiveId: {
+      type: DataTypes.INTEGER,
+      references: { key: 'id', model: 'Collectives' },
+      onDelete: 'CASCADE',
+      onUpdate: 'CASCADE',
+      allowNull: false,
+    },
+    CreatedByUserId: {
+      type: DataTypes.INTEGER,
+      references: { key: 'id', model: 'Users' },
+      onDelete: 'SET NULL',
+      onUpdate: 'CASCADE',
+      allowNull: true,
+    },
+    status: {
+      type: DataTypes.ENUM(...Object.values(HostApplicationStatus)),
+      allowNull: false,
+      validate: {
+        isIn: {
+          args: [Object.values(HostApplicationStatus)],
+          msg: `Must be one of: ${Object.values(HostApplicationStatus)}`,
         },
       },
-      message: {
-        type: DataTypes.TEXT,
-        allowNull: true,
-        validate: {
-          len: [0, 3000],
-        },
-      },
-      customData: {
-        type: DataTypes.JSONB,
-        allowNull: true,
-      },
-      updatedAt: {
-        type: DataTypes.DATE,
-        defaultValue: DataTypes.NOW,
-        allowNull: false,
-      },
-      deletedAt: {
-        type: DataTypes.DATE,
-        allowNull: true,
+    },
+    message: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+      validate: {
+        len: [0, 3000],
       },
     },
-    {
-      sequelize,
-      tableName: 'HostApplications',
-      paranoid: true,
+    customData: {
+      type: DataTypes.JSONB,
+      allowNull: true,
     },
-  );
-}
-
-// We're using the setupModel function to keep the indentation and have a clearer git history.
-// Please consider this if you plan to refactor.
-setupModel(HostApplication);
+    createdAt: {
+      type: DataTypes.DATE,
+      defaultValue: DataTypes.NOW,
+      allowNull: false,
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      defaultValue: DataTypes.NOW,
+      allowNull: false,
+    },
+    deletedAt: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+  },
+  {
+    sequelize,
+    tableName: 'HostApplications',
+    paranoid: true,
+  },
+);
 
 export default HostApplication;

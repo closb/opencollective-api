@@ -6,13 +6,14 @@ import {
   GraphQLNonNull,
   GraphQLString,
 } from 'graphql';
-import GraphQLJSON from 'graphql-type-json';
+import { GraphQLJSON } from 'graphql-type-json';
 
 import { ContributionFrequency } from '../enum';
 
 import { AccountReferenceInput } from './AccountReferenceInput';
 import { AmountInput } from './AmountInput';
 import { GuestInfoInput } from './GuestInfoInput';
+import { LocationInput } from './LocationInput';
 import { OrderTaxInput } from './OrderTaxInput';
 import { PaymentMethodInput } from './PaymentMethodInput';
 import { TierReferenceInput } from './TierReferenceInput';
@@ -24,6 +25,24 @@ const OrderContextInput = new GraphQLInputObjectType({
     isEmbed: {
       type: GraphQLBoolean,
       description: 'Whether this order was created using the embedded contribution flow',
+    },
+  }),
+});
+
+const OrderFromAccountInfo = new GraphQLInputObjectType({
+  name: 'OrderFromAccountInfo',
+  description: 'Some context about how an order was created',
+  fields: () => ({
+    location: {
+      type: LocationInput,
+      description:
+        'The location of the contributor. Account location will be updated with this address if different from the existing one.',
+    },
+    name: {
+      type: GraphQLString,
+    },
+    legalName: {
+      type: GraphQLString,
     },
   }),
 });
@@ -47,6 +66,10 @@ export const OrderCreateInput = new GraphQLInputObjectType({
       type: AccountReferenceInput,
       description: 'The profile making the order. Can be null for guest contributions.',
     },
+    fromAccountInfo: {
+      type: OrderFromAccountInfo,
+      description: 'Additional information about the contributing profile',
+    },
     toAccount: {
       type: new GraphQLNonNull(AccountReferenceInput),
       description: 'The profile you want to contribute to',
@@ -59,9 +82,9 @@ export const OrderCreateInput = new GraphQLInputObjectType({
       description: 'The payment method used for this order',
       type: PaymentMethodInput,
     },
-    platformContributionAmount: {
+    platformTipAmount: {
       type: AmountInput,
-      description: 'Platform contribution attached to this order',
+      description: 'Platform tip attached to this order',
     },
     taxes: {
       type: new GraphQLList(OrderTaxInput),

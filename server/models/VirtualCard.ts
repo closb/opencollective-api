@@ -1,67 +1,112 @@
+import type {
+  BelongsToGetAssociationMixin,
+  CreationOptional,
+  ForeignKey,
+  InferAttributes,
+  InferCreationAttributes,
+  NonAttribute,
+} from 'sequelize';
+
+import VirtualCardProviders from '../constants/virtual_card_providers';
 import { crypto } from '../lib/encryption';
-import restoreSequelizeAttributesOnClass from '../lib/restore-sequelize-attributes-on-class';
 import sequelize, { DataTypes, Model } from '../lib/sequelize';
+import privacyVirtualCards from '../paymentProviders/privacy';
+import * as stripeVirtualCards from '../paymentProviders/stripe/virtual-cards';
 
-interface VirtualCardAttributes {
-  id: string;
-  CollectiveId: number;
-  HostCollectiveId: number;
-  UserId?: number;
-  name: string;
-  last4: string;
-  data: Record<string, any>;
-  privateData: string | Record<string, any>;
-  provider: string;
-  spendingLimitAmount: number;
-  spendingLimitInterval: string;
-  createdAt: Date;
-  updatedAt: Date;
-  deletedAt: Date;
-}
+import Collective from './Collective';
+import User from './User';
 
-export interface VirtualCardCreateAttributes {
-  id: string;
-  name: string;
-  last4: string;
-  data: Record<string, any>;
-  privateData: Record<string, any>;
-  CollectiveId: number;
-  HostCollectiveId: number;
-  UserId?: number;
-  provider: string;
-  spendingLimitAmount: number;
-  spendingLimitInterval: string;
-}
+class VirtualCard extends Model<InferAttributes<VirtualCard, { omit: 'info' }>, InferCreationAttributes<VirtualCard>> {
+  public declare id: CreationOptional<string>;
+  public declare CollectiveId: number;
+  public declare HostCollectiveId: number;
+  public declare UserId: ForeignKey<User['id']>;
+  public declare name: string;
+  public declare last4: string;
+  public declare data: Record<string, any>;
+  public declare privateData: string | Record<string, any>;
+  public declare provider: VirtualCardProviders;
+  public declare spendingLimitAmount: number;
+  public declare spendingLimitInterval: string;
+  public declare currency: string;
+  public declare createdAt: CreationOptional<Date>;
+  public declare updatedAt: CreationOptional<Date>;
+  public declare deletedAt: CreationOptional<Date>;
 
-class VirtualCard extends Model<VirtualCardAttributes, VirtualCardCreateAttributes> implements VirtualCardAttributes {
-  public id!: string;
-  public CollectiveId!: number;
-  public HostCollectiveId!: number;
-  public UserId: number;
-  public name: string;
-  public last4: string;
-  public data: Record<string, any>;
-  public privateData: string | Record<string, any>;
-  public provider: string;
-  public spendingLimitAmount: number;
-  public spendingLimitInterval: string;
-  public createdAt!: Date;
-  public updatedAt!: Date;
-  public deletedAt: Date;
   // Associations
-  collective?: any;
-  host?: any;
-  user?: any;
-
-  constructor(...args) {
-    super(...args);
-    restoreSequelizeAttributesOnClass(new.target, this);
-  }
+  public declare collective?: NonAttribute<any>;
+  public declare host?: NonAttribute<typeof Collective>;
+  public declare getHost: BelongsToGetAssociationMixin<typeof Collective>;
+  public declare user?: NonAttribute<any>;
 
   async getExpensesMissingDetails(): Promise<Array<any>> {
-    return sequelize.models.Expense.findAll({
-      where: { VirtualCardId: this.id, data: { missingDetails: true } },
+    return sequelize.models.Expense.findPendingCardCharges({
+      where: { VirtualCardId: this.id },
     });
+  }
+
+  async pause() {
+    switch (this.provider) {
+      case VirtualCardProviders.STRIPE:
+        await stripeVirtualCards.pauseCard(this);
+        break;
+      case VirtualCardProviders.PRIVACY:
+        await privacyVirtualCards.pauseCard(this);
+        break;
+      default:
+        throw new Error(`Can not suspend virtual card provided by ${this.provider}`);
+    }
+
+    return this.reload();
+  }
+
+  async resume() {
+    switch (this.provider) {
+      case VirtualCardProviders.STRIPE:
+        await stripeVirtualCards.resumeCard(this);
+        break;
+      case VirtualCardProviders.PRIVACY:
+        await privacyVirtualCards.resumeCard(this);
+        break;
+      default:
+        throw new Error(`Can not resume virtual card provided by ${this.provider}`);
+    }
+
+    return this.reload();
+  }
+
+  async delete() {
+    switch (this.provider) {
+      case VirtualCardProviders.STRIPE:
+        await stripeVirtualCards.deleteCard(this);
+        break;
+      case VirtualCardProviders.PRIVACY:
+        await privacyVirtualCards.deleteCard(this);
+        break;
+      default:
+        throw new Error(`Can not delete virtual card provided by ${this.provider}`);
+    }
+
+    await this.destroy();
+  }
+
+  isActive() {
+    return this.data?.status === 'active' || this.data?.state === 'OPEN';
+  }
+
+  isPaused() {
+    return this.data?.status === 'inactive' || this.data?.state === 'PAUSED';
+  }
+
+  get info() {
+    return {
+      id: this.id,
+      name: this.name,
+      provider: this.provider,
+      last4: this.last4,
+      CollectiveId: this.CollectiveId,
+      HostCollectiveId: this.HostCollectiveId,
+    };
   }
 }
 
@@ -131,6 +176,11 @@ VirtualCard.init(
     spendingLimitInterval: {
       type: DataTypes.STRING,
       allowNull: true,
+    },
+    currency: {
+      type: DataTypes.STRING,
+      defaultValue: 'USD',
+      allowNull: false,
     },
     createdAt: {
       type: DataTypes.DATE,

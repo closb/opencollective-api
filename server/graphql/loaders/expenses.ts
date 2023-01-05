@@ -1,9 +1,11 @@
 import DataLoader from 'dataloader';
-import express from 'express';
+import { groupBy } from 'lodash';
 
 import ACTIVITY from '../../constants/activities';
+import { TransactionKind } from '../../constants/transaction-kind';
 import queries from '../../lib/queries';
-import models, { Op } from '../../models';
+import models, { Op, sequelize } from '../../models';
+import { Activity } from '../../models/Activity';
 import { ExpenseAttachedFile } from '../../models/ExpenseAttachedFile';
 import { ExpenseItem } from '../../models/ExpenseItem';
 import { LEGAL_DOCUMENT_TYPE } from '../../models/LegalDocument';
@@ -17,6 +19,7 @@ export const generateExpenseItemsLoader = (): DataLoader<number, ExpenseItem[]> 
   return new DataLoader(async (expenseIds: number[]) => {
     const items = await models.ExpenseItem.findAll({
       where: { ExpenseId: { [Op.in]: expenseIds } },
+      order: [['id', 'ASC']],
     });
 
     return sortResultsArray(expenseIds, items, item => item.ExpenseId);
@@ -26,18 +29,11 @@ export const generateExpenseItemsLoader = (): DataLoader<number, ExpenseItem[]> 
 /**
  * Load all activities for an expense
  */
-export const generateExpenseActivitiesLoader = (req: express.Request): DataLoader<number, typeof models.Activity> => {
+export const generateExpenseActivitiesLoader = (): DataLoader<number, Activity[]> => {
   return new DataLoader(async (expenseIDs: number[]) => {
-    // Optimization: load expenses to get their collective IDs, as filtering on `data` (JSON)
-    // can be expensive.
-    const expenses = await req.loaders.Expense.byId.loadMany(expenseIDs);
-    const collectiveIds = expenses.map(expense => expense.CollectiveId);
     const activities = await models.Activity.findAll({
       order: [['createdAt', 'ASC']],
       where: {
-        CollectiveId: {
-          [Op.in]: collectiveIds,
-        },
         ExpenseId: {
           [Op.in]: expenseIDs,
         },
@@ -49,6 +45,7 @@ export const generateExpenseActivitiesLoader = (req: express.Request): DataLoade
             ACTIVITY.COLLECTIVE_EXPENSE_INVITE_DRAFTED,
             ACTIVITY.COLLECTIVE_EXPENSE_REJECTED,
             ACTIVITY.COLLECTIVE_EXPENSE_APPROVED,
+            ACTIVITY.COLLECTIVE_EXPENSE_MOVED,
             ACTIVITY.COLLECTIVE_EXPENSE_UNAPPROVED,
             ACTIVITY.COLLECTIVE_EXPENSE_PAID,
             ACTIVITY.COLLECTIVE_EXPENSE_MARKED_AS_UNPAID,
@@ -56,12 +53,13 @@ export const generateExpenseActivitiesLoader = (req: express.Request): DataLoade
             ACTIVITY.COLLECTIVE_EXPENSE_ERROR,
             ACTIVITY.COLLECTIVE_EXPENSE_SCHEDULED_FOR_PAYMENT,
             ACTIVITY.COLLECTIVE_EXPENSE_MARKED_AS_SPAM,
+            ACTIVITY.COLLECTIVE_EXPENSE_MARKED_AS_INCOMPLETE,
           ],
         },
       },
     });
 
-    return sortResultsArray(expenseIDs, activities, activity => activity.data.expense.id);
+    return sortResultsArray(expenseIDs, activities, activity => activity.ExpenseId);
   });
 };
 
@@ -97,3 +95,32 @@ export const requiredLegalDocuments = (): DataLoader<number, string[]> => {
     return expenseIds.map(id => (expenseIdsPendingTaxForm.has(id) ? [LEGAL_DOCUMENT_TYPE.US_TAX_FORM] : []));
   });
 };
+
+/**
+ * Should only be used with paid expenses
+ */
+export const generateExpenseToHostTransactionFxRateLoader = (): DataLoader<
+  number,
+  { rate: number; currency: string }
+> =>
+  new DataLoader(async (expenseIds: number[]) => {
+    const transactions = await models.Transaction.findAll({
+      raw: true,
+      attributes: ['ExpenseId', 'currency', [sequelize.json('data.expenseToHostFxRate'), 'expenseToHostFxRate']],
+      where: {
+        ExpenseId: expenseIds,
+        kind: TransactionKind.EXPENSE,
+        type: 'CREDIT',
+        isRefund: false,
+        RefundTransactionId: null,
+        data: { expenseToHostFxRate: { [Op.ne]: null } },
+      },
+    });
+
+    const groupedTransactions = groupBy(transactions, 'ExpenseId');
+    return expenseIds.map(expenseId => {
+      const transactionData = groupedTransactions[expenseId]?.[0];
+      const rate = parseFloat(transactionData?.expenseToHostFxRate);
+      return isNaN(rate) ? null : { rate, currency: transactionData?.currency };
+    });
+  });

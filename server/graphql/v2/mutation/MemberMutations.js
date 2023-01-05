@@ -1,11 +1,16 @@
 import { GraphQLBoolean, GraphQLNonNull, GraphQLString } from 'graphql';
-import { GraphQLDateTime } from 'graphql-iso-date';
+import { GraphQLDateTime } from 'graphql-scalars';
 import { pick } from 'lodash';
 
+import ActivityTypes from '../../../constants/activities';
+import POLICIES from '../../../constants/policies';
 import MemberRoles from '../../../constants/roles';
 import { purgeCacheForCollective } from '../../../lib/cache';
+import { getPolicy } from '../../../lib/policies';
+import twoFactorAuthLib from '../../../lib/two-factor-authentication';
 import models from '../../../models';
 import { editPublicMessage } from '../../common/members';
+import { checkRemoteUserCanRoot, checkRemoteUserCanUseAccount } from '../../common/scope-check';
 import { BadRequest, Forbidden, Unauthorized, ValidationFailed } from '../../errors';
 import { MemberRole } from '../enum';
 import { AccountReferenceInput, fetchAccountWithReference } from '../input/AccountReferenceInput';
@@ -25,7 +30,7 @@ const isLastAdmin = async (account, memberAccount) => {
 const memberMutations = {
   editPublicMessage: {
     type: new GraphQLNonNull(Member),
-    description: 'Edit the public message for the given Member of a Collective',
+    description: 'Edit the public message for the given Member of a Collective. Scope: "account".',
     args: {
       fromAccount: {
         type: new GraphQLNonNull(AccountReferenceInput),
@@ -82,9 +87,12 @@ const memberMutations = {
       },
     },
     async resolve(_, args, req) {
-      if (!req.remoteUser?.isRoot()) {
-        throw new Unauthorized('Only root users can create member entries directly');
-      } else if (args.role !== MemberRoles.CONNECTED_COLLECTIVE) {
+      checkRemoteUserCanRoot(req);
+
+      // Always enforce 2FA for root actions
+      await twoFactorAuthLib.validateRequest(req, { requireTwoFactorAuthEnabled: true });
+
+      if (args.role !== MemberRoles.CONNECTED_COLLECTIVE) {
         throw new BadRequest('This mutation only supports the CONNECTED_ACCOUNT role');
       }
 
@@ -99,7 +107,7 @@ const memberMutations = {
   },
   editMember: {
     type: new GraphQLNonNull(Member),
-    description: 'Edit an existing member of the Collective',
+    description: 'Edit an existing member of the Collective. Scope: "account".',
     args: {
       memberAccount: {
         type: new GraphQLNonNull(AccountReferenceInput),
@@ -121,9 +129,7 @@ const memberMutations = {
       },
     },
     async resolve(_, args, req) {
-      if (!req.remoteUser) {
-        throw new Unauthorized('You need to be logged in to invite a member.');
-      }
+      checkRemoteUserCanUseAccount(req);
 
       let { memberAccount, account } = args;
 
@@ -145,6 +151,9 @@ const memberMutations = {
         }
       }
 
+      // Enforce 2FA if enabled on the account
+      await twoFactorAuthLib.enforceForAccountAdmins(req, account);
+
       // Edit member
       const editableAttributes = pick(args, ['role', 'description', 'since']);
 
@@ -153,6 +162,7 @@ const memberMutations = {
         where: {
           MemberCollectiveId: memberAccount.id,
           CollectiveId: account.id,
+          role: [MemberRoles.ACCOUNTANT, MemberRoles.ADMIN, MemberRoles.MEMBER],
         },
       });
 
@@ -160,12 +170,30 @@ const memberMutations = {
         throw new ValidationFailed(`Member ${memberAccount.slug} does not exist in Collective ${account.slug}`);
       }
 
+      if ([MemberRoles.ACCOUNTANT, MemberRoles.ADMIN, MemberRoles.MEMBER].includes(args.role)) {
+        await models.Activity.create({
+          type: ActivityTypes.COLLECTIVE_CORE_MEMBER_EDITED,
+          CollectiveId: account.id,
+          FromCollectiveId: memberAccount.id,
+          HostCollectiveId: account.approvedAt ? account.HostCollectiveId : null,
+          UserId: req.remoteUser.id,
+          UserTokenId: req.userToken?.id,
+          data: {
+            notify: false,
+            memberCollective: memberAccount.activity,
+            collective: account.activity,
+            user: req.remoteUser.info,
+            member: members[0].info,
+          },
+        });
+      }
+
       return members[0];
     },
   },
   removeMember: {
     type: GraphQLBoolean,
-    description: 'Remove a member from the Collective',
+    description: 'Remove a member from the Collective. Scope: "account".',
     args: {
       memberAccount: {
         type: new GraphQLNonNull(AccountReferenceInput),
@@ -184,9 +212,7 @@ const memberMutations = {
       },
     },
     async resolve(_, args, req) {
-      if (!req.remoteUser) {
-        throw new Unauthorized('You need to be logged in to remove a member.');
-      }
+      checkRemoteUserCanUseAccount(req);
 
       let { memberAccount, account } = args;
 
@@ -205,7 +231,22 @@ const memberMutations = {
         if (await isLastAdmin(account, memberAccount)) {
           throw new Forbidden('There must be at least one admin for the account.');
         }
+
+        const host = await account.getHostCollective();
+        if (host) {
+          const adminCount = await models.Member.count({
+            where: { CollectiveId: account.id, role: MemberRoles.ADMIN },
+          });
+
+          const policy = getPolicy(host, POLICIES.COLLECTIVE_MINIMUM_ADMINS);
+          if (policy?.numberOfAdmins && adminCount <= policy.numberOfAdmins) {
+            throw new Forbidden(`Your host policy requires at least ${policy.numberOfAdmins} admins for this account.`);
+          }
+        }
       }
+
+      // Check 2FA
+      await twoFactorAuthLib.enforceForAccountAdmins(req, account);
 
       // Remove member
       if (args.isInvitation) {
@@ -215,6 +256,22 @@ const memberMutations = {
       } else {
         await models.Member.destroy({
           where: { MemberCollectiveId: memberAccount.id, CollectiveId: account.id, role: args.role },
+        });
+      }
+      if ([MemberRoles.ACCOUNTANT, MemberRoles.ADMIN, MemberRoles.MEMBER].includes(args.role)) {
+        await models.Activity.create({
+          type: ActivityTypes.COLLECTIVE_CORE_MEMBER_REMOVED,
+          CollectiveId: account.id,
+          FromCollectiveId: memberAccount.id,
+          HostCollectiveId: account.approvedAt ? account.HostCollectiveId : null,
+          UserId: req.remoteUser.id,
+          UserTokenId: req.userToken?.id,
+          data: {
+            notify: false,
+            memberCollective: memberAccount.activity,
+            collective: account.activity,
+            user: req.remoteUser.info,
+          },
         });
       }
 

@@ -1,10 +1,12 @@
 import { GraphQLBoolean, GraphQLInt, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
 
+import twoFactorAuthLib from '../../lib/two-factor-authentication';
 import models from '../../models';
 import { bulkCreateGiftCards, createGiftCardsForEmails } from '../../paymentProviders/opencollective/giftcard';
+import { sendMessage } from '../common/collective';
 import { editPublicMessage } from '../common/members';
 import { createUser } from '../common/user';
-import { Forbidden, NotFound, Unauthorized, ValidationFailed } from '../errors';
+import { NotFound, Unauthorized } from '../errors';
 
 import * as applicationMutations from './mutations/applications';
 import * as backyourstackMutations from './mutations/backyourstack';
@@ -17,21 +19,12 @@ import {
   deactivateBudget,
   deactivateCollectiveAsHost,
   deleteCollective,
-  deleteUserCollective,
   editCollective,
-  sendMessageToCollective,
   unarchiveCollective,
 } from './mutations/collectives';
-import * as commentMutations from './mutations/comments';
 import { editConnectedAccount } from './mutations/connectedAccounts';
 import { createWebhook, deleteNotification, editWebhooks } from './mutations/notifications';
-import {
-  confirmOrder,
-  createOrder,
-  markOrderAsPaid,
-  markPendingOrderAsExpired,
-  refundTransaction,
-} from './mutations/orders';
+import { confirmOrder, createOrder, refundTransaction } from './mutations/orders';
 import * as paymentMethodsMutation from './mutations/paymentMethods';
 import { editTier, editTiers } from './mutations/tiers';
 import { confirmUserEmail, updateUserEmail } from './mutations/users';
@@ -39,8 +32,6 @@ import { ApplicationInputType, ApplicationType } from './Application';
 import { CollectiveInterfaceType } from './CollectiveInterface';
 import {
   CollectiveInputType,
-  CommentAttributesInputType,
-  CommentInputType,
   ConfirmOrderInputType,
   ConnectedAccountInputType,
   MemberInputType,
@@ -52,7 +43,6 @@ import {
 } from './inputTypes';
 import { TransactionInterfaceType } from './TransactionInterface';
 import {
-  CommentType,
   ConnectedAccountType,
   MemberType,
   NotificationType,
@@ -74,6 +64,7 @@ const mutations = {
   },
   createCollectiveFromGithub: {
     type: CollectiveInterfaceType,
+    deprecationReason: '2022-05-03: This mutation is deprecated and can only be used in test environments.',
     args: {
       collective: { type: new GraphQLNonNull(CollectiveInputType) },
     },
@@ -105,7 +96,7 @@ const mutations = {
       id: { type: new GraphQLNonNull(GraphQLInt) },
     },
     resolve(_, args, req) {
-      return deleteUserCollective(_, args, req);
+      return deleteCollective(_, args, req);
     },
   },
   archiveCollective: {
@@ -126,6 +117,7 @@ const mutations = {
       return unarchiveCollective(_, args, req);
     },
   },
+
   sendMessageToCollective: {
     type: new GraphQLObjectType({
       name: 'SendMessageToCollectiveResult',
@@ -133,13 +125,16 @@ const mutations = {
         success: { type: GraphQLBoolean },
       },
     }),
+    deprecationReason: '2022-08-01: Please use the sendMessage mutation from GraphQL v2 instead.',
     args: {
       collectiveId: { type: new GraphQLNonNull(GraphQLInt) },
       message: { type: new GraphQLNonNull(GraphQLString) },
       subject: { type: GraphQLString },
     },
-    resolve(_, args, req) {
-      return sendMessageToCollective(_, args, req);
+    async resolve(_, args, req) {
+      const collective = await models.Collective.findByPk(args.collectiveId);
+
+      return sendMessage({ req, args, collective, isGqlV2: false });
     },
   },
   createUser: {
@@ -203,8 +198,9 @@ const mutations = {
         description: 'The new email address for user',
       },
     },
-    resolve: (_, { email }, { remoteUser }) => {
-      return updateUserEmail(remoteUser, email);
+    resolve: async (_, { email }, req) => {
+      await twoFactorAuthLib.validateRequest(req, { alwaysAskForToken: true });
+      return updateUserEmail(req.remoteUser, email);
     },
   },
   confirmUserEmail: {
@@ -226,27 +222,7 @@ const mutations = {
       connectedAccount: { type: new GraphQLNonNull(ConnectedAccountInputType) },
     },
     resolve(_, args, req) {
-      return editConnectedAccount(req.remoteUser, args.connectedAccount);
-    },
-  },
-  markOrderAsPaid: {
-    type: OrderType,
-    deprecationReason: '2021-01-29: Not used anymore',
-    args: {
-      id: { type: new GraphQLNonNull(GraphQLInt) },
-    },
-    resolve(_, args, req) {
-      return markOrderAsPaid(req.remoteUser, args.id);
-    },
-  },
-  markPendingOrderAsExpired: {
-    type: OrderType,
-    deprecationReason: '2021-01-29: Not used anymore',
-    args: {
-      id: { type: new GraphQLNonNull(GraphQLInt) },
-    },
-    resolve(_, args, req) {
-      return markPendingOrderAsExpired(req.remoteUser, args.id);
+      return editConnectedAccount(req, args.connectedAccount);
     },
   },
   editTier: {
@@ -287,6 +263,8 @@ const mutations = {
       } else if (!req.remoteUser || !req.remoteUser.isAdminOfCollective(collective)) {
         throw new Unauthorized();
       } else {
+        await twoFactorAuthLib.enforceForAccountAdmins(req, collective, { onlyAskOnLogin: true });
+
         await collective.editMembers(args.members, {
           CreatedByUserId: req.remoteUser.id,
           remoteUserCollectiveId: req.remoteUser.CollectiveId,
@@ -298,6 +276,7 @@ const mutations = {
   editPublicMessage: {
     type: new GraphQLList(MemberType),
     description: 'A mutation to edit the public message of all matching members.',
+    deprecationReason: '2021-01-27: Please use editPublicMessage from GQLV2',
     args: {
       FromCollectiveId: { type: new GraphQLNonNull(GraphQLInt) },
       CollectiveId: { type: new GraphQLNonNull(GraphQLInt) },
@@ -314,12 +293,13 @@ const mutations = {
       },
     },
     async resolve(_, args, req) {
-      const { order } = await createOrder(args.order, req.loaders, req.remoteUser, req.ip);
+      const { order } = await createOrder(args.order, req);
       return order;
     },
   },
   confirmOrder: {
     type: OrderType,
+    deprecationReason: '2022-11-18: This mutation has been moved to GQLV2',
     args: {
       order: {
         type: new GraphQLNonNull(ConfirmOrderInputType),
@@ -329,44 +309,9 @@ const mutations = {
       return confirmOrder(args.order, req.remoteUser);
     },
   },
-  createComment: {
-    type: CommentType,
-    deprecationReason: '2021-01-29: Not used anymore',
-    args: {
-      comment: {
-        type: new GraphQLNonNull(CommentInputType),
-      },
-    },
-    resolve: (_, args, req) => {
-      if (args['UpdateId']) {
-        throw new Error('Use QPI V2 to post comments on updates');
-      }
-
-      return commentMutations.createComment(_, args, req);
-    },
-  },
-  editComment: {
-    type: CommentType,
-    deprecationReason: '2021-01-29: Not used anymore',
-    args: {
-      comment: {
-        type: new GraphQLNonNull(CommentAttributesInputType),
-      },
-    },
-    resolve: commentMutations.editComment,
-  },
-  deleteComment: {
-    type: CommentType,
-    deprecationReason: '2021-01-29: Not used anymore',
-    args: {
-      id: {
-        type: new GraphQLNonNull(GraphQLInt),
-      },
-    },
-    resolve: commentMutations.deleteComment,
-  },
   refundTransaction: {
     type: TransactionInterfaceType,
+    deprecationReason: '2022-01-27: Please use refundTransaction from GQLV2',
     args: {
       id: {
         type: new GraphQLNonNull(GraphQLInt),
@@ -407,25 +352,7 @@ const mutations = {
       monthlyLimitPerMember: { type: GraphQLInt },
     },
     resolve: async (_, args, req) => {
-      return paymentMethodsMutation.updatePaymentMethod(args, req.remoteUser);
-    },
-  },
-  createCreditCard: {
-    type: PaymentMethodType,
-    description: 'Add a new credit card to the given collective',
-    deprecationReason: '2021-01-29: Not used anymore',
-    args: {
-      CollectiveId: { type: new GraphQLNonNull(GraphQLInt) },
-      name: { type: new GraphQLNonNull(GraphQLString) },
-      token: { type: new GraphQLNonNull(GraphQLString) },
-      data: { type: new GraphQLNonNull(StripeCreditCardDataInputType) },
-      monthlyLimitPerMember: { type: GraphQLInt },
-    },
-    resolve: async (_, args, req) => {
-      return paymentMethodsMutation.createPaymentMethod(
-        { ...args, service: 'stripe', type: 'creditcard' },
-        req.remoteUser,
-      );
+      return paymentMethodsMutation.updatePaymentMethod(args, req);
     },
   },
   replaceCreditCard: {
@@ -439,7 +366,7 @@ const mutations = {
       data: { type: new GraphQLNonNull(StripeCreditCardDataInputType) },
     },
     resolve: async (_, args, req) => {
-      return paymentMethodsMutation.replaceCreditCard(args, req.remoteUser);
+      return paymentMethodsMutation.replaceCreditCard(args, req);
     },
   },
   createGiftCards: {
@@ -472,11 +399,6 @@ const mutations = {
         type: new GraphQLList(GraphQLString),
         description: 'Limit this payment method to make donations to collectives having those tags',
       },
-      limitedToCollectiveIds: {
-        type: new GraphQLList(GraphQLInt),
-        description: 'Limit this payment method to make donations to those collectives',
-        deprecationReason: '2020-08-11: This field does not exist anymore',
-      },
       limitedToHostCollectiveIds: {
         type: new GraphQLList(GraphQLInt),
         description: 'Limit this payment method to make donations to the collectives hosted by those hosts',
@@ -495,7 +417,7 @@ const mutations = {
       },
       expiryDate: { type: GraphQLString },
     },
-    resolve: async (_, { emails, numberOfGiftCards, ...args }, { remoteUser }) => {
+    resolve: async (_, { emails, numberOfGiftCards, ...args }, req) => {
       if (numberOfGiftCards && emails && numberOfGiftCards !== emails.length) {
         throw Error("numberOfGiftCards and emails counts doesn't match");
       } else if (args.limitedToOpenSourceCollectives && args.limitedToHostCollectiveIds) {
@@ -515,10 +437,19 @@ const mutations = {
         args.limitedToHostCollectiveIds = [openSourceHost.id];
       }
 
+      const collective = await models.Collective.findByPk(args.CollectiveId);
+      if (!collective) {
+        throw new Error('Collective does not exist');
+      } else if (!req.remoteUser.isAdminOfCollective(collective)) {
+        throw new Error('User must be admin of collective');
+      }
+
+      await twoFactorAuthLib.enforceForAccountAdmins(req, collective, { onlyAskOnLogin: true });
+
       if (numberOfGiftCards) {
-        return await bulkCreateGiftCards(args, remoteUser, numberOfGiftCards);
+        return bulkCreateGiftCards(collective, args, req.remoteUser, numberOfGiftCards);
       } else if (emails) {
-        return await createGiftCardsForEmails(args, remoteUser, emails, args.customMessage);
+        return createGiftCardsForEmails(collective, args, req.remoteUser, emails, args.customMessage);
       }
 
       throw new Error('You must either pass numberOfGiftCards of an email list');
@@ -542,7 +473,7 @@ const mutations = {
       },
     },
     resolve: async (_, args, req) => {
-      return paymentMethodsMutation.removePaymentMethod(args.id, req.remoteUser);
+      return paymentMethodsMutation.removePaymentMethod(args.id, req);
     },
   },
   editWebhooks: {
@@ -559,7 +490,7 @@ const mutations = {
       },
     },
     resolve(_, args, req) {
-      return editWebhooks(args, req.remoteUser);
+      return editWebhooks(args, req);
     },
   },
   createWebhook: {
@@ -576,7 +507,7 @@ const mutations = {
       },
     },
     resolve(_, args, req) {
-      return createWebhook(args, req.remoteUser);
+      return createWebhook(args, req);
     },
   },
   deleteNotification: {
@@ -589,42 +520,7 @@ const mutations = {
       },
     },
     resolve(_, args, req) {
-      return deleteNotification(args, req.remoteUser);
-    },
-  },
-  replyToMemberInvitation: {
-    type: GraphQLBoolean,
-    description: 'Endpoint to accept or reject an invitation to become a member',
-    deprecationReason: '2021-07-07: This endpoint has been moved to GQLV2',
-    args: {
-      invitationId: {
-        type: new GraphQLNonNull(GraphQLInt),
-        description: 'The ID of the invitation to accept or decline',
-      },
-      accept: {
-        type: new GraphQLNonNull(GraphQLBoolean),
-        description: 'Whether this invitation should be accepted or declined',
-      },
-    },
-    async resolve(_, args, req) {
-      if (!req.remoteUser) {
-        throw new Unauthorized();
-      }
-
-      const invitation = await models.MemberInvitation.findByPk(args.invitationId);
-      if (!invitation) {
-        return new ValidationFailed("This invitation doesn't exist or a reply has already been given to it");
-      } else if (!req.remoteUser.isAdmin(invitation.MemberCollectiveId)) {
-        return new Forbidden('Only admin of the invited collective can reply to the invitation');
-      }
-
-      if (args.accept) {
-        await invitation.accept();
-      } else {
-        await invitation.decline();
-      }
-
-      return args.accept;
+      return deleteNotification(args, req);
     },
   },
   backyourstackDispatchOrder: {

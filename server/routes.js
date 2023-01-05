@@ -22,15 +22,16 @@ import { getGraphqlCacheKey } from './graphql/cache';
 import graphqlSchemaV1 from './graphql/v1/schema';
 import graphqlSchemaV2 from './graphql/v2/schema';
 import cache from './lib/cache';
+import errors from './lib/errors';
 import logger from './lib/logger';
-import { SentryGraphQLPlugin } from './lib/sentry';
+import oauth, { authorizeAuthenticateHandler } from './lib/oauth';
+import { reportMessageToSentry, SentryGraphQLPlugin } from './lib/sentry';
 import { parseToBoolean } from './lib/utils';
 import * as authentication from './middleware/authentication';
 import errorHandler from './middleware/error_handler';
 import * as params from './middleware/params';
 import required from './middleware/required_param';
 import sanitizer from './middleware/sanitizer';
-import alipay from './paymentProviders/stripe/alipay';
 
 const upload = multer();
 
@@ -48,9 +49,9 @@ export default async app => {
     next();
   });
 
-  app.use('*', authentication.checkClientApp);
+  app.use('*', authentication.checkPersonalToken);
 
-  app.use('*', authentication.authorizeClientApp);
+  app.use('*', authentication.authorizeClient);
 
   // Setup rate limiter
   if (get(config, 'redis.serverUrl')) {
@@ -64,9 +65,14 @@ export default async app => {
       client,
     )({
       lookup: function (req, res, opts, next) {
-        if (req.clientApp) {
-          opts.lookup = 'clientApp.id';
+        if (req.personalToken) {
+          opts.lookup = 'personalToken.id';
           // 100 requests / minute for registered API Key
+          opts.total = 100;
+          opts.expire = 1000 * 60;
+        } else if (req.remoteUser) {
+          opts.lookup = 'remoteUser.id';
+          // 100 requests / minute for authenticated users
           opts.total = 100;
           opts.expire = 1000 * 60;
         } else {
@@ -84,10 +90,10 @@ export default async app => {
       },
       onRateLimited: function (req, res) {
         let message;
-        if (req.clientApp) {
+        if (req.personalToken) {
           message = 'Rate limit exceeded. Contact-us to get higher limits.';
         } else {
-          message = 'Rate limit exceeded. Create an API Key to get higher limits.';
+          message = 'Rate limit exceeded. Create a Personal Token to get higher limits.';
         }
         res.status(429).send({ error: { message } });
       },
@@ -109,6 +115,16 @@ export default async app => {
    * (an error will be returned if the JWT token is invalid, if not present it will simply continue)
    */
   app.use('*', authentication.authenticateUser); // populate req.remoteUser if JWT token provided in the request
+
+  // OAuth server (after authentication/JWT handling, at least for authorize)
+  app.oauth = oauth;
+  app.post('/oauth/token', noCache, app.oauth.token());
+  app.post(
+    '/oauth/authorize',
+    noCache,
+    app.oauth.authorize({ allowEmptyState: true, authenticateHandler: authorizeAuthenticateHandler }),
+  );
+  app.post('/oauth/authenticate', noCache, app.oauth.authenticate());
 
   /**
    * Parameters.
@@ -140,6 +156,16 @@ export default async app => {
         return;
       }
       req.cacheKey = cacheKey;
+    }
+    next();
+  });
+
+  /**
+   * GraphQL scope
+   */
+  app.use('/graphql/v1', async (req, res, next) => {
+    if (req.userToken && req.userToken.type === 'OAUTH') {
+      throw new errors.Unauthorized('OAuth access tokens are not accepted on GraphQL v1.');
     }
     next();
   });
@@ -206,9 +232,9 @@ export default async app => {
   graphqlServerV2.applyMiddleware({ app, path: '/graphql/v2' });
 
   /**
-   * GraphQL default (v1)
+   * GraphQL default (v2)
    */
-  graphqlServerV1.applyMiddleware({ app, path: '/graphql' });
+  graphqlServerV2.applyMiddleware({ app, path: '/graphql' });
 
   /**
    * Webhooks that should bypass api key check
@@ -218,7 +244,6 @@ export default async app => {
   app.post('/webhooks/privacy', privacyWebhook); // when it gets a new subscription invoice
   app.post('/webhooks/paypal/:hostId?', paypalWebhook);
   app.post('/webhooks/thegivingblock', thegivingblockWebhook);
-  app.post('/webhooks/mailgun', email.webhook); // when receiving an email
   app.get('/connected-accounts/:service/callback', noCache, authentication.authenticateServiceCallback); // oauth callback
   app.delete(
     '/connected-accounts/:service/disconnect/:collectiveId',
@@ -254,9 +279,6 @@ export default async app => {
     connectedAccounts.verify,
   );
 
-  /* AliPay Payment Callback */
-  app.get('/services/stripe/alipay/callback', noCache, alipay.confirmOrder);
-
   /* TransferWise OTT Request Endpoint */
   app.post('/services/transferwise/pay-batch', noCache, transferwise.payBatch);
 
@@ -274,6 +296,14 @@ export default async app => {
    * Hello Works API - Helloworks hits this endpoint when a document has been completed.
    */
   app.post('/helloworks/callback', helloworks.callback);
+
+  /**
+   * An endpoint to easily test Sentry integration
+   */
+  app.get('/__test_sentry__', (req, res) => {
+    reportMessageToSentry('Testing sentry', { severity: 'debug', user: req.remoteUser });
+    res.sendStatus(200);
+  });
 
   /**
    * Override default 404 handler to make sure to obfuscate api_key visible in URL

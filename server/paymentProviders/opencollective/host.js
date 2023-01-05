@@ -16,10 +16,6 @@ paymentMethodProvider.features = {
 };
 
 paymentMethodProvider.refundTransaction = async (transaction, user) => {
-  if (transaction.CollectiveId === transaction.FromCollectiveId) {
-    throw new Error('Cannot refund a transaction from the same collective');
-  }
-
   if (transaction.type === TransactionTypes.DEBIT) {
     transaction = await transaction.getRelatedTransaction({ type: TransactionTypes.CREDIT });
   }
@@ -50,7 +46,7 @@ paymentMethodProvider.getBalance = () => {
   return Promise.resolve(maxInteger);
 };
 
-paymentMethodProvider.processOrder = async order => {
+paymentMethodProvider.processOrder = async (order, options) => {
   const host = await order.collective.getHostCollective();
 
   if (order.paymentMethod.CollectiveId !== order.collective.HostCollectiveId) {
@@ -89,6 +85,7 @@ paymentMethodProvider.processOrder = async order => {
       isSharedRevenue,
       hostFeeSharePercent,
       tax: order.data?.tax,
+      invoiceTemplate: options.invoiceTemplate,
     },
   };
 

@@ -34,7 +34,7 @@ async function getBalance(paymentMethod) {
     include: [
       {
         model: models.PaymentMethod,
-        require: true,
+        required: true,
         attributes: [],
         where: {
           [Op.or]: {
@@ -124,7 +124,6 @@ async function processOrder(order) {
     taxAmount: order.taxAmount,
     description: order.description,
     data: {
-      isFeesOnTop: order.data?.isFeesOnTop,
       hasPlatformTip: platformTip ? true : false,
       isSharedRevenue,
       platformTipEligible,

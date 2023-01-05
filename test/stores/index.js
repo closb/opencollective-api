@@ -4,7 +4,7 @@
  */
 
 /* Test libraries */
-import sinon from 'sinon';
+import { createSandbox } from 'sinon';
 import { v4 as uuid } from 'uuid';
 
 import * as expenses from '../../server/graphql/common/expenses';
@@ -46,7 +46,7 @@ function slugify(value) {
  * @param {String} name is the name of the new user. The email created
  *  for the user will be `{name}@oc.com`.
  * @param {Object} data is whatever other data that needs to be passed
- *  to the user's creation. The fields "name", "email", "username" and
+ *  to the user's creation. The fields "name", "email" and
  *  "description" can't be overrided.
  * @return {Object} with references for `user` and `userCollective`.
  * @deprecated Prefer the `fake-data` lib: use `fakeUser()`
@@ -60,7 +60,6 @@ export async function newUser(name, data = {}) {
     email,
     slug,
     name,
-    username: name,
     description: `A user called ${name}`,
   });
   return { user, userCollective: user.collective, [slug]: user };
@@ -104,7 +103,7 @@ export async function newIncognitoProfile(user) {
 export async function newHost(name, currency, hostFee, userData = {}, hostData = {}) {
   // Host Admin
   const slug = slugify(name);
-  const hostAdmin = (await newUser(`${name} Admin`, { firstName: 'host', lastName: 'admin', ...userData })).user;
+  const hostAdmin = (await newUser(`${name} Admin`, { name: 'host admin', ...userData })).user;
   const hostFeePercent = hostFee ? parseInt(hostFee) : 0;
   const hostCollective = await models.Collective.create({
     name,
@@ -335,7 +334,7 @@ export async function stripeOneTimeDonation(opt) {
   // Every transaction made can use different values, so we stub the
   // stripe call, create the order, and restore the stripe call so it
   // can be stubbed again by the next call to this helper.
-  const sandbox = sinon.createSandbox();
+  const sandbox = createSandbox();
 
   // Freeze the time to guarantee that all the objects have the
   // requested creation date. It will be reset right after the

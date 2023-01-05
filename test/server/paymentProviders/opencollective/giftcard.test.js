@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import gql from 'fake-tag';
 import moment from 'moment';
 import nock from 'nock';
-import sinon from 'sinon';
+import { createSandbox, stub } from 'sinon';
 
 import { maxInteger } from '../../../../server/constants/math';
 import emailLib from '../../../../server/lib/email';
@@ -107,7 +107,7 @@ describe('server/paymentProviders/opencollective/giftcard', () => {
   });
 
   beforeEach(() => {
-    sandbox = sinon.createSandbox();
+    sandbox = createSandbox();
     sendEmailSpy = sandbox.spy(emailLib, 'sendMessage');
     // And given that the endpoint for creating customers on Stripe
     // is patched
@@ -554,7 +554,7 @@ describe('server/paymentProviders/opencollective/giftcard', () => {
         let creditCardProcessOrderMock;
 
         beforeEach(() => {
-          creditCardProcessOrderMock = sinon.stub(creditCardLib, 'processOrder');
+          creditCardProcessOrderMock = stub(creditCardLib, 'processOrder');
         });
 
         afterEach(() => {
@@ -974,16 +974,16 @@ describe('server/paymentProviders/opencollective/giftcard', () => {
           tags: ['meetup'],
         }).then(c => (collective2 = c)),
       );
-      before('add hosts', async () => {
-        await collective1.addHost(host1, user1, { shouldAutomaticallyApprove: true });
-        await collective2.addHost(host2, user1, { shouldAutomaticallyApprove: true });
-      });
       before('creates User 1', () =>
         models.User.createUserWithCollective({
           email: store.randEmail(),
           name: 'User 1',
         }).then(u => (user1 = u)),
       );
+      before('add hosts', async () => {
+        await collective1.addHost(host1, user1, { shouldAutomaticallyApprove: true });
+        await collective2.addHost(host2, user1, { shouldAutomaticallyApprove: true });
+      });
       before('user1 to become Admin of collective1', () => {
         return models.Member.create({
           CreatedByUserId: user1.id,

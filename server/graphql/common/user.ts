@@ -1,11 +1,13 @@
 import config from 'config';
 import { pick } from 'lodash';
 
+import { activities } from '../../constants';
 import roles from '../../constants/roles';
 import cache, { fetchCollectiveId } from '../../lib/cache';
 import emailLib from '../../lib/email';
 import logger from '../../lib/logger';
 import models, { Op, sequelize } from '../../models';
+import User from '../../models/User';
 import { ValidationFailed } from '../errors';
 
 type CreateUserOptions = {
@@ -27,14 +29,23 @@ type CreateUserOptions = {
 };
 
 export const createUser = (
-  userData: { firstName: string; lastName: string; legalName: string; email: string; newsletterOptIn: boolean },
+  userData: {
+    name?: string;
+    legalName?: string;
+    email: string;
+    newsletterOptIn: boolean;
+    location: Record<string, unknown>;
+  },
   { organizationData, sendSignInLink, throwIfExists, redirect, websiteUrl, creationRequest }: CreateUserOptions,
-): Promise<{ user: typeof models.User; organization?: typeof models.Collective }> => {
+): Promise<{ user: User; organization?: typeof models.Collective }> => {
   return sequelize.transaction(async transaction => {
-    let user = await models.User.findOne({ where: { email: userData.email.toLowerCase() } }, { transaction });
+    let user = await models.User.findOne({ where: { email: userData.email.toLowerCase() }, transaction });
 
     if (throwIfExists && user) {
-      throw new ValidationFailed('It looks like that email already exists, please sign in instead');
+      throw new ValidationFailed(
+        'It looks like that email already exists, please sign in instead',
+        'EMAIL_ALREADY_EXISTS',
+      );
     } else if (!user) {
       // Create user
       user = await models.User.createUserWithCollective(userData, transaction);
@@ -55,6 +66,7 @@ export const createUser = (
           'website',
           'twitterHandle',
           'githubHandle',
+          'repositoryUrl',
         ]),
       };
       organization = await models.Collective.create(organizationParams, { transaction });
@@ -67,14 +79,23 @@ export const createUser = (
       if (config.env === 'development') {
         logger.info(`Login Link: ${loginLink}`);
       }
-      emailLib.send('user.new.token', user.email, { loginLink }, { sendEvenIfNotProduction: true });
+      await emailLib.send(activities.USER_NEW_TOKEN, user.email, { loginLink }, { sendEvenIfNotProduction: true });
+      await models.Activity.create(
+        {
+          type: activities.USER_NEW_TOKEN,
+          UserId: user.id,
+          CollectiveId: user.CollectiveId,
+          FromCollectiveId: user.CollectiveId,
+          data: { notify: false },
+        },
+        { transaction },
+      );
     }
-
     return { user, organization };
   });
 };
 
-export const hasSeenLatestChangelogEntry = async (user: typeof models.User): Promise<boolean> => {
+export const hasSeenLatestChangelogEntry = async (user: User): Promise<boolean> => {
   const cacheKey = 'latest_changelog_publish_date';
   let latestChangelogUpdatePublishDate = await cache.get(cacheKey);
   // Make sure we don't show the changelog notifications for newly confirmed users

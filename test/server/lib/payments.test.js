@@ -2,8 +2,9 @@ import Promise from 'bluebird';
 import { expect } from 'chai';
 import config from 'config';
 import nock from 'nock';
-import sinon from 'sinon';
+import { createSandbox } from 'sinon';
 
+import { activities } from '../../../server/constants';
 import status from '../../../server/constants/order_status';
 import { PLANS_COLLECTIVE_SLUG } from '../../../server/constants/plans';
 import roles from '../../../server/constants/roles';
@@ -63,10 +64,19 @@ describe('server/lib/payments', () => {
   beforeEach(() => utils.resetTestDB());
 
   beforeEach(() => {
-    sandbox = sinon.createSandbox();
+    sandbox = createSandbox();
     sandbox.stub(stripe.customers, 'create').callsFake(() => Promise.resolve({ id: 'cus_BM7mGwp1Ea8RtL' }));
     sandbox.stub(stripe.customers, 'retrieve').callsFake(() => Promise.resolve({ id: 'cus_BM7mGwp1Ea8RtL' }));
+    sandbox.stub(stripe.tokens, 'retrieve').callsFake(async id => {
+      id;
+    });
     sandbox.stub(stripe.tokens, 'create').callsFake(() => Promise.resolve({ id: 'tok_1AzPXGD8MNtzsDcgwaltZuvp' }));
+    sandbox
+      .stub(stripe.paymentMethods, 'create')
+      .resolves({ id: 'pm_123456789012345678901234', type: 'card', card: { fingerprint: 'fingerprint' } });
+    sandbox
+      .stub(stripe.paymentMethods, 'attach')
+      .resolves({ id: 'pm_123456789012345678901234', type: 'card', card: { fingerprint: 'fingerprint' } });
     sandbox.stub(stripe.paymentIntents, 'create').callsFake(() =>
       Promise.resolve({
         id: 'pi_1F82vtBYycQg1OMfS2Rctiau',
@@ -237,7 +247,7 @@ describe('server/lib/payments', () => {
 
             it('successfully sends out an email to donor1', async () => {
               await utils.waitForCondition(() => emailSendSpy.callCount > 0);
-              expect(emailSendSpy.lastCall.args[0]).to.equal('thankyou');
+              expect(emailSendSpy.lastCall.args[0]).to.equal(activities.ORDER_THANKYOU);
               expect(emailSendSpy.lastCall.args[1]).to.equal(user.email);
               expect(emailSendSpy.lastCall.args[2].relatedCollectives).to.have.length(1);
               expect(emailSendSpy.lastCall.args[2].relatedCollectives[0]).to.have.property('settings');
@@ -294,7 +304,7 @@ describe('server/lib/payments', () => {
             }));
 
           it('successfully creates an order in the database', () =>
-            models.Order.findAndCountAll({}).then(res => {
+            models.Order.findAndCountAll({ order: [['id', 'ASC']] }).then(res => {
               expect(res.count).to.equal(2);
               expect(res.rows[1]).to.have.property('CreatedByUserId', user2.id);
               expect(res.rows[1]).to.have.property('CollectiveId', collective2.id);
@@ -318,7 +328,7 @@ describe('server/lib/payments', () => {
 
           it('successfully sends out an email to donor', done => {
             setTimeout(() => {
-              expect(emailSendSpy.lastCall.args[0]).to.equal('thankyou');
+              expect(emailSendSpy.lastCall.args[0]).to.equal(activities.ORDER_THANKYOU);
               expect(emailSendSpy.lastCall.args[1]).to.equal(user2.email);
               done();
             }, 80);
@@ -411,10 +421,10 @@ describe('server/lib/payments', () => {
         amountInHostCurrency: 5000,
         hostCurrencyFxRate: 1,
         hostFeeInHostCurrency: 250,
-        platformFeeInHostCurrency: 500,
         paymentProcessorFeeInHostCurrency: 175,
         description: 'Monthly subscription to Webpack',
-        data: { charge: { id: 'ch_refunded_charge' }, isFeesOnTop: true },
+        platformTipAmount: 500,
+        data: { charge: { id: 'ch_refunded_charge' } },
       });
 
       // Should have 6 transactions:
@@ -462,7 +472,7 @@ describe('server/lib/payments', () => {
     });
   }); /* createRefundTransaction */
 
-  describe('sendOrderProcessingEmail', () => {
+  describe('sendOrderPendingEmail', () => {
     let order;
 
     beforeEach(async () => {
@@ -503,7 +513,8 @@ describe('server/lib/payments', () => {
     });
 
     it('should include account information', async () => {
-      await payments.sendOrderProcessingEmail(order);
+      await payments.sendOrderPendingEmail(order);
+      await utils.waitForCondition(() => emailSendSpy.callCount > 0);
 
       expect(emailSendSpy.lastCall.args[2]).to.have.property('account');
       expect(emailSendSpy.lastCall.args[2].instructions).to.include('IBAN: DE893219828398123');

@@ -3,6 +3,7 @@ import debug from 'debug';
 import { get } from 'lodash';
 import moment from 'moment';
 
+import ActivityTypes from '../../constants/activities';
 import { convertToCurrency } from '../../lib/currency';
 import errors from '../../lib/errors';
 import { formatCurrency } from '../../lib/utils';
@@ -17,7 +18,7 @@ const debugPaypal = debug('paypal');
 
 /**
  * PayPal paymentProvider
- * Provides a oAuth flow to creates a payment method that can be used to pay up to $2,000 USD or equivalent
+ * Provides a OAuth flow to creates a payment method that can be used to pay up to $2,000 USD or equivalent
  */
 
 /*
@@ -150,7 +151,7 @@ export default {
               .then(pm => {
                 newPmName = pm.info.name;
                 return models.Activity.create({
-                  type: 'user.paymentMethod.created',
+                  type: ActivityTypes.USER_PAYMENT_METHOD_CREATED,
                   UserId: paymentMethod.CreatedByUserId,
                   CollectiveId: paymentMethod.CollectiveId,
                   data: {

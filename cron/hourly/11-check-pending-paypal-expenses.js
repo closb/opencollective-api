@@ -8,6 +8,7 @@ import { Op } from 'sequelize';
 
 import status from '../../server/constants/expense_status';
 import logger from '../../server/lib/logger';
+import { reportErrorToSentry } from '../../server/lib/sentry';
 import models from '../../server/models';
 import { PayoutMethodTypes } from '../../server/models/PayoutMethod';
 import { checkBatchStatus } from '../../server/paymentProviders/paypal/payouts';
@@ -18,7 +19,7 @@ export async function run() {
       [Op.or]: [
         { status: status.PROCESSING },
         {
-          status: { [Op.notIn]: [status.PAID, status.ERROR] },
+          status: { [Op.notIn]: [status.PAID, status.ERROR, status.REJECTED, status.SPAM] },
           updatedAt: {
             // 40 so we can cover the 30 day limit
             [Op.gte]: moment().subtract(40, 'days').toDate(),
@@ -38,7 +39,10 @@ export async function run() {
   logger.info(`Checking the status of ${expenses.length} transaction(s) paid using PayPal Payouts...`);
   for (const batch of batches) {
     logger.info(`Checking host ${batch[0]?.collective?.HostCollectiveId} batch with ${batch.length} expense(s)...`);
-    await checkBatchStatus(batch).catch(console.error);
+    await checkBatchStatus(batch).catch(e => {
+      console.error(e);
+      reportErrorToSentry(e);
+    });
   }
   logger.info('Done!');
 }
@@ -50,6 +54,7 @@ if (require.main === module) {
     })
     .catch(e => {
       console.error(e);
+      reportErrorToSentry(e);
       process.exit(1);
     });
 }

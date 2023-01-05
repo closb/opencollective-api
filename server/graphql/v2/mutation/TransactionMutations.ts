@@ -1,11 +1,13 @@
 import express from 'express';
 import { GraphQLNonNull, GraphQLString } from 'graphql';
 
+import { activities } from '../../../constants';
 import orderStatus from '../../../constants/order_status';
 import { TransactionKind } from '../../../constants/transaction-kind';
 import { purgeCacheForCollective } from '../../../lib/cache';
-import { notifyAdminsOfCollective } from '../../../lib/notifications';
+import twoFactorAuthLib from '../../../lib/two-factor-authentication';
 import models from '../../../models';
+import { checkRemoteUserCanUseTransactions } from '../../common/scope-check';
 import { canReject } from '../../common/transactions';
 import { Forbidden, NotFound, Unauthorized, ValidationFailed } from '../../errors';
 import { refundTransaction as legacyRefundTransaction } from '../../v1/mutations/orders';
@@ -16,7 +18,8 @@ import { Transaction } from '../interface/Transaction';
 const transactionMutations = {
   addPlatformTipToTransaction: {
     type: new GraphQLNonNull(Transaction),
-    description: 'Add platform tips to a transaction',
+    description: 'Add platform tips to a transaction. Scope: "transactions".',
+    deprecationReason: "2022-07-06: This feature will not be supported in the future. Please don't rely on it.",
     args: {
       transaction: {
         type: new GraphQLNonNull(TransactionReferenceInput),
@@ -28,9 +31,7 @@ const transactionMutations = {
       },
     },
     async resolve(_: void, args, req: express.Request): Promise<typeof Transaction> {
-      if (!req.remoteUser) {
-        throw new Unauthorized('You need to be logged in to add a platform tip');
-      }
+      checkRemoteUserCanUseTransactions(req);
 
       const transaction = await fetchTransactionWithReference(args.transaction, { throwIfMissing: true });
 
@@ -45,6 +46,12 @@ const transactionMutations = {
         throw new Error('Platform tip is already set for this transaction group');
       }
 
+      const expectedCurrency = transaction.currency;
+      const platformTipInCents = getValueInCentsFromAmountInput(args.amount, { expectedCurrency });
+      if (!platformTipInCents) {
+        throw new ValidationFailed('Platform tip amount must be greater than 0');
+      }
+
       // We fake a transactionData object to pass to createPlatformTipTransactions
       // It's not ideal but it's how it is
       const transactionData = {
@@ -53,13 +60,15 @@ const transactionMutations = {
         FromCollectiveId: transaction.HostCollectiveId,
         data: {
           ...transaction.dataValues.data,
-          isFeesOnTop: true,
           hasPlatformTip: true,
-          platformTip: getValueInCentsFromAmountInput(args.amount),
+          platformTip: platformTipInCents,
         },
       };
 
       const host = await models.Collective.findByPk(transaction.HostCollectiveId);
+
+      // Enforce 2FA
+      await twoFactorAuthLib.enforceForAccountAdmins(req, host, { onlyAskOnLogin: true });
 
       const { platformTipTransaction } = await models.Transaction.createPlatformTipTransactions(transactionData, host);
 
@@ -68,7 +77,7 @@ const transactionMutations = {
   },
   refundTransaction: {
     type: Transaction,
-    description: 'Refunds transaction',
+    description: 'Refunds a transaction. Scope: "transactions".',
     args: {
       transaction: {
         type: new GraphQLNonNull(TransactionReferenceInput),
@@ -76,16 +85,15 @@ const transactionMutations = {
       },
     },
     async resolve(_: void, args, req: express.Request): Promise<typeof Transaction> {
-      if (!req.remoteUser) {
-        throw new Unauthorized();
-      }
+      checkRemoteUserCanUseTransactions(req);
       const transaction = await fetchTransactionWithReference(args.transaction);
       return legacyRefundTransaction(undefined, { id: transaction.id }, req);
     },
   },
   rejectTransaction: {
     type: new GraphQLNonNull(Transaction),
-    description: 'Rejects transaction, removes member from Collective, and sends a message to the contributor',
+    description:
+      'Rejects transaction, removes member from Collective, and sends a message to the contributor. Scope: "transactions".',
     args: {
       transaction: {
         type: new GraphQLNonNull(TransactionReferenceInput),
@@ -97,9 +105,7 @@ const transactionMutations = {
       },
     },
     async resolve(_: void, args, req: express.Request): Promise<typeof Transaction> {
-      if (!req.remoteUser) {
-        throw new Unauthorized();
-      }
+      checkRemoteUserCanUseTransactions(req);
 
       // get transaction info
       const transaction = await fetchTransactionWithReference(args.transaction);
@@ -139,6 +145,13 @@ const transactionMutations = {
         throw new NotFound('Order not found');
       }
 
+      if (req.remoteUser.isAdminOfCollective(toAccount)) {
+        await twoFactorAuthLib.enforceForAccountAdmins(req, toAccount, { onlyAskOnLogin: true });
+      } else if (req.remoteUser.isAdmin(transaction.HostCollectiveId)) {
+        const host = await models.Collective.findByPk(transaction.HostCollectiveId);
+        await twoFactorAuthLib.enforceForAccountAdmins(req, host, { onlyAskOnLogin: true });
+      }
+
       if (orderToUpdate.SubscriptionId) {
         await orderToUpdate.update({ status: orderStatus.REJECTED });
         await orderToUpdate.Subscription.deactivate('Contribution rejected');
@@ -162,18 +175,19 @@ const transactionMutations = {
       purgeCacheForCollective(toAccount.slug);
 
       // email contributor(s) to let them know their transaction has been rejected
-      const collective = {
-        name: toAccount.name,
-      };
-
-      const data = { collective, rejectionReason };
-
       const activity = {
-        type: 'contribution.rejected',
-        data,
+        type: activities.CONTRIBUTION_REJECTED,
+        OrderId: orderToUpdate.id,
+        FromCollectiveId: orderToUpdate.FromCollectiveId,
+        CollectiveId: orderToUpdate.CollectiveId,
+        HostCollectiveId: toAccount.approvedAt ? toAccount.HostCollectiveId : null,
+        data: {
+          rejectionReason,
+          collective: toAccount.info,
+          fromCollective: fromAccount.info,
+        },
       };
-
-      await notifyAdminsOfCollective(fromAccount.id, activity);
+      await models.Activity.create(activity);
 
       return transaction;
     },

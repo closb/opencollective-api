@@ -260,15 +260,29 @@ export type Balance = {
   };
 };
 
-export type BorderlessAccount = {
+export type BalanceV4 = {
   id: number;
-  profileId: number;
-  recipientId: number;
+  currency: string;
+  type: 'STANDARD' | 'SAVINGS';
+  amount: {
+    value: number;
+    currency: string;
+  };
+  reservedAmount: {
+    value: number;
+    currency: string;
+  };
+  cashAmount: {
+    value: number;
+    currency: string;
+  };
+  totalWorth: {
+    value: number;
+    currency: string;
+  };
   creationTime: string;
   modificationTime: string;
-  active: boolean;
-  eligible: boolean;
-  balances: Balance[];
+  visible: boolean;
 };
 
 export type AccessToken = {
@@ -312,4 +326,29 @@ export type BatchGroup = {
   status: 'NEW' | 'COMPLETED' | 'MARKED_FOR_CANCELLATION' | 'PROCESSING_CANCEL' | 'CANCELLED';
   transferIds: Array<number>;
   payInDetails?: Array<Record<string, any>>;
+};
+
+export type TransactionRequiredFieldsGroup = {
+  key: string;
+  name: string;
+  type: string;
+  required: boolean;
+  example: string;
+  validationRegexp: null | string;
+  refreshRequirementsOnChange: boolean;
+  valuesAllowed?: Array<{
+    key: string;
+    name: string;
+  }>;
+};
+
+export type TransactionRequiredFields = {
+  name: string;
+  group: Array<TransactionRequiredFieldsGroup>;
+};
+
+export type TransactionRequirementsType = {
+  type: string;
+  title: string;
+  fields: Array<TransactionRequiredFields>;
 };

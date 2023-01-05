@@ -5,6 +5,8 @@ import config from 'config';
 
 import logger from '../lib/logger';
 
+import { reportErrorToSentry } from './sentry';
+
 // Create S3 service object & set credentials and region
 let s3;
 if (config.aws.s3.key) {
@@ -24,6 +26,7 @@ export const uploadToS3 = (
       (s3 as S3).upload(params, (err, data) => {
         if (err) {
           logger.error('Error uploading file to S3: ', err);
+          reportErrorToSentry(err);
           reject(err);
         } else {
           resolve(data);
@@ -32,7 +35,8 @@ export const uploadToS3 = (
     } else {
       const Location = `/tmp/${params.Key}`;
       logger.warn(`S3 is not set, saving file to ${Location}. This should only be done in development.`);
-      fs.writeFile(Location, params.Body.toString('utf8'), logger.info);
+      const isBuffer = params.Body instanceof Buffer;
+      fs.writeFile(Location, isBuffer ? <Buffer>params.Body : params.Body.toString('utf8'), logger.info);
       resolve({ Location: `file://${Location}`, Bucket: 'local-tmp', Key: params.Key });
     }
   });

@@ -1,8 +1,11 @@
 import { GraphQLBoolean, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
 import { omit, pick } from 'lodash';
 
+import stripe from '../../../lib/stripe';
+import twoFactorAuthLib from '../../../lib/two-factor-authentication';
 import models from '../../../models';
 import { setupCreditCard } from '../../../paymentProviders/stripe/creditcard';
+import { checkRemoteUserCanUseOrders } from '../../common/scope-check';
 import { Forbidden } from '../../errors';
 import { AccountReferenceInput, fetchAccountWithReference } from '../input/AccountReferenceInput';
 import { CreditCardCreateInput } from '../input/CreditCardCreateInput';
@@ -26,7 +29,7 @@ const CreditCardWithStripeError = new GraphQLObjectType({
 
 const addCreditCard = {
   type: new GraphQLNonNull(CreditCardWithStripeError),
-  description: 'Add a new payment method to be used with an Order',
+  description: 'Add a new payment method to be used with an Order. Scope: "orders".',
   args: {
     creditCardInfo: {
       type: new GraphQLNonNull(CreditCardCreateInput),
@@ -47,11 +50,17 @@ const addCreditCard = {
     },
   },
   async resolve(_, args, req) {
+    checkRemoteUserCanUseOrders(req);
+
     const collective = await fetchAccountWithReference(args.account, { throwIfMissing: true });
     if (!req.remoteUser?.isAdminOfCollective(collective)) {
       throw new Forbidden(`Must be an admin of ${collective.name}`);
     }
 
+    // Check 2FA
+    await twoFactorAuthLib.enforceForAccountAdmins(req, collective, { onlyAskOnLogin: true });
+
+    const token = await stripe.tokens.retrieve(args.creditCardInfo.token);
     const newPaymentMethodData = {
       service: 'stripe',
       type: 'creditcard',
@@ -61,7 +70,12 @@ const addCreditCard = {
       saved: args.isSavedForLater,
       CollectiveId: collective.id,
       token: args.creditCardInfo.token,
-      data: pick(args.creditCardInfo, ['brand', 'country', 'expMonth', 'expYear', 'fullName', 'funding', 'zip']),
+      data: {
+        ...pick(token.card, ['brand', 'country', 'fullName', 'funding', 'zip', 'fingerprint']),
+        name: token.card.name,
+        expMonth: token.card.exp_month,
+        expYear: token.card.exp_year,
+      },
     };
 
     let pm = await models.PaymentMethod.create(newPaymentMethodData);
@@ -100,13 +114,15 @@ const addCreditCard = {
 
 const confirmCreditCard = {
   type: new GraphQLNonNull(CreditCardWithStripeError),
-  description: 'Confirm a credit card is ready for use after strong customer authentication',
+  description: 'Confirm a credit card is ready for use after strong customer authentication. Scope: "orders".',
   args: {
     paymentMethod: {
       type: new GraphQLNonNull(PaymentMethodReferenceInput),
     },
   },
   async resolve(_, args, req) {
+    checkRemoteUserCanUseOrders(req);
+
     const paymentMethod = await fetchPaymentMethodWithReference(args.paymentMethod);
 
     if (!paymentMethod || !req.remoteUser?.isAdmin(paymentMethod.CollectiveId)) {

@@ -1,25 +1,11 @@
 #!/usr/bin/env ./node_modules/.bin/babel-node
 import '../server/env';
 
-import readline from 'readline';
-
 import { mergeAccounts, simulateMergeAccounts } from '../server/lib/merge-accounts';
+import { parseToBoolean } from '../server/lib/utils';
 import models from '../server/models';
 
-const confirmAction = question => {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
-  return new Promise(resolve => {
-    rl.question(`${question}\n> `, input => {
-      if (input.toLowerCase() === 'yes') {
-        resolve(true);
-      } else {
-        rl.close();
-        resolve(false);
-      }
-    });
-  });
-};
+import { confirm } from './common/helpers';
 
 const printMergeSummary = async (fromCollective, intoCollective) => {
   console.log('==============================================================');
@@ -53,7 +39,10 @@ async function main() {
   await printMergeSummary(fromCollective, intoCollective);
   console.log('---------------------------------------------------------------');
 
-  const isConfirmed = await confirmAction('This action is irreversible. Are you sure you want to continue? (Yes/No)');
+  let isConfirmed = parseToBoolean(process.env.CONFIRM);
+  if (!isConfirmed) {
+    isConfirmed = await confirm('This action is irreversible. Are you sure you want to continue? (Yes/No)');
+  }
   if (isConfirmed) {
     console.log(
       `\nMerging ${fromCollective.slug} (#${fromCollective.id}) into ${intoCollective.slug} (#${intoCollective.id})...`,

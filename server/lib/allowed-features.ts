@@ -4,8 +4,6 @@ import { types } from '../constants/collectives';
 import FEATURE from '../constants/feature';
 import models from '../models';
 
-import { isPastEvent } from './collectivelib';
-
 const HOST_TYPES = [types.USER, types.ORGANIZATION];
 
 // Please refer to and update https://docs.google.com/spreadsheets/d/15ppKaZJCXBjvY7-AjjCj3w5D-4ebLQdEowynJksgDXE/edit#gid=0
@@ -21,15 +19,15 @@ const FeatureAllowedForTypes = {
   [FEATURE.RECEIVE_HOST_APPLICATIONS]: HOST_TYPES,
   [FEATURE.HOST_DASHBOARD]: HOST_TYPES,
   [FEATURE.EVENTS]: [types.ORGANIZATION, types.COLLECTIVE],
-  [FEATURE.PROJECTS]: [types.FUND, types.COLLECTIVE],
+  [FEATURE.PROJECTS]: [types.FUND, types.COLLECTIVE, types.ORGANIZATION],
   [FEATURE.USE_EXPENSES]: [types.ORGANIZATION, types.COLLECTIVE, types.EVENT, types.FUND, types.PROJECT],
   [FEATURE.RECEIVE_EXPENSES]: [types.ORGANIZATION, types.COLLECTIVE, types.EVENT, types.FUND, types.PROJECT],
-  [FEATURE.COLLECTIVE_GOALS]: [types.COLLECTIVE, types.ORGANIZATION],
+  [FEATURE.COLLECTIVE_GOALS]: [types.COLLECTIVE, types.ORGANIZATION, types.PROJECT],
   [FEATURE.TOP_FINANCIAL_CONTRIBUTORS]: [types.COLLECTIVE, types.ORGANIZATION, types.FUND],
   [FEATURE.CONVERSATIONS]: [types.COLLECTIVE, types.ORGANIZATION],
   [FEATURE.UPDATES]: [types.COLLECTIVE, types.ORGANIZATION, types.FUND, types.PROJECT, types.EVENT],
   [FEATURE.TEAM]: [types.ORGANIZATION, types.COLLECTIVE, types.EVENT, types.FUND, types.PROJECT],
-  [FEATURE.CONTACT_FORM]: [types.COLLECTIVE, types.EVENT, types.ORGANIZATION],
+  [FEATURE.CONTACT_FORM]: [types.COLLECTIVE, types.EVENT, types.ORGANIZATION, types.FUND],
   [FEATURE.TRANSFERWISE]: [types.ORGANIZATION],
   [FEATURE.PAYPAL_PAYOUTS]: [types.ORGANIZATION],
   [FEATURE.PAYPAL_DONATIONS]: [types.ORGANIZATION],
@@ -48,8 +46,9 @@ export const OPT_IN_FEATURE_FLAGS = {
   [FEATURE.COLLECTIVE_GOALS]: 'settings.collectivePage.showGoals',
   [FEATURE.PAYPAL_PAYOUTS]: 'settings.features.paypalPayouts',
   [FEATURE.PAYPAL_DONATIONS]: 'settings.features.paypalDonations',
-  [FEATURE.ALIPAY]: 'settings.features.alipay',
   [FEATURE.RECEIVE_HOST_APPLICATIONS]: 'settings.apply',
+  [FEATURE.EMAIL_NOTIFICATIONS_PANEL]: 'settings.features.emailNotificationsPanel',
+  [FEATURE.STRIPE_PAYMENT_INTENT]: 'settings.features.stripePaymentIntent',
 };
 
 const FEATURES_ONLY_FOR_HOST_ORGS = new Set([
@@ -62,6 +61,7 @@ const FEATURES_ONLY_FOR_HOST_ORGS = new Set([
   FEATURE.TRANSFERWISE,
   FEATURE.PAYPAL_PAYOUTS,
   FEATURE.PAYPAL_DONATIONS,
+  FEATURE.PROJECTS,
   FEATURE.ALIPAY,
   FEATURE.CONTACT_FORM,
   FEATURE.HOST_DASHBOARD,
@@ -79,8 +79,6 @@ const FEATURES_ONLY_FOR_ACTIVE_HOSTS = new Set([
   FEATURE.RECEIVE_FINANCIAL_CONTRIBUTIONS,
   FEATURE.EVENTS,
 ]);
-
-const FEATURES_DISABLED_FOR_PAST_EVENTS = new Set([FEATURE.RECEIVE_FINANCIAL_CONTRIBUTIONS]);
 
 /**
  * Returns true if feature is allowed for this collective type, false otherwise.
@@ -119,6 +117,8 @@ export const hasOptedInForFeature = (collective: typeof models.Collective, featu
 export const hasFeature = (collective: typeof models.Collective, feature: FEATURE): boolean => {
   if (!collective) {
     return false;
+  } else if (get(collective, `data.features.${FEATURE.ALL}`) === false) {
+    return false;
   }
 
   if (!isFeatureAllowedForCollectiveType(collective.type, feature, collective.isHostAccount)) {
@@ -142,12 +142,7 @@ export const hasFeature = (collective: typeof models.Collective, feature: FEATUR
     return hasOptedInForFeature(collective, feature);
   }
 
-  // Checks for past events
-  if (collective.type === types.EVENT && isPastEvent(collective) && FEATURES_DISABLED_FOR_PAST_EVENTS.has(feature)) {
-    return false;
-  }
-
-  return true;
+  return get(collective, `data.features.${feature}`, true);
 };
 
 export { FEATURE };

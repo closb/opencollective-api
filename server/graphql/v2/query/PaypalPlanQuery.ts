@@ -2,6 +2,7 @@ import { GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
 
 import RateLimit from '../../../lib/rate-limit';
 import PaypalPlanModel from '../../../models/PaypalPlan';
+import Tier from '../../../models/Tier';
 import { getOrCreatePlan } from '../../../paymentProviders/paypal/subscription';
 import { RateLimitExceeded } from '../../errors';
 import { ContributionFrequency } from '../enum';
@@ -50,11 +51,13 @@ const PaypalPlanQuery = {
       throw new Error('An interval must be provided to fetch PayPal plans');
     }
 
-    const amount = getValueInCentsFromAmountInput(args.amount);
-    const currency = args.amount.currency;
     const collective = await fetchAccountWithReference(args.account, { loaders: req.loaders, throwIfMissing: true });
+    const tier =
+      args.tier && <Tier>await fetchTierWithReference(args.tier, { loaders: req.loaders, throwIfMissing: true });
+    const expectedCurrency = tier?.currency || collective?.currency;
+    const amount = getValueInCentsFromAmountInput(args.amount, { expectedCurrency, allowNilCurrency: false });
+    const currency = args.amount.currency;
     const host = await collective.getHostCollective();
-    const tier = args.tier && (await fetchTierWithReference(args.tier, { loaders: req.loaders, throwIfMissing: true }));
     return getOrCreatePlan(host, collective, interval, amount, currency, tier);
   },
 };

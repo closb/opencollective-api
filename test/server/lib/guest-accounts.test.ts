@@ -25,8 +25,8 @@ describe('server/lib/guest-accounts.ts', () => {
       const user = await models.User.findOne({ where: { CollectiveId: collective.id } });
       expect(collective).to.exist;
       expect(user.email).to.eq(email);
-      expect(user.data.creationRequest.ip).to.eq('1.2.3.4');
-      expect(user.data.creationRequest.userAgent).to.eq('TestUserAgent');
+      expect(user.data.creationRequest['ip']).to.eq('1.2.3.4');
+      expect(user.data.creationRequest['userAgent']).to.eq('TestUserAgent');
     });
 
     it('Works even if a verified account already exists for this email, but does not update the profile', async () => {
@@ -95,7 +95,7 @@ describe('server/lib/guest-accounts.ts', () => {
       await user.reload({ include: [{ association: 'collective' }] });
       expect(user.confirmedAt).to.not.be.null;
       expect(user.collective.name).to.eq('Incognito');
-      expect(user.collective.slug).to.include('guest-'); // slug doesn't get updated
+      expect(user.collective.slug).to.include('user-');
     });
 
     it('verifies the account and updates the profile for users that already filled their profiles', async () => {
@@ -107,7 +107,7 @@ describe('server/lib/guest-accounts.ts', () => {
       await user.reload({ include: [{ association: 'collective' }] });
       expect(user.confirmedAt).to.not.be.null;
       expect(user.collective.name).to.eq('Zappa');
-      expect(user.collective.slug).to.include('guest'); // slug doesn't get updated
+      expect(user.collective.slug).to.include('zappa');
     });
   });
 });

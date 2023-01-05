@@ -1,4 +1,4 @@
-import { get, truncate } from 'lodash';
+import { get, isUndefined, pickBy, truncate } from 'lodash';
 
 import * as constants from '../../constants/transactions';
 import { getFxRate } from '../../lib/currency';
@@ -12,12 +12,20 @@ import {
 } from '../../lib/payments';
 import { paypalAmountToCents } from '../../lib/paypal';
 import { formatCurrency } from '../../lib/utils';
-import models from '../../models';
+import models, { Op } from '../../models';
+import User from '../../models/User';
 
 import { paypalRequestV2 } from './api';
 
 /** Create transaction in our database to reflect a PayPal charge */
-const recordTransaction = async (order, amount, currency, paypalFee, payload): Promise<typeof models.Transaction> => {
+const recordTransaction = async (
+  order,
+  amount,
+  currency,
+  paypalFee,
+  { data = undefined, createdAt = undefined } = {},
+): Promise<typeof models.Transaction> => {
+  order.collective = order.collective || (await order.getCollective());
   const host = await order.collective.getHostCollective();
   if (!host) {
     throw new Error(`Cannot create transaction: collective id ${order.collective.id} doesn't have a host`);
@@ -37,7 +45,7 @@ const recordTransaction = async (order, amount, currency, paypalFee, payload): P
   const platformTip = getPlatformTip(order);
   const platformTipInHostCurrency = Math.round(platformTip * hostCurrencyFxRate);
 
-  return models.Transaction.createFromContributionPayload({
+  const transactionData = {
     CreatedByUserId: order.CreatedByUserId,
     FromCollectiveId: order.FromCollectiveId,
     CollectiveId: order.CollectiveId,
@@ -54,8 +62,7 @@ const recordTransaction = async (order, amount, currency, paypalFee, payload): P
     taxAmount: order.taxAmount,
     description: order.description,
     data: {
-      ...payload,
-      isFeesOnTop: order.data?.isFeesOnTop,
+      ...data,
       hasPlatformTip: platformTip ? true : false,
       isSharedRevenue,
       platformTipEligible,
@@ -64,32 +71,65 @@ const recordTransaction = async (order, amount, currency, paypalFee, payload): P
       hostFeeSharePercent,
       tax: order.data?.tax,
     },
-  });
+  };
+
+  if (createdAt) {
+    transactionData['createdAt'] = createdAt;
+  }
+
+  return models.Transaction.createFromContributionPayload(transactionData);
 };
 
 export function recordPaypalSale(order: typeof models.Order, paypalSale): Promise<typeof models.Transaction> {
   const currency = paypalSale.amount.currency;
   const amount = paypalAmountToCents(paypalSale.amount.total);
   const fee = paypalAmountToCents(get(paypalSale, 'transaction_fee.value', '0.0'));
-  return recordTransaction(order, amount, currency, fee, { paypalSale });
+  return recordTransaction(order, amount, currency, fee, { data: { paypalSale } });
 }
 
 export function recordPaypalTransaction(
   order: typeof models.Order,
   paypalTransaction,
+  { data = undefined, createdAt = undefined } = {},
 ): Promise<typeof models.Transaction> {
   const currency = paypalTransaction.amount_with_breakdown.gross_amount.currency_code;
   const amount = floatAmountToCents(parseFloat(paypalTransaction.amount_with_breakdown.gross_amount.value));
   const fee = parseFloat(get(paypalTransaction.amount_with_breakdown, 'fee_amount.value', '0.0'));
-  return recordTransaction(order, amount, currency, fee, { paypalTransaction });
+  return recordTransaction(order, amount, currency, fee, { data: { ...data, paypalTransaction }, createdAt });
 }
 
-export const recordPaypalCapture = async (order: typeof models.Order, capture): Promise<typeof models.Transaction> => {
+export const recordPaypalCapture = async (
+  order: typeof models.Order,
+  capture,
+  { data = undefined, createdAt = undefined } = {},
+): Promise<typeof models.Transaction> => {
   const currency = capture.amount.currency_code;
   const amount = paypalAmountToCents(capture.amount.value);
   const fee = paypalAmountToCents(get(capture, 'seller_receivable_breakdown.paypal_fee.value', '0.0'));
-  return recordTransaction(order, amount, currency, fee, { capture });
+  return recordTransaction(order, amount, currency, fee, { data: { ...data, capture }, createdAt });
 };
+
+/**
+ * Returns the PayPal transaction associated to this ID, if any.
+ * `HostCollectiveId`/`OrderId` are optional but make the query way more performant.
+ */
+export async function findTransactionByPaypalId(
+  paypalTransactionId: string,
+  { type = 'CREDIT', HostCollectiveId = undefined, OrderId = undefined } = {},
+) {
+  return models.Transaction.findOne({
+    where: {
+      ...pickBy({ type, HostCollectiveId, OrderId }, value => !isUndefined(value)),
+      data: {
+        [Op.or]: [
+          { capture: { id: paypalTransactionId } },
+          { paypalSale: { id: paypalTransactionId } },
+          { paypalTransaction: { id: paypalTransactionId } },
+        ],
+      },
+    },
+  });
+}
 
 const processPaypalOrder = async (order, paypalOrderId): Promise<typeof models.Transaction | undefined> => {
   const hostCollective = await order.collective.getHostCollective();
@@ -120,14 +160,27 @@ const processPaypalOrder = async (order, paypalOrderId): Promise<typeof models.T
     return;
   }
 
-  // Record the charge in our ledger
-  return recordPaypalCapture(order, captureDetails);
+  // Prevent double-records in the (quite unlikely) case where the webhook event would be processed before the API replies
+  const existingTransaction = await models.Transaction.findOne({
+    where: {
+      OrderId: order.id,
+      type: 'CREDIT',
+      kind: 'CONTRIBUTION',
+      data: { capture: { id: capture.id } },
+    },
+  });
+
+  if (existingTransaction) {
+    return existingTransaction;
+  } else {
+    return recordPaypalCapture(order, captureDetails);
+  }
 };
 
 export const refundPaypalCapture = async (
   transaction: typeof models.Transaction,
   captureId: string,
-  user: typeof models.User,
+  user: User,
   reason: string,
 ): Promise<typeof models.Transaction> => {
   const host = await transaction.getHostCollective();
@@ -145,7 +198,12 @@ export const refundPaypalCapture = async (
     const refundDetails = await paypalRequestV2(`payments/refunds/${result.id}`, host, 'GET');
     const rawRefundedPaypalFee = <string>get(refundDetails, 'seller_payable_breakdown.paypal_fee.value', '0.00');
     const refundedPaypalFee = floatAmountToCents(parseFloat(rawRefundedPaypalFee));
-    return createRefundTransaction(transaction, refundedPaypalFee, { paypalResponse: result }, user);
+    return createRefundTransaction(
+      transaction,
+      refundedPaypalFee,
+      { refundReason: reason, paypalResponse: result },
+      user,
+    );
   } catch (error) {
     const newData = delete transaction.data.isRefundedFromOurSystem;
     await transaction.update({ data: newData });
@@ -162,7 +220,7 @@ export async function processOrder(order: typeof models.Order): Promise<typeof m
   }
 }
 
-const getCaptureIdFromPaypalTransaction = transaction => {
+export const getCaptureIdFromPaypalTransaction = transaction => {
   const { data } = transaction;
   if (!data) {
     return null;
@@ -175,7 +233,7 @@ const getCaptureIdFromPaypalTransaction = transaction => {
 
 const refundPaypalPaymentTransaction = async (
   transaction: typeof models.Transaction,
-  user: typeof models.User,
+  user: User,
   reason: string,
 ): Promise<typeof models.Transaction> => {
   const captureId = getCaptureIdFromPaypalTransaction(transaction);

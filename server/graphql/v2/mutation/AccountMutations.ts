@@ -1,27 +1,36 @@
 import cryptoRandomString from 'crypto-random-string';
 import express from 'express';
-import { GraphQLBoolean, GraphQLFloat, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
-import GraphQLJSON from 'graphql-type-json';
-import { cloneDeep, set } from 'lodash';
+import {
+  GraphQLBoolean,
+  GraphQLEnumType,
+  GraphQLFloat,
+  GraphQLList,
+  GraphQLNonNull,
+  GraphQLObjectType,
+  GraphQLString,
+} from 'graphql';
+import { GraphQLNonEmptyString } from 'graphql-scalars';
+import { GraphQLJSON } from 'graphql-type-json';
+import { cloneDeep, isNull, omitBy, set } from 'lodash';
 
-import plans from '../../../constants/plans';
-import cache, { purgeAllCachesForAccount, purgeGQLCacheForCollective } from '../../../lib/cache';
-import { purgeCacheForPage } from '../../../lib/cloudflare';
-import { invalidateContributorsCache } from '../../../lib/contributors';
+import activities from '../../../constants/activities';
+import { types as COLLECTIVE_TYPE } from '../../../constants/collectives';
+import * as collectivelib from '../../../lib/collectivelib';
 import { crypto } from '../../../lib/encryption';
-import { mergeAccounts, simulateMergeAccounts } from '../../../lib/merge-accounts';
-import { verifyTwoFactorAuthenticatorCode } from '../../../lib/two-factor-authentication';
+import TwoFactorAuthLib from '../../../lib/two-factor-authentication';
+import { validateTOTPToken } from '../../../lib/two-factor-authentication/totp';
 import models, { sequelize } from '../../../models';
+import { sendMessage } from '../../common/collective';
+import { checkRemoteUserCanUseAccount, checkRemoteUserCanUseHost } from '../../common/scope-check';
 import { Forbidden, NotFound, Unauthorized, ValidationFailed } from '../../errors';
-import { AccountCacheType } from '../enum/AccountCacheType';
 import { AccountTypeToModelMapping } from '../enum/AccountType';
 import { idDecode } from '../identifiers';
 import { AccountReferenceInput, fetchAccountWithReference } from '../input/AccountReferenceInput';
 import { AccountUpdateInput } from '../input/AccountUpdateInput';
+import { PoliciesInput } from '../input/PoliciesInput';
 import { Account } from '../interface/Account';
 import { Host } from '../object/Host';
 import { Individual } from '../object/Individual';
-import { MergeAccountsResponse } from '../object/MergeAccountsResponse';
 import AccountSettingsKey from '../scalar/AccountSettingsKey';
 
 const AddTwoFactorAuthTokenToIndividualResponse = new GraphQLObjectType({
@@ -42,7 +51,7 @@ const AddTwoFactorAuthTokenToIndividualResponse = new GraphQLObjectType({
 const accountMutations = {
   editAccountSetting: {
     type: new GraphQLNonNull(Account),
-    description: 'Edit the settings for the given account',
+    description: 'Edit the settings for the given account. Scope: "account" or "host".',
     args: {
       account: {
         type: new GraphQLNonNull(AccountReferenceInput),
@@ -75,6 +84,18 @@ const accountMutations = {
           throw new Forbidden();
         }
 
+        // If the user is not admin and was not Forbidden, it means it's the Host and we check "host" scope
+        if (!req.remoteUser.isAdminOfCollective(account)) {
+          checkRemoteUserCanUseHost(req);
+        } else {
+          checkRemoteUserCanUseAccount(req);
+        }
+
+        // Enforce 2FA if trying to change 2FA rolling limit settings while it's already enabled
+        if (args.key.split('.')[0] === 'payoutsTwoFactorAuth' && account.settings?.payoutsTwoFactorAuth?.enabled) {
+          await TwoFactorAuthLib.validateRequest(req, { alwaysAskForToken: true, requireTwoFactorAuthEnabled: true });
+        }
+
         if (
           args.key === 'collectivePage' &&
           ![AccountTypeToModelMapping.FUND, AccountTypeToModelMapping.PROJECT].includes(account.type)
@@ -87,13 +108,32 @@ const accountMutations = {
 
         const settings = account.settings ? cloneDeep(account.settings) : {};
         set(settings, args.key, args.value);
-        return account.update({ settings }, { transaction });
+
+        const previousData = { settings: { [args.key]: account.data?.[args.key] } };
+        const updatedAccount = await account.update({ settings }, { transaction });
+        await models.Activity.create(
+          {
+            type: activities.COLLECTIVE_EDITED,
+            UserId: req.remoteUser.id,
+            UserTokenId: req.userToken?.id,
+            CollectiveId: account.id,
+            FromCollectiveId: account.id,
+            HostCollectiveId: account.approvedAt ? account.HostCollectiveId : null,
+            data: {
+              previousData,
+              newData: { settings: { [args.key]: args.value } },
+            },
+          },
+          { transaction },
+        );
+
+        return updatedAccount;
       });
     },
   },
   editAccountFeeStructure: {
     type: new GraphQLNonNull(Account),
-    description: 'An endpoint for hosts to edit the fees structure of their hosted accounts',
+    description: 'An endpoint for hosts to edit the fees structure of their hosted accounts. Scope: "host".',
     args: {
       account: {
         type: new GraphQLNonNull(AccountReferenceInput),
@@ -109,6 +149,8 @@ const accountMutations = {
       },
     },
     async resolve(_: void, args, req: express.Request): Promise<Record<string, unknown>> {
+      checkRemoteUserCanUseHost(req);
+
       return sequelize.transaction(async dbTransaction => {
         const account = await fetchAccountWithReference(args.account, {
           throwIfMissing: true,
@@ -126,19 +168,96 @@ const accountMutations = {
           throw new ValidationFailed('The collective needs to be approved before you can change the fees structure');
         }
 
-        return account.update(
+        const updateAccountFees = async account => {
+          return account.update(
+            {
+              hostFeePercent: args.hostFeePercent,
+              data: { ...account.data, useCustomHostFee: args.isCustomFee },
+            },
+            { transaction: dbTransaction },
+          );
+        };
+
+        const previousData = {
+          hostFeePercent: account.hostFeePercent,
+          useCustomHostFee: account.data?.useCustomHostFee,
+        };
+
+        // Update main account
+        await updateAccountFees(account);
+
+        // Cascade host update to events and projects
+        // Passing platformFeePercent through options so we don't request the parent collective on every children update
+        const children = await account.getChildren({ transaction: dbTransaction });
+        if (children.length > 0) {
+          await Promise.all(children.map(updateAccountFees));
+        }
+
+        await models.Activity.create(
           {
-            hostFeePercent: args.hostFeePercent,
-            data: { ...account.data, useCustomHostFee: args.isCustomFee },
+            type: activities.COLLECTIVE_EDITED,
+            UserId: req.remoteUser.id,
+            UserTokenId: req.userToken?.id,
+            CollectiveId: account.id,
+            FromCollectiveId: account.id,
+            HostCollectiveId: account.HostCollectiveId,
+            data: {
+              previousData,
+              newData: { hostFeePercent: args.hostFeePercent, useCustomHostFee: args.isCustomFee },
+            },
           },
           { transaction: dbTransaction },
         );
+
+        return account;
       });
+    },
+  },
+  editAccountFreezeStatus: {
+    type: new GraphQLNonNull(Account),
+    description: 'An endpoint for hosts to edit the freeze status of their hosted accounts. Scope: "host".',
+    args: {
+      account: {
+        type: new GraphQLNonNull(AccountReferenceInput),
+        description: 'Account to freeze',
+      },
+      action: {
+        type: new GraphQLNonNull(
+          new GraphQLEnumType({ name: 'AccountFreezeAction', values: { FREEZE: {}, UNFREEZE: {} } }),
+        ),
+      },
+      message: {
+        type: GraphQLString,
+        description: 'Message to send by email to the admins of the account',
+      },
+    },
+    async resolve(_: void, args, req: express.Request): Promise<void> {
+      checkRemoteUserCanUseHost(req);
+
+      const account = await fetchAccountWithReference(args.account, { throwIfMissing: true });
+      account.host = await account.getHostCollective();
+      if (!account.host) {
+        throw new ValidationFailed('Cannot find the host of this account');
+      } else if (!req.remoteUser.isAdminOfCollective(account.host)) {
+        throw new Unauthorized();
+      } else if (![COLLECTIVE_TYPE.COLLECTIVE, COLLECTIVE_TYPE.FUND].includes(account.type)) {
+        throw new ValidationFailed(
+          'Only collective and funds can be frozen. To freeze children accounts (projects, events) you need to freeze the parent account.',
+        );
+      }
+
+      if (args.action === 'FREEZE') {
+        await account.freeze(args.message);
+      } else if (args.action === 'UNFREEZE') {
+        await account.unfreeze(args.message);
+      }
+
+      return account.reload();
     },
   },
   addTwoFactorAuthTokenToIndividual: {
     type: new GraphQLNonNull(AddTwoFactorAuthTokenToIndividualResponse),
-    description: 'Add 2FA to the Individual if it does not have it',
+    description: 'Add 2FA to the Individual if it does not have it. Scope: "account".',
     args: {
       account: {
         type: new GraphQLNonNull(AccountReferenceInput),
@@ -150,9 +269,7 @@ const accountMutations = {
       },
     },
     async resolve(_: void, args, req: express.Request): Promise<Record<string, unknown>> {
-      if (!req.remoteUser) {
-        throw new Unauthorized();
-      }
+      checkRemoteUserCanUseAccount(req);
 
       const account = await fetchAccountWithReference(args.account);
 
@@ -193,12 +310,19 @@ const accountMutations = {
 
       await user.update({ twoFactorAuthToken: encryptedText, twoFactorAuthRecoveryCodes: hashedRecoveryCodesArray });
 
+      await models.Activity.create({
+        type: activities.TWO_FACTOR_CODE_ADDED,
+        UserId: user.id,
+        FromCollectiveId: user.CollectiveId,
+        CollectiveId: user.CollectiveId,
+      });
+
       return { account: account, recoveryCodes: recoveryCodesArray };
     },
   },
   removeTwoFactorAuthTokenFromIndividual: {
     type: new GraphQLNonNull(Individual),
-    description: 'Remove 2FA from the Individual if it has been enabled',
+    description: 'Remove 2FA from the Individual if it has been enabled. Scope: "account".',
     args: {
       account: {
         type: new GraphQLNonNull(AccountReferenceInput),
@@ -210,9 +334,7 @@ const accountMutations = {
       },
     },
     async resolve(_: void, args, req: express.Request): Promise<Record<string, unknown>> {
-      if (!req.remoteUser) {
-        throw new Unauthorized();
-      }
+      checkRemoteUserCanUseAccount(req);
 
       const account = await fetchAccountWithReference(args.account);
 
@@ -230,7 +352,7 @@ const accountMutations = {
         throw new Unauthorized('This account already has 2FA disabled.');
       }
 
-      const verified = verifyTwoFactorAuthenticatorCode(user.twoFactorAuthToken, args.code);
+      const verified = validateTOTPToken(user.twoFactorAuthToken, args.code);
 
       if (!verified) {
         throw new Unauthorized('Two-factor authentication code failed. Please try again');
@@ -238,63 +360,19 @@ const accountMutations = {
 
       await user.update({ twoFactorAuthToken: null, twoFactorAuthRecoveryCodes: null });
 
-      return account;
-    },
-  },
-  editHostPlan: {
-    type: new GraphQLNonNull(Host),
-    description: 'Update the plan',
-    args: {
-      account: {
-        type: new GraphQLNonNull(AccountReferenceInput),
-        description: 'Account where the host plan will be edited.',
-      },
-      plan: {
-        type: new GraphQLNonNull(GraphQLString),
-        description: 'The name of the plan to subscribe to.',
-      },
-    },
-    async resolve(_: void, args, req: express.Request): Promise<Record<string, unknown>> {
-      if (!req.remoteUser) {
-        throw new Unauthorized();
-      }
-
-      const account = await fetchAccountWithReference(args.account);
-      if (!req.remoteUser.isAdminOfCollective(account)) {
-        throw new Forbidden();
-      }
-      if (!account.isHostAccount) {
-        throw new Error(`Only Fiscal Hosts can set their plan.`);
-      }
-
-      const plan = args.plan;
-      if (!plans[plan]) {
-        throw new Error(`Unknown plan: ${plan}`);
-      }
-
-      await account.update({ plan });
-
-      if (plan === 'start-plan-2021') {
-        // This should cascade to all Collectives
-        await account.updateHostFee(0, req.remoteUser);
-      }
-
-      if (plan === 'start-plan-2021' || plan === 'grow-plan-2021') {
-        // This should cascade to all Collectives
-        await account.updatePlatformFee(0, req.remoteUser);
-
-        // Make sure budget is activated
-        await account.activateBudget();
-      }
-
-      await cache.del(`plan_${account.id}`);
+      await models.Activity.create({
+        type: activities.TWO_FACTOR_CODE_DELETED,
+        UserId: user.id,
+        FromCollectiveId: user.CollectiveId,
+        CollectiveId: user.CollectiveId,
+      });
 
       return account;
     },
   },
   editAccount: {
     type: new GraphQLNonNull(Host),
-    description: 'Edit key properties of an account.',
+    description: 'Edit key properties of an account. Scope: "account".',
     args: {
       account: {
         type: new GraphQLNonNull(AccountUpdateInput),
@@ -302,9 +380,7 @@ const accountMutations = {
       },
     },
     async resolve(_: void, args, req: express.Request): Promise<Record<string, unknown>> {
-      if (!req.remoteUser) {
-        throw new Unauthorized();
-      }
+      checkRemoteUserCanUseAccount(req);
 
       const id = idDecode(args.account.id, 'account');
       const account = await req.loaders.Collective.byId.load(id);
@@ -316,87 +392,141 @@ const accountMutations = {
         throw new Forbidden();
       }
 
+      await TwoFactorAuthLib.enforceForAccountAdmins(req, account, { onlyAskOnLogin: true });
+
       for (const key of Object.keys(args.account)) {
         switch (key) {
-          case 'currency':
+          case 'currency': {
+            const previousData = { currency: account.currency };
             await account.setCurrency(args.account[key]);
+            await models.Activity.create({
+              type: activities.COLLECTIVE_EDITED,
+              UserId: req.remoteUser.id,
+              UserTokenId: req.userToken?.id,
+              CollectiveId: account.id,
+              FromCollectiveId: account.id,
+              HostCollectiveId: account.approvedAt ? account.HostCollectiveId : null,
+              data: { previousData, newData: { currency: args.account[key] } },
+            });
+          }
         }
       }
 
       return account;
     },
   },
-  clearCacheForAccount: {
+  setPolicies: {
     type: new GraphQLNonNull(Account),
-    description: '[Root only] Clears the cache for a given account',
+    description: 'Adds or removes a policy on a given account. Scope: "account".',
     args: {
       account: {
         type: new GraphQLNonNull(AccountReferenceInput),
-        description: 'Account to clear the cache for',
+        description: 'Account where the policies are being set',
       },
-      type: {
-        type: new GraphQLNonNull(new GraphQLList(AccountCacheType)),
-        description: 'Types of cache to clear',
-        defaultValue: ['CLOUDFLARE', 'GRAPHQL_QUERIES', 'CONTRIBUTORS'],
+      policies: {
+        type: new GraphQLNonNull(PoliciesInput),
+        description: 'The policy to be added',
       },
     },
-    async resolve(_: void, args, req: express.Request): Promise<Record<string, unknown>> {
-      if (!req.remoteUser?.isRoot()) {
-        throw new Forbidden('Only root users can perform this action');
+
+    async resolve(_: void, args, req: express.Request): Promise<void> {
+      checkRemoteUserCanUseAccount(req);
+
+      const id = args.account.legacyId || idDecode(args.account.id, 'account');
+      const account = await req.loaders.Collective.byId.load(id);
+      if (!account) {
+        throw new NotFound('Account Not Found');
       }
 
-      const account = await fetchAccountWithReference(args.account, { throwIfMissing: true });
+      if (!req.remoteUser.isAdminOfCollective(account)) {
+        throw new Unauthorized();
+      }
 
-      if (args.type.includes('CLOUDFLARE')) {
-        purgeCacheForPage(`/${account.slug}`);
+      // Merge submitted policies with existing ones
+      const previousPolicies = account.data?.policies;
+      const newPolicies = omitBy({ ...previousPolicies, ...args.policies }, isNull);
+
+      // Enforce 2FA when trying to disable `REQUIRE_2FA_FOR_ADMINS`
+      if (previousPolicies?.REQUIRE_2FA_FOR_ADMINS && !newPolicies.REQUIRE_2FA_FOR_ADMINS) {
+        await TwoFactorAuthLib.validateRequest(req, { alwaysAskForToken: true, requireTwoFactorAuthEnabled: true });
       }
-      if (args.type.includes('GRAPHQL_QUERIES')) {
-        purgeGQLCacheForCollective(account.slug);
-      }
-      if (args.type.includes('CONTRIBUTORS')) {
-        await invalidateContributorsCache(account.id);
-      }
+
+      await account.setPolicies(newPolicies);
+      await models.Activity.create({
+        type: activities.COLLECTIVE_EDITED,
+        UserId: req.remoteUser.id,
+        UserTokenId: req.userToken?.id,
+        CollectiveId: account.id,
+        FromCollectiveId: account.id,
+        HostCollectiveId: account.approvedAt ? account.HostCollectiveId : null,
+        data: { previousData: { policies: previousPolicies }, newData: { policies: newPolicies } },
+      });
 
       return account;
     },
   },
-  mergeAccounts: {
-    type: new GraphQLNonNull(MergeAccountsResponse),
-    description: '[Root only] Merge two accounts, returns the result account',
+  deleteAccount: {
+    type: Account,
+    description: 'Adds or removes a policy on a given account. Scope: "account".',
     args: {
-      fromAccount: {
+      account: {
+        description: 'Reference to the Account to be deleted.',
         type: new GraphQLNonNull(AccountReferenceInput),
-        description: 'Account to merge from',
-      },
-      toAccount: {
-        type: new GraphQLNonNull(AccountReferenceInput),
-        description: 'Account to merge to',
-      },
-      dryRun: {
-        type: new GraphQLNonNull(GraphQLBoolean),
-        description: 'If true, the result will be simulated and summarized in the response message',
-        defaultValue: true,
       },
     },
-    async resolve(_: void, args, req: express.Request): Promise<Record<string, unknown>> {
-      if (!req.remoteUser?.isRoot()) {
-        throw new Forbidden('Only root users can perform this action');
+    async resolve(_, args, req) {
+      checkRemoteUserCanUseAccount(req);
+
+      const id = args.account.legacyId || idDecode(args.account.id, 'account');
+      const account = await req.loaders.Collective.byId.load(id);
+      if (!account) {
+        throw new NotFound('Account Not Found');
       }
 
-      const fromAccount = await fetchAccountWithReference(args.fromAccount, { throwIfMissing: true });
-      const toAccount = await fetchAccountWithReference(args.toAccount, { throwIfMissing: true });
-
-      if (args.dryRun) {
-        const message = await simulateMergeAccounts(fromAccount, toAccount);
-        return { account: toAccount, message };
-      } else {
-        const warnings = await mergeAccounts(fromAccount, toAccount, req.remoteUser.id);
-        await Promise.all([purgeAllCachesForAccount(fromAccount), purgeAllCachesForAccount(toAccount)]).catch(() => {
-          // Ignore errors
-        });
-        const message = warnings.join('\n');
-        return { account: await toAccount.reload(), message: message || null };
+      if (!req.remoteUser.isAdminOfCollective(account)) {
+        throw new Unauthorized('You need to be logged in as an Admin of the account.');
       }
+
+      await TwoFactorAuthLib.enforceForAccountAdmins(req, account, { alwaysAskForToken: true });
+
+      if (await account.isHost()) {
+        throw new Error(
+          `You can't delete an account activated as Host. Please, desactivate the account as Host and try again.`,
+        );
+      }
+
+      if (!(await collectivelib.isCollectiveDeletable(account))) {
+        throw new Error(
+          `You can't delete an Account with admin memberships, children, transactions, orders or expenses. Please archive it instead.`,
+        );
+      }
+
+      return collectivelib.deleteCollective(account);
+    },
+  },
+  sendMessage: {
+    type: new GraphQLObjectType({
+      name: 'SendMessageResult',
+      fields: {
+        success: { type: GraphQLBoolean },
+      },
+    }),
+    description: 'Send a message to an account. Scope: "account"',
+    args: {
+      account: {
+        type: new GraphQLNonNull(AccountReferenceInput),
+        description: 'Reference to the Account to send message to.',
+      },
+      message: {
+        type: new GraphQLNonNull(GraphQLNonEmptyString),
+        description: 'Message to send to the account.',
+      },
+      subject: { type: GraphQLString },
+    },
+    async resolve(_, args, req) {
+      const account = await fetchAccountWithReference(args.account, { throwIfMissing: true });
+
+      return sendMessage({ req, args, collective: account, isGqlV2: true });
     },
   },
 };

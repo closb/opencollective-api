@@ -1,28 +1,38 @@
 import config from 'config';
 import { pick } from 'lodash';
+import moment from 'moment';
 
 import INTERVALS from '../../constants/intervals';
 import ORDER_STATUS from '../../constants/order_status';
 import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE } from '../../constants/paymentMethods';
 import TierType from '../../constants/tiers';
 import logger from '../../lib/logger';
+import { reportErrorToSentry } from '../../lib/sentry';
 import models from '../../models';
 import PaypalPlan from '../../models/PaypalPlan';
+import Tier from '../../models/Tier';
+import User from '../../models/User';
 import { PaymentProviderService } from '../types';
 
 import { paypalRequest } from './api';
-import { refundPaypalCapture } from './payment';
+import { getCaptureIdFromPaypalTransaction, refundPaypalCapture } from './payment';
 
-export const cancelPaypalSubscription = async (order: typeof models.Order, reason = undefined): Promise<void> => {
+export const CANCEL_PAYPAL_EDITED_SUBSCRIPTION_REASON = 'Updated subscription';
+
+export const cancelPaypalSubscription = async (
+  order: typeof models.Order,
+  reason = undefined,
+  host: typeof models.Collective = undefined,
+): Promise<void> => {
   const collective = order.collective || (await order.getCollective());
-  const hostCollective = await collective.getHostCollective();
+  const hostCollective = host || (await collective.getHostCollective());
   const subscription = order.Subscription || (await order.getSubscription());
   await paypalRequest(`billing/subscriptions/${subscription.paypalSubscriptionId}/cancel`, { reason }, hostCollective);
 };
 
 export const createPaypalPaymentMethodForSubscription = (
   order: typeof models.Order,
-  user: typeof models.User,
+  user: User,
   paypalSubscriptionId: string,
 ): Promise<typeof models.PaymentMethod> => {
   return models.PaymentMethod.create({
@@ -42,7 +52,7 @@ type PaypalProductCategory = 'MERCHANDISE' | 'MEMBERSHIP_CLUBS_AND_ORGANIZATIONS
 /**
  * See https://developer.paypal.com/docs/api/catalog-products/v1/#products-create-response
  */
-export const getProductTypeAndCategory = (tier: typeof models.Tier): [PaypalProductType, PaypalProductCategory?] => {
+export const getProductTypeAndCategory = (tier: Tier): [PaypalProductType, PaypalProductCategory?] => {
   switch (tier?.type) {
     case TierType.TICKET:
       return ['DIGITAL'];
@@ -130,7 +140,7 @@ export async function getOrCreatePlan(
   interval: INTERVALS,
   amount: number,
   currency: string,
-  tier = null,
+  tier: Tier = null,
 ): Promise<PaypalPlan> {
   const product = await models.PaypalProduct.findOne({
     where: { CollectiveId: collective.id, TierId: tier?.id || null },
@@ -210,7 +220,7 @@ export const setupPaypalSubscriptionForOrder = async (
     if (existingSubscription) {
       // Cancel existing PayPal subscription
       if (existingSubscription.paypalSubscriptionId) {
-        await cancelPaypalSubscription(order, 'Updated subscription');
+        await cancelPaypalSubscription(order, CANCEL_PAYPAL_EDITED_SUBSCRIPTION_REASON);
       }
 
       // Update the subscription with the new params
@@ -224,6 +234,7 @@ export const setupPaypalSubscriptionForOrder = async (
     }
   } catch (e) {
     logger.error(`[PayPal] Error while creating subscription: ${e}`);
+    reportErrorToSentry(e);
 
     // Restore the initial subscription
     if (existingSubscription) {
@@ -243,6 +254,7 @@ export const setupPaypalSubscriptionForOrder = async (
     }
   } catch (e) {
     logger.error(`[PayPal] Error while activating subscription: ${e}`);
+    reportErrorToSentry(e);
     const error = new Error('Failed to activate PayPal subscription');
     error['rootException'] = e;
     order.update({ status: ORDER_STATUS.ERROR });
@@ -253,7 +265,7 @@ export const setupPaypalSubscriptionForOrder = async (
 };
 
 export const updateSubscriptionWithPaypal = async (
-  user: typeof models.User,
+  user: User,
   order: typeof models.Order,
   paypalSubscriptionId: string,
 ): Promise<typeof models.Order> => {
@@ -276,8 +288,16 @@ const createSubscription = async (order: typeof models.Order, paypalSubscription
   });
 };
 
-const fetchPaypalSubscription = async (hostCollective, subscriptionId) => {
+export const fetchPaypalSubscription = async (hostCollective, subscriptionId) => {
   return paypalRequest(`billing/subscriptions/${subscriptionId}`, null, hostCollective, 'GET');
+};
+
+export const fetchPaypalTransactionsForSubscription = async (host, subscriptionId) => {
+  const urlParams = new URLSearchParams();
+  urlParams.append('start_time', moment('2020-01-01').toISOString());
+  urlParams.append('end_time', moment().toISOString());
+  const apiUrl = `billing/subscriptions/${subscriptionId}/transactions?${urlParams.toString()}`;
+  return paypalRequest(apiUrl, null, host, 'GET');
 };
 
 /**
@@ -324,8 +344,7 @@ const PayPalSubscription: PaymentProviderService = {
   },
 
   async refundTransaction(transaction, user, reason) {
-    // Subscription's transactions are always recorded with paypalSale
-    const captureId = transaction.data.paypalSale?.id;
+    const captureId = getCaptureIdFromPaypalTransaction(transaction);
     if (!captureId) {
       throw new Error(`PayPal Payment capture not found for transaction #${transaction.id}`);
     }

@@ -12,12 +12,13 @@ import { floatAmountToCents } from '../../lib/math';
 import { createRefundTransaction } from '../../lib/payments';
 import { validateWebhookEvent } from '../../lib/paypal';
 import { sendThankYouEmail } from '../../lib/recurring-contributions';
-import models from '../../models';
+import models, { Op } from '../../models';
 import { PayoutWebhookRequest } from '../../types/paypal';
 
 import { paypalRequestV2 } from './api';
-import { recordPaypalCapture, recordPaypalSale } from './payment';
+import { findTransactionByPaypalId, recordPaypalCapture, recordPaypalSale } from './payment';
 import { checkBatchItemStatus } from './payouts';
+import { CANCEL_PAYPAL_EDITED_SUBSCRIPTION_REASON } from './subscription';
 
 const debug = Debug('paypal:webhook');
 
@@ -59,8 +60,8 @@ const loadSubscriptionForWebhookEvent = async (req: Request, subscriptionId: str
 
   const order = await models.Order.findOne({
     include: [
-      { association: 'fromCollective' },
-      { association: 'createdByUser' },
+      { association: 'fromCollective', required: false },
+      { association: 'createdByUser', required: false },
       { association: 'collective', required: true },
       {
         association: 'Subscription',
@@ -97,13 +98,7 @@ async function handleSaleCompleted(req: Request): Promise<void> {
   const { order } = await loadSubscriptionForWebhookEvent(req, subscriptionId);
 
   // Make sure the sale hasn't already been recorded
-  const existingTransaction = await models.Transaction.findOne({
-    where: {
-      OrderId: order.id, // Not necessary, but makes the query faster
-      data: { paypalSale: { id: sale.id } },
-    },
-  });
-
+  const existingTransaction = await findTransactionByPaypalId(sale.id, { OrderId: order.id });
   if (existingTransaction) {
     logger.debug(`PayPal: Transaction for sale ${sale.id} already recorded, ignoring`);
     return;
@@ -117,10 +112,13 @@ async function handleSaleCompleted(req: Request): Promise<void> {
     await order.update({ status: OrderStatus.ACTIVE, processedAt: new Date() });
   }
 
+  const nextChargeDate = moment().add(1, order.interval);
   await order.Subscription.update({
     chargeNumber: (order.Subscription.chargeNumber || 0) + 1,
-    nextChargeDate: moment().add(1, order.interval),
+    nextChargeDate: nextChargeDate,
+    nextPeriodStart: nextChargeDate,
     isActive: true,
+    activatedAt: order.Subscription.activatedAt || new Date(),
   });
 
   // 4. Send thankyou email
@@ -134,7 +132,7 @@ async function handleSaleCompleted(req: Request): Promise<void> {
 
 async function handleCaptureCompleted(req: Request): Promise<void> {
   // TODO: This can be optimized by using the `host` from path
-  // 1. Retrieve the order for this event
+  // Retrieve the order for this event
   const capture = req.body.resource;
   const order = await models.Order.findOne({
     where: {
@@ -158,19 +156,32 @@ async function handleCaptureCompleted(req: Request): Promise<void> {
     return;
   }
 
-  // 2. Validate webhook event
+  // Validate webhook event
   const host = await order.collective.getHostCollective();
   const paypalAccount = await getPaypalAccount(host);
   await validateWebhookEvent(paypalAccount, req);
 
-  // 3. Record the transaction
+  // Make sure the transaction is not already recorded
+  const existingTransaction = await models.Transaction.findOne({
+    where: {
+      OrderId: order.id,
+      data: { capture: { id: capture.id } },
+    },
+  });
+
+  if (existingTransaction) {
+    logger.debug(`Transaction for PayPal capture ${capture.id} already exists`);
+    return;
+  }
+
+  // Record the transaction
   const transaction = await recordPaypalCapture(order, capture);
   await order.update({ processedAt: new Date(), status: OrderStatus.PAID });
 
-  // 4. Send thankyou email
+  // Send thankyou email
   await sendThankYouEmail(order, transaction);
 
-  // 5. Register user as a member, since the transaction is not created in `processOrder`
+  // Register user as a member, since the transaction is not created in `processOrder`
   await order.getOrCreateMembers();
 }
 
@@ -198,9 +209,15 @@ async function handleCaptureRefunded(req: Request): Promise<void> {
     where: {
       type: TransactionTypes.CREDIT,
       kind: TransactionKind.CONTRIBUTION,
-      data: { capture: { id: captureDetails.id } },
       isRefund: false,
       RefundTransactionId: null,
+      data: {
+        [Op.or]: [
+          { capture: { id: captureDetails.id } },
+          { paypalSale: { id: captureDetails.id } },
+          { paypalTransaction: { id: captureDetails.id } },
+        ],
+      },
     },
     include: [
       {
@@ -238,6 +255,11 @@ async function handleCaptureRefunded(req: Request): Promise<void> {
  */
 async function handleSubscriptionCancelled(req: Request): Promise<void> {
   const subscription = req.body.resource;
+  if (subscription['status_change_note'] === CANCEL_PAYPAL_EDITED_SUBSCRIPTION_REASON) {
+    // Ignore, this is a subscription that was updated by the user through the edit subscription page
+    return;
+  }
+
   const { order } = await loadSubscriptionForWebhookEvent(req, subscription.id);
   if (order.status !== OrderStatus.CANCELLED) {
     await order.update({

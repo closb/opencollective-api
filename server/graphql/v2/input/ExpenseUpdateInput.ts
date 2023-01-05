@@ -1,10 +1,12 @@
 import { GraphQLInputObjectType, GraphQLList, GraphQLNonNull, GraphQLString } from 'graphql';
 
+import { Currency } from '../enum';
 import { ExpenseType } from '../enum/ExpenseType';
 
 import { NewAccountOrReferenceInput } from './AccountReferenceInput';
 import { ExpenseAttachedFileInput } from './ExpenseAttachedFileInput';
 import { ExpenseItemInput } from './ExpenseItemInput';
+import { ExpenseTaxInput } from './ExpenseTaxInput';
 import { LocationInput } from './LocationInput';
 import { PayoutMethodInput } from './PayoutMethodInput';
 
@@ -25,6 +27,10 @@ export const ExpenseUpdateInput = new GraphQLInputObjectType({
     longDescription: {
       type: GraphQLString,
       description: 'Longer text to attach to the expense',
+    },
+    currency: {
+      type: Currency,
+      description: 'Currency that should be used for the payout. Defaults to the account currency',
     },
     tags: {
       type: new GraphQLList(GraphQLString),
@@ -66,6 +72,10 @@ export const ExpenseUpdateInput = new GraphQLInputObjectType({
     payeeLocation: {
       type: LocationInput,
       description: 'The address of the payee',
+    },
+    tax: {
+      type: new GraphQLList(ExpenseTaxInput),
+      description: 'The list of taxes that should be applied to the expense (VAT, GST, etc...)',
     },
   }),
 });

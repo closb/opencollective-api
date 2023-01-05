@@ -1,17 +1,19 @@
-import { expect } from 'chai';
+import * as chai from 'chai';
 import gql from 'fake-tag';
 import { describe, it } from 'mocha';
-import sinon from 'sinon';
+import { assert, createSandbox, match } from 'sinon';
 
 import roles from '../../../../server/constants/roles';
 import emailLib from '../../../../server/lib/email';
 import * as payments from '../../../../server/lib/payments';
 import models from '../../../../server/models';
-import { fakePaymentMethod } from '../../../test-helpers/fake-data';
+import { fakePaymentMethod, fakeProject } from '../../../test-helpers/fake-data';
 import * as utils from '../../../utils';
 
 let host, user1, user2, user3, collective1, event1, ticket1;
 let sandbox, executeOrderStub, emailSendSpy, emailSendMessageSpy;
+
+const { expect } = chai;
 
 describe('server/graphql/v1/mutation', () => {
   /* SETUP
@@ -20,7 +22,7 @@ describe('server/graphql/v1/mutation', () => {
   */
 
   before(() => {
-    sandbox = sinon.createSandbox();
+    sandbox = createSandbox();
     emailSendSpy = sandbox.spy(emailLib, 'send');
     emailSendMessageSpy = sandbox.spy(emailLib, 'sendMessage');
     executeOrderStub = sandbox.stub(payments, 'executeOrder').callsFake((user, order) => {
@@ -92,8 +94,20 @@ describe('server/graphql/v1/mutation', () => {
       Object.assign(utils.data('event1'), {
         CreatedByUserId: user1.id,
         ParentCollectiveId: collective1.id,
+        HostCollectiveId: collective1.HostCollectiveId,
+        isActive: true,
+        approvedAt: new Date(),
       }),
     );
+  });
+
+  beforeEach('create a project  under collective1', async () => {
+    await fakeProject({
+      ParentCollectiveId: collective1.id,
+      HostCollectiveId: collective1.HostCollectiveId,
+      isActive: true,
+      approvedAt: new Date(),
+    });
   });
 
   describe('createCollective tests', () => {
@@ -343,6 +357,56 @@ describe('server/graphql/v1/mutation', () => {
         });
       });
     });
+
+    describe('archives a collective', () => {
+      const archiveCollectiveMutation = gql`
+        mutation ArchiveCollective($id: Int!) {
+          archiveCollective(id: $id) {
+            id
+            isArchived
+          }
+        }
+      `;
+      const unarchiveCollectiveMutation = gql`
+        mutation UnarchiveCollective($id: Int!) {
+          unarchiveCollective(id: $id) {
+            id
+            isArchived
+          }
+        }
+      `;
+      it('fails if not authenticated', async () => {
+        const result = await utils.graphqlQuery(archiveCollectiveMutation, {
+          id: collective1.id,
+        });
+
+        expect(result.errors).to.exist;
+        expect(result.errors[0].message).to.equal('You need to be logged in to archive a collective');
+      });
+
+      it('fails if not authenticated as an Admin', async () => {
+        const result = await utils.graphqlQuery(archiveCollectiveMutation, { id: collective1.id }, user3);
+
+        expect(result.errors).to.exist;
+        expect(result.errors[0].message).to.equal('You need to be logged in as an Admin.');
+      });
+
+      it('should archive its children projects and events', async () => {
+        await utils.graphqlQuery(archiveCollectiveMutation, { id: collective1.id }, user1);
+
+        const projects = (await collective1.getProjects()).map(p => ({ id: p.id, name: p.name, isActive: p.isActive }));
+        const events = (await collective1.getEvents()).map(p => ({ id: p.id, name: p.name, isActive: p.isActive }));
+
+        expect(projects.length).to.eq(1);
+        expect(events.length).to.eq(1);
+        projects.forEach(project => expect(project.isActive).to.eq(false));
+        events.forEach(event => expect(event.isActive).to.eq(false));
+      });
+
+      after(async () => {
+        await utils.graphqlQuery(unarchiveCollectiveMutation, { id: collective1.id }, user3);
+      });
+    });
   });
 
   describe('createOrder tests', () => {
@@ -570,17 +634,21 @@ describe('server/graphql/v1/mutation', () => {
               role: roles.BACKER,
             },
           });
-          await utils.waitForCondition(() => emailSendMessageSpy.callCount > 1);
+          await utils.waitForCondition(() => emailSendMessageSpy.callCount === 3);
           // utils.inspectSpy(emailSendMessageSpy, 2);
           expect(members).to.have.length(1);
 
           // Make sure we send the collective.member.created email notification to core contributor of collective1
           expect(emailSendMessageSpy.callCount).to.equal(3);
           // utils.inspectSpy(emailSendMessageSpy, 2);
-          expect(emailSendMessageSpy.firstCall.args[0]).to.equal('user2@opencollective.com');
-          expect(emailSendMessageSpy.firstCall.args[1]).to.equal('Your Organization on Open Collective');
-          expect(emailSendMessageSpy.secondCall.args[0]).to.equal('user1@opencollective.com');
-          expect(emailSendMessageSpy.secondCall.args[1]).to.equal(
+          assert.calledWithMatch(
+            emailSendMessageSpy,
+            'user2@opencollective.com',
+            'Your Organization on Open Collective',
+          );
+          assert.calledWithMatch(
+            emailSendMessageSpy,
+            'user1@opencollective.com',
             "New financial contributor to Scouts d'Arlon: Google ($20.00/m)",
           );
           expect(emailSendMessageSpy.secondCall.args[2]).to.contain('Looking forward!'); // publicMessage
@@ -655,8 +723,8 @@ describe('server/graphql/v1/mutation', () => {
           expect(activityData.order.subscription.interval).to.equal('month');
           expect(activityData.collective.slug).to.equal(collective1.slug);
           expect(activityData.member.memberCollective.slug).to.equal('slack');
-          expect(emailSendSpy.lastCall.args[0]).to.equal('collective.member.created');
-          expect(emailSendMessageSpy.lastCall.args[0]).to.equal(user2.email);
+          assert.calledWithMatch(emailSendSpy, 'collective.member.created');
+          assert.calledWithMatch(emailSendMessageSpy, user2.email);
         });
       });
 
@@ -737,28 +805,34 @@ describe('server/graphql/v1/mutation', () => {
           });
           expect(members).to.have.length(1);
           // 2 for the collective admins, 1 for the contributor
-          await utils.waitForCondition(() => emailSendMessageSpy.callCount === 3);
+          await utils.waitForCondition(() => emailSendSpy.callCount === 3);
           expect(emailSendSpy.callCount).to.equal(3);
-          const activityData = emailSendSpy.firstCall.args[2];
+          const activityData = emailSendSpy.args.find(arg => arg[0] === 'collective.member.created')[2];
           expect(activityData.member.role).to.equal('ATTENDEE');
           expect(activityData.collective.type).to.equal('EVENT');
           expect(activityData.order.publicMessage).to.equal('Looking forward!');
           expect(activityData.collective.slug).to.equal(event1.slug);
           expect(activityData.member.memberCollective.slug).to.equal(user2.collective.slug);
-          expect(emailSendSpy.firstCall.args[0]).to.equal('collective.member.created');
-          expect(emailSendSpy.secondCall.args[0]).to.equal('collective.member.created');
-          expect(emailSendSpy.thirdCall.args[0]).to.equal('ticket.confirmed');
+
+          assert.calledWithMatch(emailSendSpy, 'collective.member.created');
+          assert.calledWithMatch(emailSendSpy, 'collective.member.created');
+          assert.calledWithMatch(emailSendSpy, 'ticket.confirmed');
           expect(emailSendMessageSpy.callCount).to.equal(3);
-          expect(emailSendMessageSpy.firstCall.args[0]).to.equal('user1@opencollective.com');
-          expect(emailSendMessageSpy.firstCall.args[1]).to.equal(
+          assert.calledWithMatch(
+            emailSendMessageSpy,
+            'user1@opencollective.com',
             'New financial contributor to January meetup: Anish Bas',
           );
-          expect(emailSendMessageSpy.secondCall.args[0]).to.equal('user2@opencollective.com');
-          expect(emailSendMessageSpy.secondCall.args[1]).to.equal(
+          assert.calledWithMatch(
+            emailSendMessageSpy,
+            'user2@opencollective.com',
             'New financial contributor to January meetup: Anish Bas',
           );
-          expect(emailSendMessageSpy.thirdCall.args[0]).to.equal('user2@opencollective.com');
-          expect(emailSendMessageSpy.thirdCall.args[1]).to.equal('2 tickets confirmed for January meetup');
+          assert.calledWithMatch(
+            emailSendMessageSpy,
+            'user2@opencollective.com',
+            '2 tickets confirmed for January meetup',
+          );
         });
 
         it('from a new user', async () => {
@@ -808,7 +882,7 @@ describe('server/graphql/v1/mutation', () => {
                 },
                 createdByUser: {
                   email: 'newuser@email.com',
-                  id: 5,
+                  id: 6,
                 },
               },
             },
@@ -902,11 +976,17 @@ describe('server/graphql/v1/mutation', () => {
           expect(executeOrderArgument[1].paymentMethod.token).to.equal('tok_123456781234567812345678');
           await utils.waitForCondition(() => emailSendMessageSpy.callCount === 2);
           expect(emailSendMessageSpy.callCount).to.equal(2);
-          expect(emailSendMessageSpy.firstCall.args[0]).to.equal(user1.email);
-          expect(emailSendMessageSpy.firstCall.args[1]).to.contain(
+          assert.calledWithMatch(
+            emailSendMessageSpy,
+            user1.email,
             `New financial contributor to ${event1.name}: Anish Bas ($40.00)`,
           );
-          expect(emailSendMessageSpy.firstCall.args[2]).to.contain('/scouts/events/jan-meetup');
+          assert.calledWithMatch(
+            emailSendMessageSpy,
+            user2.email,
+            'New financial contributor to January meetup: Anish Bas ($40.00)',
+            match('/scouts/events/jan-meetup'),
+          );
         });
 
         describe('from an existing but logged out user', async () => {
@@ -1064,7 +1144,7 @@ describe('server/graphql/v1/mutation', () => {
                 },
                 createdByUser: {
                   email: 'newuser@email.com',
-                  id: 5,
+                  id: 6,
                 },
                 collective: {
                   id: 6,
@@ -1078,14 +1158,20 @@ describe('server/graphql/v1/mutation', () => {
           expect(executeOrderArgument[1].id).to.equal(1);
           expect(executeOrderArgument[1].TierId).to.equal(4);
           expect(executeOrderArgument[1].CollectiveId).to.equal(6);
-          expect(executeOrderArgument[1].CreatedByUserId).to.equal(5);
+          expect(executeOrderArgument[1].CreatedByUserId).to.equal(6);
           expect(executeOrderArgument[1].totalAmount).to.equal(4000);
           expect(executeOrderArgument[1].currency).to.equal('USD');
           expect(executeOrderArgument[1].paymentMethod.token).to.equal('tok_123456781234567812345678');
           await utils.waitForCondition(() => emailSendMessageSpy.callCount === 2);
           expect(emailSendMessageSpy.callCount).to.equal(2);
-          expect(emailSendMessageSpy.firstCall.args[0]).to.equal(user1.email);
-          expect(emailSendMessageSpy.firstCall.args[1]).to.contain(
+          assert.calledWithMatch(
+            emailSendMessageSpy,
+            user1.email,
+            'New financial contributor to January meetup: incognito ($40.00)',
+          );
+          assert.calledWithMatch(
+            emailSendMessageSpy,
+            user2.email,
             'New financial contributor to January meetup: incognito ($40.00)',
           );
         });

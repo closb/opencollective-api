@@ -1,16 +1,19 @@
 import { GraphQLInt, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
-import { GraphQLDateTime } from 'graphql-iso-date';
-import GraphQLJSON from 'graphql-type-json';
-import { get, pick } from 'lodash';
+import { GraphQLDateTime } from 'graphql-scalars';
+import { GraphQLJSON } from 'graphql-type-json';
+import { get, omit, pick } from 'lodash';
 
 import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE } from '../../../constants/paymentMethods';
+import { checkScope } from '../../common/scope-check';
+import { OrderCollection } from '../collection/OrderCollection';
 import { getLegacyPaymentMethodType, PaymentMethodLegacyType } from '../enum/PaymentMethodLegacyType';
 import { PaymentMethodService } from '../enum/PaymentMethodService';
 import { PaymentMethodType } from '../enum/PaymentMethodType';
-import { idEncode } from '../identifiers';
+import { idEncode, IDENTIFIER_TYPES } from '../identifiers';
 import { Account } from '../interface/Account';
 import { Amount } from '../object/Amount';
 import { Host } from '../object/Host';
+import { OrdersCollectionArgs, OrdersCollectionResolver } from '../query/collection/OrdersCollectionQuery';
 
 export const PaymentMethod = new GraphQLObjectType({
   name: 'PaymentMethod',
@@ -31,14 +34,18 @@ export const PaymentMethod = new GraphQLObjectType({
       },
       name: {
         type: GraphQLString,
-        resolve(paymentMethod, _, req) {
+        async resolve(paymentMethod, _, req) {
           const publicProviders = [
             [PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE, PAYMENT_METHOD_TYPE.GIFTCARD],
             [PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE, PAYMENT_METHOD_TYPE.PREPAID],
+            [PAYMENT_METHOD_SERVICE.OPENCOLLECTIVE, PAYMENT_METHOD_TYPE.COLLECTIVE],
           ];
 
+          const collective = await req.loaders.Collective.byId.load(paymentMethod.CollectiveId);
           if (
-            (paymentMethod.CollectiveId && req.remoteUser?.isAdmin(paymentMethod.CollectiveId)) ||
+            (paymentMethod.CollectiveId &&
+              req.remoteUser?.isAdminOfCollective(collective) &&
+              checkScope(req, 'orders')) ||
             publicProviders.some(([service, type]) => paymentMethod.service === service && paymentMethod.type === type)
           ) {
             return paymentMethod.name;
@@ -63,8 +70,13 @@ export const PaymentMethod = new GraphQLObjectType({
         type: new GraphQLNonNull(Amount),
         description: 'Returns the balance amount and the currency of this paymentMethod',
         async resolve(paymentMethod, args, req) {
-          const balance = await paymentMethod.getBalanceForUser(req.remoteUser);
-          return { value: balance.amount, currency: paymentMethod.currency };
+          if (!req.remoteUser) {
+            // We should return null here
+            return { value: 0, currency: paymentMethod.currency };
+          } else {
+            const balance = await paymentMethod.getBalanceForUser(req.remoteUser);
+            return { value: balance.amount, currency: paymentMethod.currency };
+          }
         },
       },
       account: {
@@ -78,20 +90,25 @@ export const PaymentMethod = new GraphQLObjectType({
       sourcePaymentMethod: {
         type: PaymentMethod,
         description: 'For gift cards, this field will return to the source payment method',
-        resolve(paymentMethod, _, req) {
-          if (paymentMethod.SourcePaymentMethodId && req.remoteUser?.isAdmin(paymentMethod.CollectiveId)) {
+        async resolve(paymentMethod, _, req) {
+          const collective = await req.loaders.Collective.byId.load(paymentMethod.CollectiveId);
+          if (
+            paymentMethod.SourcePaymentMethodId &&
+            req.remoteUser?.isAdminOfCollective(collective) &&
+            checkScope(req, 'orders')
+          ) {
             return req.loaders.PaymentMethod.byId.load(paymentMethod.SourcePaymentMethodId);
           }
         },
       },
       data: {
         type: GraphQLJSON,
-        resolve(paymentMethod, _, req) {
-          if (
-            !req.remoteUser?.isAdmin(paymentMethod.CollectiveId) &&
-            paymentMethod.type !== PAYMENT_METHOD_TYPE.CRYPTO
-          ) {
-            return null;
+        async resolve(paymentMethod, _, req) {
+          if (paymentMethod.type !== PAYMENT_METHOD_TYPE.CRYPTO) {
+            const collective = await req.loaders.Collective.byId.load(paymentMethod.CollectiveId);
+            if (!req.remoteUser?.isAdminOfCollective(collective) || !checkScope(req, 'orders')) {
+              return null;
+            }
           }
 
           // Protect and limit fields
@@ -102,6 +119,10 @@ export const PaymentMethod = new GraphQLObjectType({
             allowedFields = ['fullName', 'expMonth', 'expYear', 'brand', 'country', 'last4'];
           } else if (paymentMethod.type === PAYMENT_METHOD_TYPE.CRYPTO) {
             allowedFields = ['depositAddress'];
+          }
+
+          if (paymentMethod.service === PAYMENT_METHOD_SERVICE.STRIPE) {
+            allowedFields.push('stripeAccount', 'stripePaymentMethodId');
           }
 
           return pick(paymentMethod.data, allowedFields);
@@ -128,8 +149,9 @@ export const PaymentMethod = new GraphQLObjectType({
       },
       expiryDate: {
         type: GraphQLDateTime,
-        resolve(paymentMethod, _, req) {
-          if (!req.remoteUser?.isAdmin(paymentMethod.CollectiveId)) {
+        async resolve(paymentMethod, _, req) {
+          const collective = await req.loaders.Collective.byId.load(paymentMethod.CollectiveId);
+          if (!req.remoteUser?.isAdminOfCollective(collective) || !checkScope(req, 'orders')) {
             return null;
           } else {
             return paymentMethod.expiryDate;
@@ -138,6 +160,33 @@ export const PaymentMethod = new GraphQLObjectType({
       },
       createdAt: {
         type: GraphQLDateTime,
+      },
+      monthlyLimit: {
+        type: Amount,
+        description: 'For monthly gift cards, this field will return the monthly limit',
+        resolve(paymentMethod) {
+          if (paymentMethod.type !== PAYMENT_METHOD_TYPE.GIFTCARD || !paymentMethod.monthlyLimitPerMember) {
+            return null;
+          }
+
+          return {
+            value: paymentMethod.monthlyLimitPerMember,
+            currency: paymentMethod.currency,
+          };
+        },
+      },
+      orders: {
+        type: OrderCollection,
+        description: 'Get all the orders associated with this payment method',
+        args: omit(OrdersCollectionArgs, 'paymentMethod'),
+        async resolve(paymentMethod, args, req) {
+          if (!checkScope(req, 'orders')) {
+            return null;
+          }
+
+          const paymentMethodReference = { id: idEncode(paymentMethod.id, IDENTIFIER_TYPES.PAYMENT_METHOD) };
+          return OrdersCollectionResolver({ ...args, paymentMethod: paymentMethodReference }, req);
+        },
       },
     };
   },

@@ -6,12 +6,22 @@ import {
   GraphQLNonNull,
   GraphQLString,
 } from 'graphql';
-import GraphQLJSON from 'graphql-type-json';
+import { GraphQLJSON } from 'graphql-type-json';
 
 import { ExpenseType } from '../enum/ExpenseType';
 
 import { LocationInput } from './LocationInput';
 import { PayoutMethodInput } from './PayoutMethodInput';
+
+const ExpenseInviteeOrganizationInput = new GraphQLInputObjectType({
+  name: 'ExpenseInviteeOrganizationInput',
+  fields: () => ({
+    description: { type: GraphQLString },
+    name: { type: GraphQLString },
+    slug: { type: GraphQLString },
+    website: { type: GraphQLString },
+  }),
+});
 
 const ExpenseInvitee = new GraphQLInputObjectType({
   name: 'ExpenseInvitee',
@@ -21,6 +31,7 @@ const ExpenseInvitee = new GraphQLInputObjectType({
     name: { type: GraphQLString },
     email: { type: GraphQLString },
     isInvite: { type: GraphQLBoolean },
+    organization: { type: ExpenseInviteeOrganizationInput },
   }),
 });
 

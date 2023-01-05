@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import gqlV2 from 'fake-tag';
-import sinon from 'sinon';
+import { createSandbox } from 'sinon';
 
 import * as orders from '../../../../../server/graphql/v1/mutations/orders';
 import emailLib from '../../../../../server/lib/email';
@@ -32,7 +32,7 @@ describe('server/graphql/v2/mutation/TransactionMutations', () => {
   });
 
   before(() => {
-    sandbox = sinon.createSandbox();
+    sandbox = createSandbox();
     sandbox.stub(stripe.customers, 'create').callsFake(() => Promise.resolve({ id: 'cus_BM7mGwp1Ea8RtL' }));
     sandbox.stub(stripe.customers, 'retrieve').callsFake(() => Promise.resolve({ id: 'cus_BM7mGwp1Ea8RtL' }));
     sandbox.stub(stripe.tokens, 'create').callsFake(() => Promise.resolve({ id: 'tok_1AzPXGD8MNtzsDcgwaltZuvp' }));
@@ -51,6 +51,14 @@ describe('server/graphql/v2/mutation/TransactionMutations', () => {
     sandbox.stub(stripe.balanceTransactions, 'retrieve').callsFake(() => Promise.resolve(stripeMocks.balance));
     sandbox.stub(stripe.refunds, 'create').callsFake(() => Promise.resolve('foo'));
     sandbox.stub(stripe.charges, 'retrieve').callsFake(() => Promise.resolve('foo'));
+
+    sandbox
+      .stub(stripe.paymentMethods, 'create')
+      .resolves({ id: 'pm_123456789012345678901234', type: 'card', card: { fingerprint: 'fingerprint' } });
+    sandbox
+      .stub(stripe.paymentMethods, 'attach')
+      .resolves({ id: 'pm_123456789012345678901234', type: 'card', card: { fingerprint: 'fingerprint' } });
+
     sendEmailSpy = sandbox.spy(emailLib, 'send');
     refundTransactionSpy = sandbox.spy(orders, 'refundTransaction');
   });
@@ -97,7 +105,7 @@ describe('server/graphql/v2/mutation/TransactionMutations', () => {
       CollectiveId: collective.id,
       MemberCollectiveId: randomUser.id,
       role: 'BACKER',
-      CreatedByUserId: randomUser.CreatedByUserId,
+      CreatedByUserId: randomUser.id,
     });
   });
 
@@ -123,6 +131,7 @@ describe('server/graphql/v2/mutation/TransactionMutations', () => {
         hostAdminUser,
       );
 
+      result.errors && console.error(result.errors);
       expect(result.errors).to.not.exist;
       expect(result.data.refundTransaction.id).to.exist;
     });
@@ -184,6 +193,8 @@ describe('server/graphql/v2/mutation/TransactionMutations', () => {
           role: 'BACKER',
         },
       });
+
+      await utils.waitForCondition(() => sendEmailSpy.calledWith('contribution.rejected'));
 
       expect(result.errors).to.not.exist;
       expect(result.data.rejectTransaction.id).to.exist;

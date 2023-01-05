@@ -1,6 +1,9 @@
 import { expect } from 'chai';
+import moment from 'moment';
 
 import { expenseStatus } from '../../../../server/constants';
+import { EXPENSE_PERMISSION_ERROR_CODES } from '../../../../server/constants/permissions';
+import POLICIES from '../../../../server/constants/policies';
 import {
   canApprove,
   canComment,
@@ -16,11 +19,23 @@ import {
   canSeeExpensePayoutMethod,
   canUnapprove,
   canUnschedulePayment,
+  checkHasBalanceToPayExpense,
+  getExpenseAmountInDifferentCurrency,
   isAccountHolderNameAndLegalNameMatch,
 } from '../../../../server/graphql/common/expenses';
+import { createTransactionsFromPaidExpense } from '../../../../server/lib/transactions';
+import models from '../../../../server/models';
 import { PayoutMethodTypes } from '../../../../server/models/PayoutMethod';
-import { fakeCollective, fakeExpense, fakePayoutMethod, fakeUser } from '../../../test-helpers/fake-data';
-import { makeRequest } from '../../../utils';
+import {
+  fakeCollective,
+  fakeCurrencyExchangeRate,
+  fakeExpense,
+  fakeHost,
+  fakePayoutMethod,
+  fakeTransaction,
+  fakeUser,
+} from '../../../test-helpers/fake-data';
+import { getApolloErrorCode, makeRequest } from '../../../utils';
 
 describe('server/graphql/common/expenses', () => {
   let expense,
@@ -133,7 +148,7 @@ describe('server/graphql/common/expenses', () => {
   });
 
   describe('canEditExpense', () => {
-    it('only if not processing, paid, draft or scheduled for payment', async () => {
+    it('only if not processing, paid or scheduled for payment', async () => {
       await expense.update({ status: 'PENDING' });
       expect(await canEditExpense(hostAdminReq, expense)).to.be.true;
       await expense.update({ status: 'APPROVED' });
@@ -147,9 +162,15 @@ describe('server/graphql/common/expenses', () => {
       await expense.update({ status: 'PAID' });
       expect(await canEditExpense(hostAdminReq, expense)).to.be.false;
       await expense.update({ status: 'DRAFT' });
-      expect(await canEditExpense(hostAdminReq, expense)).to.be.false;
+      expect(await canEditExpense(hostAdminReq, expense)).to.be.true;
       await expense.update({ status: 'SCHEDULED_FOR_PAYMENT' });
       expect(await canEditExpense(hostAdminReq, expense)).to.be.false;
+    });
+
+    it('can edit expense if user is the draft payee', async () => {
+      const expensePayee = await fakeUser();
+      await expense.update({ status: 'DRAFT', data: { payee: { id: expensePayee.collective.id } } });
+      expect(await canEditExpense(makeRequest(expensePayee), expense)).to.be.true;
     });
 
     it('only with the allowed roles', async () => {
@@ -276,6 +297,117 @@ describe('server/graphql/common/expenses', () => {
       expect(await canApprove(collectiveAccountantReq, expense)).to.be.false;
       expect(await canApprove(hostAccountantReq, expense)).to.be.false;
     });
+
+    it('throws informative error if options.throw is set', async () => {
+      await expense.update({ status: 'PENDING' });
+      expect(await getApolloErrorCode(canApprove(publicReq, expense, { throw: true }))).to.be.equal(
+        EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_USER_FEATURE,
+      );
+      expect(await getApolloErrorCode(canApprove(expenseOwnerReq, expense, { throw: true }))).to.be.equal(
+        EXPENSE_PERMISSION_ERROR_CODES.MINIMAL_CONDITION_NOT_MET,
+      );
+
+      await expense.update({ status: 'APPROVED' });
+      expect(await getApolloErrorCode(canApprove(publicReq, expense, { throw: true }))).to.be.equal(
+        EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_STATUS,
+      );
+    });
+
+    describe('enforces EXPENSE_AUTHOR_CANNOT_APPROVE policy', () => {
+      let newExpense;
+      before(async () => {
+        const payoutMethod = await fakePayoutMethod({ type: PayoutMethodTypes.OTHER });
+        newExpense = await fakeExpense({
+          CollectiveId: collective.id,
+          FromCollectiveId: collectiveAdmin.CollectiveId,
+          PayoutMethodId: payoutMethod.id,
+          UserId: collectiveAdmin.id,
+        });
+
+        await expense.update({ status: 'PENDING' });
+      });
+
+      beforeEach(async () => {
+        await collective.host.setPolicies({
+          [POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE]: { enabled: false, amountInCents: 0 },
+        });
+        await collective.setPolicies({
+          [POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE]: { enabled: false, amountInCents: 0 },
+        });
+        await newExpense.update({ amount: 10e2 });
+      });
+
+      it('by collective', async () => {
+        newExpense.collective = await collective.setPolicies({
+          [POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE]: { enabled: true, amountInCents: 0 },
+        });
+        expect(await getApolloErrorCode(canApprove(collectiveAdminReq, newExpense, { throw: true }))).to.be.equal(
+          EXPENSE_PERMISSION_ERROR_CODES.AUTHOR_CANNOT_APPROVE,
+        );
+        expect(await canApprove(collectiveAdminReq, newExpense)).to.be.false;
+
+        newExpense.collective = await collective.setPolicies({
+          [POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE]: { enabled: true, amountInCents: 20e2 },
+        });
+
+        expect(await canApprove(collectiveAdminReq, newExpense)).to.be.true;
+
+        await newExpense.update({ amount: 20e2 });
+
+        expect(await getApolloErrorCode(canApprove(collectiveAdminReq, newExpense, { throw: true }))).to.be.equal(
+          EXPENSE_PERMISSION_ERROR_CODES.AUTHOR_CANNOT_APPROVE,
+        );
+        expect(await canApprove(collectiveAdminReq, newExpense)).to.be.false;
+      });
+
+      it('by host', async () => {
+        collective = await collective.setPolicies({
+          [POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE]: { enabled: false, amountInCents: 0 },
+        });
+        collective.host = await collective.host.setPolicies({
+          [POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE]: {
+            enabled: true,
+            amountInCents: 0,
+            appliesToHostedCollectives: true,
+          },
+        });
+        newExpense.collective = collective;
+
+        expect(await canApprove(collectiveAdminReq, newExpense)).to.be.true;
+
+        newExpense.collective.host = await collective.host.setPolicies({
+          [POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE]: {
+            enabled: true,
+            amountInCents: 0,
+            appliesToHostedCollectives: true,
+            appliesToSingleAdminCollectives: true,
+          },
+        });
+
+        expect(await getApolloErrorCode(canApprove(collectiveAdminReq, newExpense, { throw: true }))).to.be.equal(
+          EXPENSE_PERMISSION_ERROR_CODES.AUTHOR_CANNOT_APPROVE,
+        );
+        expect(await canApprove(collectiveAdminReq, newExpense)).to.be.false;
+
+        newExpense.collective.host = await collective.host.setPolicies({
+          [POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE]: {
+            enabled: true,
+            amountInCents: 20e2,
+            appliesToHostedCollectives: true,
+            appliesToSingleAdminCollectives: true,
+          },
+        });
+
+        expect(await canApprove(collectiveAdminReq, newExpense)).to.be.true;
+
+        await newExpense.update({ amount: 20e2 });
+
+        expect(await getApolloErrorCode(canApprove(collectiveAdminReq, newExpense, { throw: true }))).to.be.equal(
+          EXPENSE_PERMISSION_ERROR_CODES.AUTHOR_CANNOT_APPROVE,
+        );
+        expect(await canApprove(collectiveAdminReq, newExpense)).to.be.false;
+      });
+    });
   });
 
   describe('canReject', () => {
@@ -316,7 +448,7 @@ describe('server/graphql/common/expenses', () => {
       await expense.update({ status: 'PROCESSING' });
       expect(await canUnapprove(hostAdminReq, expense)).to.be.false;
       await expense.update({ status: 'ERROR' });
-      expect(await canUnapprove(hostAdminReq, expense)).to.be.false;
+      expect(await canUnapprove(hostAdminReq, expense)).to.be.true;
       await expense.update({ status: 'PAID' });
       expect(await canUnapprove(hostAdminReq, expense)).to.be.false;
       await expense.update({ status: 'REJECTED' });
@@ -422,6 +554,260 @@ describe('server/graphql/common/expenses', () => {
       expect(isAccountHolderNameAndLegalNameMatch('Sudharaka Palamakumbura', 'Sudharaka Palamakumbura')).to.be.true;
       expect(isAccountHolderNameAndLegalNameMatch('JHipster Inc.', 'JHipster Inc. 501(c)(3)')).to.be.true;
       expect(isAccountHolderNameAndLegalNameMatch('JHipster Inc. 501(c)(3)', 'JHipster Inc.')).to.be.true;
+    });
+  });
+
+  describe('getExpenseAmountInDifferentCurrency', () => {
+    describe('Wise', async () => {
+      it('returns the amount in expense currency', async () => {
+        const payoutMethod = await fakePayoutMethod({ service: 'TRANSFERWISE', type: 'BANK_ACCOUNT' });
+        const expense = await fakeExpense({ PayoutMethodId: payoutMethod.id, amount: 1000, currency: 'EUR' });
+        const amount = await getExpenseAmountInDifferentCurrency(expense, 'EUR', publicReq);
+        expect(amount).to.deep.eq({
+          value: 1000,
+          currency: 'EUR',
+          exchangeRate: null,
+        });
+      });
+
+      describe('converts the amount to collective currency', () => {
+        let expense;
+
+        before(async () => {
+          const payoutMethod = await fakePayoutMethod({ service: 'TRANSFERWISE', type: 'BANK_ACCOUNT' });
+          const collective = await fakeCollective({ currency: 'USD' });
+          expense = await fakeExpense({
+            PayoutMethodId: payoutMethod.id,
+            CollectiveId: collective.id,
+            amount: 1000,
+            currency: 'EUR',
+          });
+        });
+
+        it('when there is no data (uses the mocked 1.1)', async () => {
+          const amount = await getExpenseAmountInDifferentCurrency(expense, 'USD', publicReq);
+          expect(amount).to.deep.eq({
+            value: 1100,
+            currency: 'USD',
+            exchangeRate: {
+              date: amount.exchangeRate.date, // We don't really care about the date
+              fromCurrency: 'EUR',
+              isApproximate: true,
+              source: 'OPENCOLLECTIVE',
+              toCurrency: 'USD',
+              value: 1.1,
+            },
+          });
+        });
+
+        it('when there is data', async () => {
+          await expense.update({
+            data: {
+              transfer: {
+                sourceCurrency: 'USD', // Host currency
+                targetCurrency: 'EUR', // Expense/Payout method currency
+                rate: 1.4,
+              },
+            },
+          });
+
+          const amount = await getExpenseAmountInDifferentCurrency(expense, 'USD', publicReq);
+          expect(amount).to.deep.eq({
+            value: 714, // 1 * (1 / 1.4)
+            currency: 'USD',
+            exchangeRate: {
+              date: amount.exchangeRate.date, // We don't really care about the date
+              fromCurrency: 'EUR',
+              isApproximate: false,
+              source: 'WISE',
+              toCurrency: 'USD',
+              value: 1 / 1.4,
+            },
+          });
+        });
+      });
+    });
+
+    describe('PayPal', async () => {
+      let expense;
+
+      before(async () => {
+        const payoutMethod = await fakePayoutMethod({ service: 'PAYPAL', type: 'PAYPAL' });
+        const collective = await fakeCollective({ currency: 'USD' });
+        expense = await fakeExpense({
+          PayoutMethodId: payoutMethod.id,
+          CollectiveId: collective.id,
+          amount: 1000,
+          currency: 'EUR',
+        });
+      });
+
+      describe('converts the amount to collective currency', () => {
+        it('when there is no data (uses the mocked 1.1)', async () => {
+          const amount = await getExpenseAmountInDifferentCurrency(expense, 'USD', publicReq);
+          expect(amount).to.deep.eq({
+            value: 1100,
+            currency: 'USD',
+            exchangeRate: {
+              date: amount.exchangeRate.date, // We don't really care about the date
+              fromCurrency: 'EUR',
+              isApproximate: true,
+              source: 'OPENCOLLECTIVE',
+              toCurrency: 'USD',
+              value: 1.1,
+            },
+          });
+        });
+
+        it('when there is data', async () => {
+          await expense.update({
+            data: {
+              /* eslint-disable camelcase */
+              currency_conversion: {
+                from_amount: { currency: 'EUR', value: 1000 },
+                to_amount: { currency: 'USD', value: 1600 },
+                exchange_rate: 1.6,
+              },
+              /* eslint-enable camelcase */
+            },
+          });
+
+          const amount = await getExpenseAmountInDifferentCurrency(expense, 'USD', publicReq);
+          expect(amount).to.deep.eq({
+            value: 1600,
+            currency: 'USD',
+            exchangeRate: {
+              date: amount.exchangeRate.date, // We don't really care about the date
+              fromCurrency: 'EUR',
+              isApproximate: false,
+              source: 'PAYPAL',
+              toCurrency: 'USD',
+              value: 1.6,
+            },
+          });
+        });
+      });
+    });
+
+    describe('Manual', async () => {
+      let expense;
+
+      before(async () => {
+        const payoutMethod = await fakePayoutMethod({ type: 'OTHER' });
+        const collective = await fakeCollective({ currency: 'USD' });
+        expense = await fakeExpense({
+          PayoutMethodId: payoutMethod.id,
+          CollectiveId: collective.id,
+          amount: 1000,
+          currency: 'EUR',
+        });
+      });
+
+      describe('converts the amount to collective currency', () => {
+        it('when there is no data (uses the mocked 1.1)', async () => {
+          const amount = await getExpenseAmountInDifferentCurrency(expense, 'USD', publicReq);
+          expect(amount).to.deep.eq({
+            value: 1100,
+            currency: 'USD',
+            exchangeRate: {
+              date: amount.exchangeRate.date, // We don't really care about the date
+              fromCurrency: 'EUR',
+              isApproximate: true,
+              source: 'OPENCOLLECTIVE',
+              toCurrency: 'USD',
+              value: 1.1,
+            },
+          });
+        });
+
+        it('when there is a transaction to retrieve the rate', async () => {
+          await createTransactionsFromPaidExpense(expense.collective.host, expense, undefined, 1.6);
+          await expense.update({ status: 'PAID' });
+
+          const amount = await getExpenseAmountInDifferentCurrency(expense, 'USD', publicReq);
+          expect(amount).to.deep.eq({
+            value: 1600,
+            currency: 'USD',
+            exchangeRate: {
+              date: amount.exchangeRate.date, // We don't really care about the date
+              fromCurrency: 'EUR',
+              isApproximate: false,
+              source: 'OPENCOLLECTIVE',
+              toCurrency: 'USD',
+              value: 1.6,
+            },
+          });
+        });
+      });
+    });
+  });
+
+  describe('checkHasBalanceToPayExpense', () => {
+    let host, collective, payoutMethod;
+    before(async () => {
+      host = await fakeHost({ currency: 'USD' });
+      collective = await fakeCollective({ currency: 'USD', HostCollectiveId: host.id });
+      payoutMethod = await fakePayoutMethod({ type: 'OTHER' });
+      await fakeTransaction({
+        type: 'CREDIT',
+        CollectiveId: collective.id,
+        HostCollectiveId: host.id,
+        amount: 1000 * 100,
+      });
+      await models.CurrencyExchangeRate.destroy({ where: { to: ['BRL', 'EUR'] } });
+      await Promise.all([
+        fakeCurrencyExchangeRate({ from: 'USD', to: 'BRL', rate: 5.0, createdAt: moment().subtract(3, 'days') }),
+        fakeCurrencyExchangeRate({ from: 'USD', to: 'BRL', rate: 5.1, createdAt: moment().subtract(2, 'days') }),
+        fakeCurrencyExchangeRate({ from: 'USD', to: 'BRL', rate: 5.2, createdAt: moment().subtract(1, 'days') }),
+        fakeCurrencyExchangeRate({ from: 'USD', to: 'BRL', rate: 5.1, createdAt: moment() }),
+        fakeCurrencyExchangeRate({ from: 'USD', to: 'EUR', rate: 1, createdAt: moment().subtract(3, 'days') }),
+        fakeCurrencyExchangeRate({ from: 'USD', to: 'EUR', rate: 1.1, createdAt: moment().subtract(2, 'days') }),
+        fakeCurrencyExchangeRate({ from: 'USD', to: 'EUR', rate: 1.15, createdAt: moment().subtract(1, 'days') }),
+        fakeCurrencyExchangeRate({ from: 'USD', to: 'EUR', rate: 1.05, createdAt: moment() }),
+      ]);
+    });
+
+    it('throws if the collective has not enough balance to cover for the expense', async () => {
+      const expense = await fakeExpense({
+        currency: 'USD',
+        CollectiveId: collective.id,
+        HostCollectiveId: host.id,
+        PayoutMethodId: payoutMethod.id,
+        FromCollectiveId: payoutMethod.CollectiveId,
+        amount: 100001,
+      });
+
+      await expect(checkHasBalanceToPayExpense(host, expense, payoutMethod)).to.be.rejectedWith(
+        'Collective does not have enough funds to pay this expense. Current balance: $1,000.00, Expense amount: $1,000.01',
+      );
+    });
+
+    it('throws if the collective has not enough balance to cover for the exchange rate variance', async () => {
+      let expense = await fakeExpense({
+        currency: 'BRL',
+        CollectiveId: collective.id,
+        HostCollectiveId: host.id,
+        PayoutMethodId: payoutMethod.id,
+        FromCollectiveId: payoutMethod.CollectiveId,
+        amount: 500000,
+      });
+
+      await expect(checkHasBalanceToPayExpense(host, expense, payoutMethod)).to.be.rejectedWith(
+        'Collective does not have enough funds to pay this expense. Current balance: $1,000.00, Expense amount: R$5,000.00. For expenses submitted in a different currency than the collective, an error margin is applied to accommodate for fluctuations. The maximum amount that can be paid is R$4,936.70',
+      );
+
+      expense = await fakeExpense({
+        currency: 'EUR',
+        CollectiveId: collective.id,
+        HostCollectiveId: host.id,
+        PayoutMethodId: payoutMethod.id,
+        FromCollectiveId: payoutMethod.CollectiveId,
+        amount: 500000,
+      });
+
+      await expect(checkHasBalanceToPayExpense(host, expense, payoutMethod)).to.be.rejectedWith(
+        'Collective does not have enough funds to pay this expense. Current balance: $1,000.00, Expense amount: €5,000.00. For expenses submitted in a different currency than the collective, an error margin is applied to accommodate for fluctuations. The maximum amount that can be paid is €920.90',
+      );
     });
   });
 });

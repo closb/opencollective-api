@@ -3,6 +3,7 @@ import { flatten, isEmpty, keyBy, mapValues, some } from 'lodash';
 import { types as CollectiveTypes } from '../constants/collectives';
 import models, { Op, sequelize } from '../models';
 import { MigrationLogType } from '../models/MigrationLog';
+import User from '../models/User';
 
 import { DEFAULT_GUEST_NAME } from './guest-accounts';
 
@@ -27,7 +28,7 @@ export const getMovableItemsCounts = async (
   account: Record<keyof CollectiveFieldsConfig, number>;
   user: Record<keyof UserFieldsConfig, number>;
 }> => {
-  if (fromCollective.type === CollectiveTypes.USER) {
+  if (fromCollective.type === CollectiveTypes.USER && !fromCollective.isIncognito) {
     const user = await fromCollective.getUser({ paranoid: false });
     if (!user) {
       throw new Error('Cannot find user for this account');
@@ -169,12 +170,14 @@ const collectiveFieldsConfig: CollectiveFieldsConfig = {
   updatesCreated: { model: models.Update, field: 'FromCollectiveId' },
   virtualCards: { model: models.VirtualCard, field: 'CollectiveId' },
   virtualCardsHosted: { model: models.VirtualCard, field: 'HostCollectiveId' },
+  recurringExpenses: { model: models.RecurringExpense, field: 'CollectiveId' },
+  recurringExpensesCreated: { model: models.RecurringExpense, field: 'FromCollectiveId' },
 };
 
 // Defines the collective field names used in the DB. Useful to prevent typos in the config below
 type UserField = 'UserId' | 'CreatedByUserId';
 
-type UserFieldsConfig = Record<string, { model: typeof models.User; field: UserField }>;
+type UserFieldsConfig = Record<string, { model: User; field: UserField }>;
 
 const userFieldsConfig = {
   activities: { model: models.Activity, field: 'UserId' },
@@ -191,11 +194,13 @@ const userFieldsConfig = {
   members: { model: models.Member, field: 'CreatedByUserId' },
   migrationLogs: { model: models.MigrationLog, field: 'CreatedByUserId' },
   notifications: { model: models.Notification, field: 'UserId' },
+  oAuthAuthorizationCodes: { model: models.OAuthAuthorizationCode, field: 'UserId' },
   orders: { model: models.Order, field: 'CreatedByUserId' },
   paymentMethods: { model: models.PaymentMethod, field: 'CreatedByUserId' },
   payoutMethods: { model: models.PayoutMethod, field: 'CreatedByUserId' },
   transactions: { model: models.Transaction, field: 'CreatedByUserId' },
   updates: { model: models.Update, field: 'CreatedByUserId' },
+  userTokens: { model: models.UserToken, field: 'UserId' },
   virtualCards: { model: models.VirtualCard, field: 'UserId' },
 };
 
@@ -331,7 +336,7 @@ export const mergeAccounts = async (
 
   // When moving users, we'll also update the user entries
   let fromUser, toUser;
-  if (from.type === CollectiveTypes.USER) {
+  if (from.type === CollectiveTypes.USER && !from.isIncognito) {
     fromUser = await models.User.findOne({ where: { CollectiveId: from.id } });
     toUser = await models.User.findOne({ where: { CollectiveId: into.id } });
     if (!fromUser || !toUser) {

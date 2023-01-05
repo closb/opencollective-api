@@ -1,26 +1,16 @@
-import restoreSequelizeAttributesOnClass from '../lib/restore-sequelize-attributes-on-class';
+import type { CreationOptional, ForeignKey, InferAttributes, InferCreationAttributes } from 'sequelize';
+
 import sequelize, { DataTypes, Model } from '../lib/sequelize';
+
+import User from './User';
 
 export enum MigrationLogType {
   MIGRATION = 'MIGRATION',
   MANUAL = 'MANUAL',
   MERGE_ACCOUNTS = 'MERGE_ACCOUNTS',
-}
-
-interface MigrationLogAttributes {
-  id: number;
-  type: MigrationLogType;
-  createdAt: Date;
-  description: string;
-  data: Record<string, unknown>;
-  CreatedByUserId: number;
-}
-
-interface MigrationLogCommonCreateAttributes {
-  type: MigrationLogType;
-  description: string;
-  data: Record<string, unknown>;
-  CreatedByUserId: number;
+  BAN_ACCOUNTS = 'BAN_ACCOUNTS',
+  MOVE_ORDERS = 'MOVE_ORDERS',
+  MOVE_EXPENSES = 'MOVE_EXPENSES',
 }
 
 export type MigrationLogDataForMergeAccounts = {
@@ -34,21 +24,13 @@ export type MigrationLogDataForMergeAccounts = {
 
 type MigrationLogData = MigrationLogDataForMergeAccounts | Record<string, unknown>;
 
-class MigrationLog
-  extends Model<MigrationLogAttributes, MigrationLogCommonCreateAttributes>
-  implements MigrationLogAttributes
-{
-  id: number;
-  type: MigrationLogType;
-  createdAt: Date;
-  description: string;
-  data: MigrationLogData;
-  CreatedByUserId: number;
-
-  constructor(...args) {
-    super(...args);
-    restoreSequelizeAttributesOnClass(new.target, this);
-  }
+class MigrationLog extends Model<InferAttributes<MigrationLog>, InferCreationAttributes<MigrationLog>> {
+  public declare id: CreationOptional<number>;
+  public declare type: MigrationLogType;
+  public declare createdAt: CreationOptional<Date>;
+  public declare description: string;
+  public declare data: MigrationLogData;
+  public declare CreatedByUserId: ForeignKey<User['id']>;
 
   static async getDataForMergeAccounts(
     fromAccountId: number,
@@ -76,7 +58,7 @@ MigrationLog.init(
       autoIncrement: true,
     },
     type: {
-      type: DataTypes.ENUM('MIGRATION', 'MANUAL', 'MERGE_ACCOUNTS'),
+      type: DataTypes.ENUM(...Object.values(MigrationLogType)),
       allowNull: false,
     },
     description: {

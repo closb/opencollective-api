@@ -1,10 +1,13 @@
 import { expect } from 'chai';
+import { repeat } from 'lodash';
 import moment from 'moment';
 import { SequelizeValidationError } from 'sequelize';
-import sinon from 'sinon';
+import { createSandbox } from 'sinon';
 
 import { expenseStatus, roles } from '../../../server/constants';
+import FEATURE from '../../../server/constants/feature';
 import plans from '../../../server/constants/plans';
+import POLICIES from '../../../server/constants/policies';
 import { TransactionKind } from '../../../server/constants/transaction-kind';
 import { getFxRate } from '../../../server/lib/currency';
 import emailLib from '../../../server/lib/email';
@@ -15,7 +18,9 @@ import {
   fakeEvent,
   fakeExpense,
   fakeHost,
+  fakeMember,
   fakeOrder,
+  fakeOrganization,
   fakePaymentMethod,
   fakePayoutMethod,
   fakeTransaction,
@@ -39,6 +44,7 @@ describe('server/models/Collective', () => {
     name: 'tipbox',
     currency: 'USD',
     tags: ['#brusselstogether'],
+    CreatedByUserId: 1,
     tiers: [
       {
         name: 'backer',
@@ -93,6 +99,7 @@ describe('server/models/Collective', () => {
       createdAt: new Date('2016-06-15'),
       amount: 25000,
       amountInHostCurrency: 25000,
+      paymentProcessorFeeInHostCurrency: -2500,
       netAmountInCollectiveCurrency: 22500,
       currency: 'USD',
       type: 'CREDIT',
@@ -103,6 +110,7 @@ describe('server/models/Collective', () => {
       createdAt: new Date('2016-07-16'),
       amount: 50000,
       amountInHostCurrency: 50000,
+      paymentProcessorFeeInHostCurrency: -5000,
       netAmountInCollectiveCurrency: 45000,
       currency: 'USD',
       type: 'CREDIT',
@@ -111,8 +119,9 @@ describe('server/models/Collective', () => {
     },
     {
       createdAt: new Date('2016-08-18'),
-      amount: 500,
+      amount: 45000,
       amountInHostCurrency: 50000,
+      paymentProcessorFeeInHostCurrency: -5000,
       netAmountInCollectiveCurrency: 45000,
       currency: 'USD',
       type: 'CREDIT',
@@ -127,7 +136,7 @@ describe('server/models/Collective', () => {
   });
 
   before(() => {
-    sandbox = sinon.createSandbox();
+    sandbox = createSandbox();
     sendEmailSpy = sandbox.spy(emailLib, 'sendMessage');
   });
 
@@ -141,6 +150,7 @@ describe('server/models/Collective', () => {
     hostUser = await User.createUserWithCollective(utils.data('host1'));
     collective = await Collective.create(collectiveData);
     opensourceCollective = await Collective.create({
+      name: 'Webpack',
       slug: 'webpack',
       tags: ['open source'],
       isActive: true,
@@ -206,7 +216,7 @@ describe('server/models/Collective', () => {
   });
 
   it('creates a unique slug', async () => {
-    const collective1 = await Collective.create({ slug: 'piamancini' });
+    const collective1 = await Collective.create({ name: 'Pia', slug: 'piamancini' });
     expect(collective1.slug).to.equal('piamancini');
 
     const collective2 = await Collective.create({ name: 'XavierDamman' });
@@ -214,7 +224,7 @@ describe('server/models/Collective', () => {
 
     await Collective.create({ name: 'piamancini2' });
 
-    const collective3 = await Collective.create({ twitterHandle: '@piamancini' });
+    const collective3 = await Collective.create({ name: 'PiaMancini', twitterHandle: '@piamancini' });
     expect(collective3.slug).to.equal('piamancini1');
     expect(collective3.twitterHandle).to.equal('piamancini');
 
@@ -234,7 +244,7 @@ describe('server/models/Collective', () => {
   });
 
   it('creates a unique slug for incognito profile', async () => {
-    const collective = await Collective.create({ isIncognito: true });
+    const collective = await Collective.create({ name: 'incognito', isIncognito: true });
     expect(collective.slug).to.contain('incognito-');
     expect(collective.slug.length).to.equal(18);
   });
@@ -278,7 +288,7 @@ describe('server/models/Collective', () => {
       const ics = await event.getICS();
       expect(ics).to.contain('STATUS:CONFIRMED');
       expect(ics).to.contain('/tipbox/events/sustainoss-london');
-      expect(ics).to.contain('no-reply@tipbox.opencollective.com');
+      expect(ics).to.contain('no-reply@opencollective.com');
     });
   });
 
@@ -336,8 +346,18 @@ describe('server/models/Collective', () => {
         await collective.changeHost();
         throw new Error("Didn't throw expected error!");
       } catch (e) {
-        expect(e.message).to.contain('Unable to change host: you still have a balance of $965');
+        expect(e.message).to.contain('Unable to change host: you still have a balance of $1,125.00');
       }
+    });
+
+    it('fails to change host if one of the children has a pending balance', async () => {
+      const collective = await fakeCollective();
+      const event = await fakeEvent({ name: 'Crazy Party', ParentCollectiveId: collective.id });
+      const transaction = await fakeTransaction({ CollectiveId: event.id, type: 'CREDIT', amount: 1000 });
+      await expect(collective.changeHost(null)).to.be.eventually.rejectedWith(
+        'Unable to change host: your event "Crazy Party" still has a balance of $10.00',
+      );
+      await transaction.destroy(); // We unfortunately have to do that because `getTopBackers` is based on previous tests' data
     });
 
     it('fails to deactivate as host if it is hosting any collective', async () => {
@@ -391,7 +411,7 @@ describe('server/models/Collective', () => {
       const applyArgs = sendEmailSpy.args.find(callArgs => callArgs[1].includes('Thanks for applying'));
       expect(applyArgs).to.exist;
       expect(applyArgs[0]).to.equal(user1.email);
-      expect(applyArgs[3].from).to.equal('no-reply@wwcode.opencollective.com');
+      expect(applyArgs[3].from).to.equal('no-reply@opencollective.com');
     });
 
     it('updates hostFeePercent for collective and events when adding or changing host', async () => {
@@ -465,20 +485,52 @@ describe('server/models/Collective', () => {
     expect(collective.image).to.equal('https://www.gravatar.com/avatar/a97d0fcd96579015da610aa284f8d8df?default=404');
   });
 
-  it('computes the balance ', () =>
-    collective.getBalance().then(balance => {
+  it('computes the balance (v1)', () =>
+    collective.getBalance({ version: 'v1' }).then(balance => {
       let sum = 0;
       transactions.map(t => (sum += t.netAmountInCollectiveCurrency));
       expect(balance).to.equal(sum);
     }));
 
-  it('computes the balance until a certain month', done => {
+  it('computes the balance (v2 - default)', () =>
+    collective.getBalance().then(balance => {
+      let sum = 0;
+      transactions.map(
+        t =>
+          (sum +=
+            (t.amountInHostCurrency || 0) +
+            (t.hostFeeInHostCurrency || 0) +
+            (t.platformFeeInHostCurrency || 0) +
+            (t.paymentProcessorFeeInHostCurrency || 0)),
+      );
+      expect(balance).to.equal(sum);
+    }));
+
+  it('computes the balance until a certain month (v1)', done => {
+    const until = new Date('2016-07-01');
+    collective.getBalance({ version: 'v1', endDate: until }).then(balance => {
+      let sum = 0;
+      transactions.map(t => {
+        if (t.createdAt < until) {
+          sum += t.netAmountInCollectiveCurrency;
+        }
+      });
+      expect(balance).to.equal(sum);
+      done();
+    });
+  });
+
+  it('computes the balance until a certain month (v2 - default)', done => {
     const until = new Date('2016-07-01');
     collective.getBalance({ endDate: until }).then(balance => {
       let sum = 0;
       transactions.map(t => {
         if (t.createdAt < until) {
-          sum += t.netAmountInCollectiveCurrency;
+          sum +=
+            (t.amountInHostCurrency || 0) +
+            (t.hostFeeInHostCurrency || 0) +
+            (t.platformFeeInHostCurrency || 0) +
+            (t.paymentProcessorFeeInHostCurrency || 0);
         }
       });
       expect(balance).to.equal(sum);
@@ -491,10 +543,12 @@ describe('server/models/Collective', () => {
     await fakeTransaction({
       createdAt: new Date(),
       CollectiveId: collective.id,
-      amount: 500,
+      amount: 50000,
       amountInHostCurrency: 50000,
+      paymentProcessorFeeInHostCurrency: -5000,
       netAmountInCollectiveCurrency: 45000,
       currency: 'USD',
+      hostCurrency: 'USD',
       type: 'CREDIT',
       CreatedByUserId: 2,
       FromCollectiveId: 2,
@@ -513,8 +567,11 @@ describe('server/models/Collective', () => {
       data: { payout_batch_id: 1 },
     });
 
+    const balanceV1 = await collective.getBalanceWithBlockedFunds({ version: 'v1' });
+    expect(balanceV1).to.equal(50000 - 5000 - 20000 - 10000);
+
     const balance = await collective.getBalanceWithBlockedFunds();
-    expect(balance).to.equal(45000 - 30000);
+    expect(balance).to.equal(50000 - 5000 - 20000 - 10000);
   });
 
   it('computes the number of backers', () =>
@@ -626,7 +683,7 @@ describe('server/models/Collective', () => {
     });
 
     it('gets the latest transactions of a user collective', () => {
-      return Collective.findOne({ where: { type: 'USER' } }).then(userCollective => {
+      return Collective.findOne({ where: { id: user1.CollectiveId } }).then(userCollective => {
         return userCollective
           .getLatestTransactions(new Date('2016-06-01'), new Date('2016-08-01'))
           .then(transactions => {
@@ -636,7 +693,8 @@ describe('server/models/Collective', () => {
     });
 
     it('gets the latest transactions of a user collective to open source', () => {
-      return Collective.findOne({ where: { type: 'USER' } }).then(userCollective => {
+      // we have like 4 users here
+      return Collective.findOne({ where: { id: user1.CollectiveId } }).then(userCollective => {
         return userCollective
           .getLatestTransactions(new Date('2016-06-01'), new Date('2016-08-01'), ['open source'])
           .then(transactions => {
@@ -733,97 +791,149 @@ describe('server/models/Collective', () => {
   });
 
   describe('members', () => {
-    it('gets email addresses of admins', async () => {
-      let emails = await collective.getEmails();
-      expect(emails.length).to.equal(0);
+    describe('getAdminUsers', () => {
+      it('gets admin users for collective', async () => {
+        let admins = await collective.getAdminUsers();
+        expect(admins.length).to.equal(0);
 
-      await collective.editMembers(
-        [
-          {
-            role: 'ADMIN',
-            member: {
-              id: user1.CollectiveId,
-            },
-          },
-          {
-            role: 'ADMIN',
-            member: {
-              id: user2.CollectiveId,
-            },
-          },
-        ],
-        { CreatedByUserId: user1.id },
-      );
+        await collective.editMembers(
+          [
+            { role: 'ADMIN', member: { id: user1.CollectiveId } },
+            { role: 'ADMIN', member: { id: user2.CollectiveId } },
+          ],
+          { CreatedByUserId: user1.id },
+        );
 
-      // Invitation needs to be approved before admins can access the email
-      const invitation = await models.MemberInvitation.findOne({
-        where: { CollectiveId: collective.id, MemberCollectiveId: user1.CollectiveId, role: 'ADMIN' },
+        // Invitation needs to be approved before admins can access the email
+        const invitation = await models.MemberInvitation.findOne({
+          where: { CollectiveId: collective.id, MemberCollectiveId: user1.CollectiveId, role: 'ADMIN' },
+        });
+        await invitation.accept();
+
+        admins = await collective.getAdminUsers();
+        expect(admins.length).to.equal(1);
+
+        // Approve user 2
+        const invitation2 = await models.MemberInvitation.findOne({
+          where: { CollectiveId: collective.id, MemberCollectiveId: user2.CollectiveId, role: 'ADMIN' },
+        });
+        await invitation2.accept();
+
+        admins = await collective.getAdminUsers();
+        expect(admins.length).to.equal(2);
       });
-      await invitation.accept();
 
-      emails = await collective.getEmails();
-      expect(emails.length).to.equal(1);
-
-      // Approve user 2
-      const invitation2 = await models.MemberInvitation.findOne({
-        where: { CollectiveId: collective.id, MemberCollectiveId: user2.CollectiveId, role: 'ADMIN' },
+      it('returns the user profile for user', async () => {
+        const admins = await user1.collective.getAdminUsers();
+        expect(admins.length).to.eq(1);
+        expect(admins[0].id).to.eq(user1.id);
+        expect(admins[0].collective).to.be.undefined; // Not returned by default
       });
-      await invitation2.accept();
 
-      emails = await collective.getEmails();
-      expect(emails.length).to.equal(2);
+      it('can return the member collectives if requested', async () => {
+        // For collective
+        const collectiveAdmins = await collective.getAdminUsers({ collectiveAttributes: null });
+        expect(collectiveAdmins[0].collective.id).to.eq(user1.CollectiveId);
+
+        // For user
+        const admins = await user1.collective.getAdminUsers({ collectiveAttributes: null });
+        expect(admins.length).to.eq(1);
+        expect(admins[0].id).to.eq(user1.id);
+        expect(admins[0].collective.id).to.eq(user1.CollectiveId);
+      });
     });
 
-    it('add/update/remove members', async () => {
-      const loadCoreContributors = () => {
-        return models.Member.findAll({
+    describe('getMembersUsers', () => {
+      it('filters by role', async () => {
+        await models.Member.destroy({ where: { CollectiveId: collective.id } });
+
+        // Some fake data to fool the tests
+        await fakeMember({ CreatedByUserId: user1.id });
+        await fakeMember({ CreatedByUserId: user1.id });
+        await fakeMember({ CollectiveId: collective.id, CreatedByUserId: user1.id });
+
+        // Add some members
+        const backer = await fakeUser();
+        const admin = await fakeUser();
+        const org = await fakeOrganization();
+        await fakeMember({
+          CollectiveId: collective.id,
+          MemberCollectiveId: org.id,
+          CreatedByUserId: backer.id,
+          role: 'BACKER',
+        });
+        await collective.addUserWithRole(backer, 'BACKER');
+        await collective.addUserWithRole(admin, 'ADMIN');
+
+        // Check results
+        const resultAdmins = await collective.getMembersUsers({ role: roles.ADMIN });
+        expect(resultAdmins.length).to.equal(1);
+        expect(resultAdmins[0].CollectiveId).to.equal(admin.CollectiveId);
+
+        // Not returning the org for backer
+        const resultBackers = await collective.getMembersUsers({ role: roles.BACKER });
+        expect(resultBackers.length).to.equal(1);
+        expect(resultBackers[0].CollectiveId).to.equal(backer.CollectiveId);
+
+        const adminsAndBackers = await collective.getMembersUsers({ role: [roles.BACKER, roles.ADMIN] });
+        expect(adminsAndBackers.length).to.equal(2);
+        expect(adminsAndBackers[0].CollectiveId).to.equal(backer.CollectiveId);
+        expect(adminsAndBackers[1].CollectiveId).to.equal(admin.CollectiveId);
+      });
+    });
+
+    describe('edit members', () => {
+      it('add/update/remove members', async () => {
+        const loadCoreContributors = () => {
+          return models.Member.findAll({
+            where: { CollectiveId: collective.id, role: { [Op.in]: [roles.ADMIN, roles.MEMBER] } },
+          });
+        };
+
+        // Remove all existing members to start from scratch
+        await models.Member.destroy({
           where: { CollectiveId: collective.id, role: { [Op.in]: [roles.ADMIN, roles.MEMBER] } },
         });
-      };
 
-      // Remove all existing members to stash from fresh
-      await models.Member.destroy({
-        where: { CollectiveId: collective.id, role: { [Op.in]: [roles.ADMIN, roles.MEMBER] } },
-      });
-
-      let members = await collective.editMembers(
-        [
-          {
-            role: 'ADMIN',
-            member: {
-              id: user1.CollectiveId,
+        let members = await collective.editMembers(
+          [
+            {
+              role: 'ADMIN',
+              member: {
+                id: user1.CollectiveId,
+              },
             },
-          },
-          {
-            role: 'MEMBER',
-            member: {
-              id: user2.CollectiveId,
+            {
+              role: 'MEMBER',
+              member: {
+                id: user2.CollectiveId,
+              },
             },
-          },
-        ],
-        { CreatedByUserId: user1.id },
-      );
+          ],
+          { CreatedByUserId: user1.id },
+        );
 
-      expect(members.length).to.equal(0);
+        expect(members.length).to.equal(0);
 
-      const invitation = await models.MemberInvitation.findOne({
-        where: { CollectiveId: collective.id, MemberCollectiveId: user1.CollectiveId, role: 'ADMIN' },
+        const invitation = await models.MemberInvitation.findOne({
+          where: { CollectiveId: collective.id, MemberCollectiveId: user1.CollectiveId, role: 'ADMIN' },
+        });
+        await invitation.accept();
+
+        members = await loadCoreContributors();
+        expect(members.length).to.equal(1);
+        expect(members[0].role).to.equal('ADMIN');
+
+        const invitation2 = await models.MemberInvitation.findOne({
+          where: { CollectiveId: collective.id, MemberCollectiveId: user2.CollectiveId, role: 'MEMBER' },
+        });
+        await invitation2.accept();
+
+        members = await loadCoreContributors();
+        expect(members.length).to.equal(2);
+        expect(members.find(m => m.MemberCollectiveId === user1.CollectiveId).role).to.equal('ADMIN');
+        expect(members.find(m => m.MemberCollectiveId === user2.CollectiveId).role).to.equal('MEMBER');
       });
-      await invitation.accept();
-
-      members = await loadCoreContributors();
-      expect(members.length).to.equal(1);
-      expect(members[0].role).to.equal('ADMIN');
-
-      const invitation2 = await models.MemberInvitation.findOne({
-        where: { CollectiveId: collective.id, MemberCollectiveId: user2.CollectiveId, role: 'MEMBER' },
-      });
-      await invitation2.accept();
-
-      members = await loadCoreContributors();
-      expect(members.length).to.equal(2);
-      expect(members.find(m => m.MemberCollectiveId === user1.CollectiveId).role).to.equal('ADMIN');
-      expect(members.find(m => m.MemberCollectiveId === user2.CollectiveId).role).to.equal('MEMBER');
     });
   });
 
@@ -845,9 +955,9 @@ describe('server/models/Collective', () => {
       const nextGoal = await collective.getNextGoal();
       expect(nextGoal.type).to.equal('balance');
       expect(nextGoal.amount).to.equal(200000);
-      expect(nextGoal.progress).to.equal(0.48);
-      expect(nextGoal.percentage).to.equal('48%');
-      expect(nextGoal.missing.amount).to.equal(103500);
+      expect(nextGoal.progress).to.equal(0.56);
+      expect(nextGoal.percentage).to.equal('56%');
+      expect(nextGoal.missing.amount).to.equal(87500);
     });
 
     it('returns the next goal based on yearlBudget', async () => {
@@ -876,6 +986,7 @@ describe('server/models/Collective', () => {
   describe('third party accounts handles', () => {
     it('stores Github handle and strip first @ character', async () => {
       const collective = await Collective.create({
+        name: 'test',
         slug: 'my-collective',
         githubHandle: '@test',
       });
@@ -1057,7 +1168,7 @@ describe('server/models/Collective', () => {
       const user = await fakeUser({ id: 30 }, { id: 20, slug: 'pia' });
       const opencollective = await fakeHost({ id: 8686, slug: 'opencollective', CreatedByUserId: user.id });
       // Move Collectives ID auto increment pointer up, so we don't collide with the manually created id:1
-      await sequelize.query(`ALTER SEQUENCE "Collectives_id_seq" RESTART WITH 1453`);
+      await sequelize.query(`ALTER SEQUENCE "Groups_id_seq" RESTART WITH 1453`);
       await fakePayoutMethod({
         id: 2955,
         CollectiveId: opencollective.id,
@@ -1161,10 +1272,7 @@ describe('server/models/Collective', () => {
     });
 
     it('returns acurate metrics for requested month', async () => {
-      // We expect the value returned by getFxRate (fixer API), which is 1.1 in test environment
-      const usdToGbpFxRate = 1.1;
-
-      const expectedTotalMoneyManaged = 3000 - 600 + 5000 - 1000 + 100 + 100 + 81 + 1000 * usdToGbpFxRate;
+      const expectedTotalMoneyManaged = 3000 - 600 + 5000 - 1000 + 100 + 100 + 81 + 800;
 
       expect(metrics).to.deep.equal({
         hostFees: 1600,
@@ -1177,6 +1285,88 @@ describe('server/models/Collective', () => {
         hostFeeSharePercent: 0,
         settledHostFeeShare: 0,
         totalMoneyManaged: expectedTotalMoneyManaged,
+      });
+    });
+  });
+
+  describe('policies', () => {
+    let collective;
+    beforeEach(async () => {
+      collective = await fakeCollective({ isHostAccount: true });
+    });
+
+    it('should set policies', async () => {
+      await collective.setPolicies({ [POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE]: { enabled: true } });
+
+      expect(collective.data.policies).to.deep.equal({ [POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE]: { enabled: true } });
+    });
+
+    it('should fail setting policies if policy does not exists', async () => {
+      return expect(collective.setPolicies({ FAKE_POLICY: true })).to.eventually.be.rejected;
+    });
+  });
+
+  describe('location', () => {
+    it('validates latitude/longitude', async () => {
+      // Invalid
+      await expect(fakeCollective({ geoLocationLatLong: 42 })).to.be.rejected;
+      await expect(fakeCollective({ geoLocationLatLong: 'nope' })).to.be.rejected;
+      await expect(fakeCollective({ geoLocationLatLong: {} })).to.be.rejected;
+      await expect(fakeCollective({ geoLocationLatLong: { type: 'Point' } })).to.be.rejected;
+      await expect(fakeCollective({ geoLocationLatLong: { type: 'Point', coordinates: 42 } })).to.be.rejected;
+      await expect(fakeCollective({ geoLocationLatLong: { type: 'Point', coordinates: [55] } })).to.be.rejected;
+      await expect(fakeCollective({ geoLocationLatLong: { type: 'TOTO', coordinates: [55, -66] } })).to.be.rejected;
+
+      // Valid
+      await expect(fakeCollective({ geoLocationLatLong: null })).to.be.fulfilled;
+      await expect(fakeCollective({ geoLocationLatLong: { type: 'Point', coordinates: [55, -66] } })).to.be.fulfilled;
+    });
+  });
+
+  describe('features', () => {
+    let collective;
+    beforeEach(async () => {
+      collective = await fakeCollective();
+    });
+
+    it('should disable comaptible feature', async () => {
+      await collective.disableFeature(FEATURE.RECEIVE_FINANCIAL_CONTRIBUTIONS);
+      expect(collective.data.features).to.have.property(FEATURE.RECEIVE_FINANCIAL_CONTRIBUTIONS).equals(false);
+    });
+
+    it('should enable comaptible feature', async () => {
+      await collective.enableFeature(FEATURE.RECEIVE_FINANCIAL_CONTRIBUTIONS);
+      expect(collective.data.features).to.be.undefined;
+    });
+
+    it('should throw if feature is not supported', async () => {
+      return expect(collective.enableFeature('RECEIVE_POTATOES_FOR_THE_GIANT_RACLETTE')).to.eventually.be.rejected;
+    });
+  });
+
+  describe('settings', () => {
+    describe('custom thank you email message', () => {
+      it('sanitizes the HTML', async () => {
+        const collective = await fakeCollective({
+          settings: {
+            customEmailMessage:
+              '<div>Some content with an iframe <iframe></iframe> and an <img src="/test.jpg"></img></div>',
+          },
+        });
+
+        expect(collective.settings.customEmailMessage).to.equal(
+          '<div>Some content with an iframe  and an <img src="/test.jpg" /></div>',
+        );
+      });
+
+      it('checks the length ', async () => {
+        await expect(fakeCollective({ settings: { customEmailMessage: repeat('x', 600) } })).to.be.rejectedWith(
+          'Validation error: Custom "Thank you" email message should be less than 500 characters',
+        );
+      });
+
+      it('checks the length (ignoring the HTML)', async () => {
+        await expect(fakeCollective({ settings: { customEmailMessage: repeat('<div>x</div>', 499) } })).to.be.fulfilled;
       });
     });
   });

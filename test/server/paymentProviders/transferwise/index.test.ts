@@ -1,7 +1,6 @@
 import { expect } from 'chai';
-import { toNumber } from 'lodash';
 import moment from 'moment';
-import sinon from 'sinon';
+import { assert, createSandbox } from 'sinon';
 
 import cache from '../../../../server/lib/cache';
 import * as transferwiseLib from '../../../../server/lib/transferwise';
@@ -17,7 +16,7 @@ import {
 import * as utils from '../../../utils';
 
 describe('server/paymentProviders/transferwise/index', () => {
-  const sandbox = sinon.createSandbox();
+  const sandbox = createSandbox();
   const quote = {
     id: 1234,
     sourceCurrency: 'USD',
@@ -26,6 +25,7 @@ describe('server/paymentProviders/transferwise/index', () => {
     targetAmount: 90.44,
     rate: 0.9044,
     payOut: 'BANK_TRANSFER',
+    expirationTime: moment().add(1, 'hour').format(),
     paymentOptions: [
       {
         formattedEstimatedDelivery: 'by March 18th',
@@ -53,7 +53,6 @@ describe('server/paymentProviders/transferwise/index', () => {
     fundTransfer,
     getAccountRequirements,
     cacheSpy,
-    getBorderlessAccount,
     validateAccountRequirements,
     createBatchGroup,
     completeBatchGroup,
@@ -66,14 +65,6 @@ describe('server/paymentProviders/transferwise/index', () => {
   before(utils.resetTestDB);
   before(() => {
     createQuote = sandbox.stub(transferwiseLib, 'createQuote').resolves(quote);
-    getBorderlessAccount = sandbox.stub(transferwiseLib, 'getBorderlessAccount').resolves({
-      balances: [
-        {
-          currency: 'USD',
-          amount: { value: 100000 },
-        },
-      ],
-    });
     sandbox.stub(transferwiseLib, 'getTemporaryQuote').resolves(quote);
     sandbox.stub(transferwiseLib, 'getProfiles').resolves([
       {
@@ -182,6 +173,17 @@ describe('server/paymentProviders/transferwise/index', () => {
         .to.have.nested.property('targetAmount')
         .equals((expense.amount / 100) * quote.rate);
     });
+
+    it('should set expense.data.quote', async () => {
+      await expense.reload();
+      expect(expense).to.have.nested.property('data.quote');
+    });
+
+    it('should use existing quote if available', async () => {
+      createQuote.resetHistory();
+      await transferwise.quoteExpense(connectedAccount, payoutMethod, expense);
+      expect(createQuote.callCount).to.be.equal(0);
+    });
   });
 
   describe('payExpense', () => {
@@ -206,10 +208,6 @@ describe('server/paymentProviders/transferwise/index', () => {
       expect(data).to.have.nested.property('quote');
     });
 
-    it('should check for existing balance', () => {
-      expect(getBorderlessAccount.called).to.be.true;
-    });
-
     it('should create recipient account and update data.recipient', () => {
       expect(createRecipientAccount.called).to.be.true;
       expect(data).to.have.nested.property('recipient');
@@ -223,20 +221,6 @@ describe('server/paymentProviders/transferwise/index', () => {
     it('should fund transfer account and update data.fund', () => {
       expect(fundTransfer.called).to.be.true;
       expect(data).to.have.nested.property('fund');
-    });
-
-    it('should throw if balance is not enough to cover the transfer', async () => {
-      getBorderlessAccount.resolves({
-        balances: [
-          {
-            currency: 'USD',
-            amount: { value: 0 },
-          },
-        ],
-      });
-
-      const payExpensePromise = transferwise.payExpense(connectedAccount, payoutMethod, expense);
-      await expect(payExpensePromise).to.be.eventually.rejectedWith(Error, "You don't have enough funds");
     });
   });
 
@@ -262,29 +246,17 @@ describe('server/paymentProviders/transferwise/index', () => {
       createBatchGroup.resolves({ id: batchGroupId });
       getBatchGroup.resolves({ id: batchGroupId, version: 1, transferIds: [800], status: 'NEW' });
       createBatchGroupTransfer.resolves({ id: 800 });
-      getBorderlessAccount.resolves({
-        balances: [
-          {
-            currency: 'USD',
-            amount: { value: 100000 },
-          },
-        ],
-      });
       await transferwise.scheduleExpenseForPayment(expense);
     });
 
     it('creates a new batchGroup', () => {
-      expect(createBatchGroup.called).to.be.true;
-      const [token, , batchGroupOptions] = createBatchGroup.firstCall.args;
-
-      expect(token).to.equal(connectedAccount.token);
-      expect(batchGroupOptions.currency).to.equal(host.currnecy);
+      assert.calledOnceWithMatch(createBatchGroup, { id: connectedAccount.id }, { sourceCurrency: host.currency });
     });
 
     it('creates a transaction for the expense in the batchGroup ', () => {
-      const call = createBatchGroupTransfer.firstCall;
-      expect(toNumber(call.lastArg.details.reference)).to.equal(expense.id);
-      expect(call).to.have.nested.property('args[2]', batchGroupId);
+      assert.calledOnceWithMatch(createBatchGroupTransfer, { id: connectedAccount.id }, batchGroupId, {
+        details: { reference: expense.id.toString() },
+      });
     });
 
     it('reuses existing batchGroup if available', async () => {
@@ -303,9 +275,9 @@ describe('server/paymentProviders/transferwise/index', () => {
       newExpense.PayoutMethod = payoutMethod;
       await transferwise.scheduleExpenseForPayment(newExpense);
 
-      const call = createBatchGroupTransfer.secondCall;
-      expect(toNumber(call.lastArg.details.reference)).to.equal(newExpense.id);
-      expect(call).to.have.nested.property('args[2]', batchGroupId);
+      assert.calledWithMatch(createBatchGroupTransfer, { id: connectedAccount.id }, batchGroupId, {
+        details: { reference: newExpense.id.toString() },
+      });
     });
   });
 
@@ -345,10 +317,7 @@ describe('server/paymentProviders/transferwise/index', () => {
     });
 
     it('should cancel existing batchGroup', () => {
-      const { args } = cancelBatchGroup.getCall(0);
-      expect(args).to.have.property('0', connectedAccount.token);
-      expect(args).to.have.property('2', batchGroupId);
-      expect(args).to.have.property('3', 6);
+      assert.calledOnceWithMatch(cancelBatchGroup, { id: connectedAccount.id }, batchGroupId, 6);
     });
 
     it('should update status and data of all expenses in the same batch', () => {
@@ -400,24 +369,22 @@ describe('server/paymentProviders/transferwise/index', () => {
       createBatchGroup.resolves({ id: batchGroupId, version: 0, status: 'NEW' });
       getBatchGroup.resolves({ id: batchGroupId, version: 1, transferIds: [800], status: 'NEW' });
       createBatchGroupTransfer.resolves({ id: 800 });
-      completeBatchGroup.resolves({ id: batchGroupId, version: 2 });
-      getBorderlessAccount.resolves({
-        balances: [
-          {
-            currency: 'USD',
-            amount: { value: 100000 },
-          },
-        ],
-      });
+      completeBatchGroup.resolves({ id: batchGroupId, version: 2, status: 'COMPLETED' });
       response = await transferwise.payExpensesBatchGroup(host, [expense]);
     });
 
     it('should complete and fund batch group', () => {
-      expect(completeBatchGroup.firstCall).to.have.nested.property('args[2]', batchGroupId);
-      expect(completeBatchGroup.firstCall).to.have.nested.property('args[3]', 1);
+      assert.calledOnceWithMatch(completeBatchGroup, { id: connectedAccount.id }, batchGroupId, 1);
 
       expect(fundBatchGroup.firstCall).to.have.nested.property('args[2]', batchGroupId);
       expect(fundBatchGroup.firstCall).to.not.have.nested.property('args[3]');
+    });
+
+    it('should update existing batchGroup information on expenses', async () => {
+      await expense.reload();
+
+      expect(expense.data).to.have.nested.property('batchGroup.status', 'COMPLETED');
+      expect(expense.data).to.have.nested.property('batchGroup.version', 2);
     });
 
     it('should return OTT info if request fails', () => {
@@ -434,7 +401,10 @@ describe('server/paymentProviders/transferwise/index', () => {
     it('should fail if batchGroup status !== NEW', async () => {
       getBatchGroup.resolves({ id: batchGroupId, version: 1, transferIds: [], status: 'COMPLETED' });
       const call = transferwise.payExpensesBatchGroup(host, [expense]);
-      await expect(call).to.be.eventually.rejectedWith(Error, `Can not pay batch group, status !== NEW`);
+      await expect(call).to.be.eventually.rejectedWith(
+        Error,
+        `Can not pay batch group, existing batch group was already processed`,
+      );
     });
 
     it('should fail if batchGroup does not contain every expense', async () => {
@@ -505,26 +475,30 @@ describe('server/paymentProviders/transferwise/index', () => {
     });
 
     it('should check if cache already has the information', () => {
-      sinon.assert.calledWith(cacheSpy.get, `transferwise_required_bank_info_${host.id}_to_EUR`);
+      assert.calledWith(cacheSpy.get, `transferwise_required_bank_info_${host.id}_to_EUR`);
     });
 
     it('should cache the response', () => {
-      sinon.assert.calledWithMatch(cacheSpy.set, `transferwise_required_bank_info_${host.id}_to_EUR`);
+      assert.calledWithMatch(cacheSpy.set, `transferwise_required_bank_info_${host.id}_to_EUR`);
     });
 
     it('should request account requirements with transaction params', () => {
-      sinon.assert.calledWithMatch(getAccountRequirements, connectedAccount.token, {
-        sourceCurrency: host.currency,
-        targetCurrency: 'EUR',
-        sourceAmount: 20,
-      });
+      assert.calledWithMatch(
+        getAccountRequirements,
+        { id: connectedAccount.id },
+        {
+          sourceCurrency: host.currency,
+          targetCurrency: 'EUR',
+          sourceAmount: 20,
+        },
+      );
     });
 
     it('should validate account requirements if accountDetails is passed as argument', async () => {
       await transferwise.getRequiredBankInformation(host, 'EUR', { details: { bankAccount: 'fake' } });
-      sinon.assert.calledWithMatch(
+      assert.calledWithMatch(
         validateAccountRequirements,
-        connectedAccount.token,
+        { id: connectedAccount.id },
         {
           sourceCurrency: host.currency,
           targetCurrency: 'EUR',
@@ -542,11 +516,11 @@ describe('server/paymentProviders/transferwise/index', () => {
     });
 
     it('should check if cache already has the information', () => {
-      sinon.assert.calledWith(cacheSpy.get, `transferwise_available_currencies_${host.id}`);
+      assert.calledWith(cacheSpy.get, `transferwise_available_currencies_${host.id}`);
     });
 
     it('should cache the response', () => {
-      sinon.assert.calledWithMatch(cacheSpy.set, `transferwise_available_currencies_${host.id}`);
+      assert.calledWithMatch(cacheSpy.set, `transferwise_available_currencies_${host.id}`);
     });
 
     it('should return an array of available currencies for host', async () => {

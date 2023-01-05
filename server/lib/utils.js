@@ -492,6 +492,8 @@ export const cleanTags = tags => {
   const cleanTagsList = tags
     .filter(t => Boolean(t)) // Remove null values
     .map(t => t.trim()) // Trim tags
+    .map(t => t.replace(/^#+/g, '')) // Remove # prefixes
+    .map(t => t.trim()) // Trim again for empty tags with a # prefix
     .filter(t => t.length > 0); // Remove empty tags
 
   return cleanTagsList.length > 0 ? cleanTagsList : null;
@@ -553,3 +555,21 @@ export const getTokenFromRequestHeaders = req => {
 };
 
 export const sumByWhen = (vector, iteratee, predicate) => sumBy(filter(vector, predicate), iteratee);
+
+/**
+ * Returns the start and end dates as ISO 8601 strings.
+ */
+export const computeDatesAsISOStrings = (startDate, endDate) => {
+  startDate = startDate ? startDate.toISOString() : null;
+  endDate = endDate ? endDate.toISOString() : null;
+
+  return { startDate, endDate };
+};
+
+/**
+ * Returns string if given condition is truthy, otherwise returns empty string.
+ * @param {*} condition
+ * @param {String} string
+ * @returns string
+ */
+export const ifStr = (condition, expression) => (condition ? expression : '');

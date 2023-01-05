@@ -7,13 +7,16 @@ import config from 'config';
 import debug from 'debug';
 import { graphql } from 'graphql';
 import { cloneDeep, get, groupBy, isArray, values } from 'lodash';
+import markdownTable from 'markdown-table';
 import nock from 'nock';
+import speakeasy from 'speakeasy';
 
 import * as dbRestore from '../scripts/db_restore';
 import { loaders } from '../server/graphql/loaders';
 import schemaV1 from '../server/graphql/v1/schema';
 import schemaV2 from '../server/graphql/v2/schema';
 import cache from '../server/lib/cache';
+import { crypto } from '../server/lib/encryption';
 import logger from '../server/lib/logger';
 import * as libpayments from '../server/lib/payments';
 /* Server code being used */
@@ -42,12 +45,18 @@ export const data = path => {
 export const resetCaches = () => cache.clear();
 
 export const resetTestDB = async () => {
-  await sequelize.sync({ force: true }).catch(e => {
-    console.error("test/utils.js> Sequelize Error: Couldn't recreate the schema", e);
+  const resetFn = async () => {
+    await sequelize.truncate({ cascade: true, force: true, restartIdentity: true });
+    await sequelize.query(`REFRESH MATERIALIZED VIEW "TransactionBalances"`);
+    await sequelize.query(`REFRESH MATERIALIZED VIEW "CollectiveBalanceCheckpoint"`);
+  };
+
+  try {
+    await resetFn();
+  } catch (e) {
+    console.error(e);
     process.exit(1);
-  });
-  // That could be an alternative but this doesn't work
-  // await sequelize.truncate({ force: true, cascade: true });
+  }
 };
 
 export async function loadDB(dbname) {
@@ -60,12 +69,18 @@ export const stringify = json => {
     .replace(/\n|>>>>+/g, '');
 };
 
-export const makeRequest = (remoteUser, query) => {
+export const makeRequest = (remoteUser, query, jwtPayload, headers = {}, userToken) => {
   return {
     remoteUser,
+    jwtPayload,
     body: { query },
     loaders: loaders({ remoteUser }),
+    headers,
     header: () => null,
+    get: a => {
+      return headers[a];
+    },
+    userToken,
   };
 };
 
@@ -74,6 +89,11 @@ export const inspectSpy = (spy, argsCount) => {
     console.log(`>>> spy.args[${i}]`, { ...spy.args[i].slice(0, argsCount) });
   }
 };
+
+export const sleep = async (timeout = 200) =>
+  new Promise(resolve => {
+    setTimeout(resolve, timeout);
+  });
 
 /**
  * Wait for condition to be met
@@ -112,7 +132,7 @@ export const waitForCondition = (cond, options = { timeout: 10000, delay: 0 }) =
  * @param {object} remoteUser - The user to add to the context. It is not required.
  * @param {object} schema - Schema to which queries and mutations will be served against. Schema v1 by default.
  */
-export const graphqlQuery = async (query, variables, remoteUser, schema = schemaV1) => {
+export const graphqlQuery = async (query, variables, remoteUser, schema = schemaV1, jwtPayload, headers, userToken) => {
   const prepare = () => {
     if (remoteUser) {
       remoteUser.rolesByCollectiveId = null; // force refetching the roles
@@ -129,13 +149,13 @@ export const graphqlQuery = async (query, variables, remoteUser, schema = schema
   }
 
   return prepare().then(() =>
-    graphql(
+    graphql({
       schema,
-      query,
-      null, // rootValue
-      makeRequest(remoteUser, query), // context
-      variables,
-    ),
+      source: query,
+      rootValue: null,
+      contextValue: makeRequest(remoteUser, query, jwtPayload, headers, userToken),
+      variableValues: variables,
+    }),
   );
 };
 
@@ -145,8 +165,18 @@ export const graphqlQuery = async (query, variables, remoteUser, schema = schema
  * @param {object} variables - Variables to use in the queries and mutations. Example: { id: 1 }
  * @param {object} remoteUser - The user to add to the context. It is not required.
  */
-export async function graphqlQueryV2(query, variables, remoteUser = null) {
-  return graphqlQuery(query, variables, remoteUser, schemaV2);
+export async function graphqlQueryV2(query, variables, remoteUser = null, jwtPayload = null, headers = {}) {
+  return graphqlQuery(query, variables, remoteUser, schemaV2, jwtPayload, headers);
+}
+
+/**
+ * This function allows to test queries and mutations against schema v2.
+ * @param {string} query - Queries and Mutations to serve against the type schema. Example: `query Expense($id: Int!) { Expense(id: $id) { description } }`
+ * @param {object} variables - Variables to use in the queries and mutations. Example: { id: 1 }
+ * @param {object} userToken - The user token to add to the context.
+ */
+export async function oAuthGraphqlQueryV2(query, variables, userToken = {}, jwtPayload = null, headers = {}) {
+  return graphqlQuery(query, variables, userToken.user, schemaV2, jwtPayload, headers, userToken);
 }
 
 /** Helper for interpreting fee description in BDD tests
@@ -226,6 +256,7 @@ export function stubStripeCreate(sandbox, overloadDefaults) {
     charge: { id: 'ch_1AzPXHD8MNtzsDcgXpUhv4pm' },
     paymentIntent: { id: 'pi_1F82vtBYycQg1OMfS2Rctiau', status: 'requires_confirmation' },
     paymentIntentConfirmed: { charges: { data: [{ id: 'ch_1AzPXHD8MNtzsDcgXpUhv4pm' }] }, status: 'succeeded' },
+    paymentMethod: { id: 'pm_123456789012345678901234', type: 'card', card: { fingerprint: 'fingerprint' } },
     ...overloadDefaults,
   };
   /* Little helper function that returns the stub with a given
@@ -233,17 +264,12 @@ export function stubStripeCreate(sandbox, overloadDefaults) {
   const factory = name => async () => values[name];
   sandbox.stub(stripe.tokens, 'create').callsFake(factory('token'));
 
-  sandbox.stub(stripe.customers, 'create').callsFake(async ({ source }) => {
-    if (source.startsWith('tok_chargeDeclined')) {
-      throw new Error('Your card was declined.');
-    }
-
-    return values.customer;
-  });
-
+  sandbox.stub(stripe.customers, 'create').callsFake(factory('customer'));
   sandbox.stub(stripe.customers, 'retrieve').callsFake(factory('customer'));
   sandbox.stub(stripe.paymentIntents, 'create').callsFake(factory('paymentIntent'));
   sandbox.stub(stripe.paymentIntents, 'confirm').callsFake(factory('paymentIntentConfirmed'));
+  sandbox.stub(stripe.paymentMethods, 'create').callsFake(factory('paymentMethod'));
+  sandbox.stub(stripe.paymentMethods, 'attach').callsFake(factory('paymentMethod'));
 }
 
 export function stubStripeBalance(sandbox, amount, currency, applicationFee = 0, stripeFee = 0) {
@@ -300,7 +326,7 @@ export function traverse(obj, cb) {
   }
 }
 
-const prettifyTransactionsData = (transactions, columns) => {
+export const prettifyTransactionsData = (transactions, columns) => {
   // Alias some columns for a simpler output
   const TRANSACTION_KEY_ALIASES = {
     HostCollectiveId: 'Host',
@@ -309,6 +335,7 @@ const prettifyTransactionsData = (transactions, columns) => {
     settlementStatus: 'Settlement',
     TransactionGroup: 'Group',
     paymentProcessorFeeInHostCurrency: 'paymentFee',
+    platformFeeInHostCurrency: 'platformFee',
   };
 
   // Prettify values
@@ -360,8 +387,9 @@ export const nockFixerRates = ratesConfig => {
     .persist()
     .get(/.*/)
     .query(({ base, symbols }) => {
-      if (ratesConfig[base][symbols]) {
-        logger.debug(`Fixer: Returning mock value for ${base} -> ${symbols}: ${ratesConfig[base][symbols]}`);
+      const splitSymbols = symbols.split(',');
+      if (splitSymbols.every(symbol => Boolean(ratesConfig[base][symbol]))) {
+        logger.debug(`Fixer: Returning mock value for ${base} -> ${symbols}`);
         return true;
       } else {
         return false;
@@ -374,7 +402,10 @@ export const nockFixerRates = ratesConfig => {
         {
           base,
           date: '2021-06-01',
-          rates: { [symbols]: ratesConfig[base][symbols] },
+          rates: symbols.split(',').reduce((rates, symbol) => {
+            rates[symbol] = ratesConfig[base][symbol];
+            return rates;
+          }, {}),
         },
       ];
     });
@@ -426,6 +457,14 @@ export const preloadAssociationsForTransactions = async (transactions, columns) 
   });
 };
 
+export const printLedger = async (columns = ['type', 'amount', 'CollectiveId', 'kind']) => {
+  const allTransactions = await models.Transaction.findAll();
+  await preloadAssociationsForTransactions(allTransactions, columns);
+  const prettyTransactions = prettifyTransactionsData(allTransactions, columns);
+  const headers = Object.keys(prettyTransactions[0]);
+  console.log(markdownTable([headers, ...prettyTransactions.map(Object.values)]));
+};
+
 /**
  * Generate a snapshot using a markdown table, aliasing columns for a prettier output.
  * If associations (collective, host, ...etc) are loaded, their names will be used for the output.
@@ -449,4 +488,21 @@ export const snapshotLedger = async columns => {
   }
 
   snapshotTransactions(transactions, { columns: columns });
+};
+
+export const getApolloErrorCode = call => call.catch(e => e?.extensions?.code);
+
+export const generateValid2FAHeader = user => {
+  if (!user.twoFactorAuthToken) {
+    return null;
+  }
+
+  const decryptedToken = crypto.decrypt(user.twoFactorAuthToken).toString();
+  const twoFactorAuthenticatorCode = speakeasy.totp({
+    algorithm: 'SHA1',
+    encoding: 'base32',
+    secret: decryptedToken,
+  });
+
+  return `totp ${twoFactorAuthenticatorCode}`;
 };

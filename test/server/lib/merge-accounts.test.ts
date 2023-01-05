@@ -45,6 +45,7 @@ const addFakeDataToAccount = async (account): Promise<void> => {
     Faker.fakePayoutMethod({ CollectiveId: account.id }),
     Faker.fakePaypalProduct({ CollectiveId: account.id }),
     // TODO Faker.fakeRequiredLegalDocument({ HostCollectiveId: account.id }),
+    // TODO: Add Oauth authorization codes
     Faker.fakeTier({ CollectiveId: account.id }),
     Faker.fakeTransaction({ FromCollectiveId: account.id, CollectiveId: randomCollective.id }),
     Faker.fakeTransaction({ CollectiveId: account.id, FromCollectiveId: randomCollective.id }),
@@ -92,7 +93,7 @@ describe('server/lib/merge-accounts', () => {
 
   before(async function () {
     // This test can take some time to setup on local env
-    this.timeout(30000);
+    this.timeout(45000);
 
     await resetTestDB();
 

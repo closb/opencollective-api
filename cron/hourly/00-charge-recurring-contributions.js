@@ -7,12 +7,14 @@ import { ArgumentParser } from 'argparse';
 import { parse as json2csv } from 'json2csv';
 import PQueue from 'p-queue';
 
+import FEATURE from '../../server/constants/feature';
 import emailLib from '../../server/lib/email';
 import {
   groupProcessedOrders,
   ordersWithPendingCharges,
   processOrderWithSubscription,
 } from '../../server/lib/recurring-contributions';
+import { reportErrorToSentry } from '../../server/lib/sentry';
 import { parseToBoolean } from '../../server/lib/utils';
 import { sequelize } from '../../server/models';
 
@@ -60,11 +62,16 @@ async function run(options) {
 
   for (const order of orders) {
     queue.add(() =>
-      processOrderWithSubscription(order, options).then(csvEntry => {
-        if (csvEntry) {
-          data.push(csvEntry);
-        }
-      }),
+      processOrderWithSubscription(order, options)
+        .then(csvEntry => {
+          if (csvEntry) {
+            data.push(csvEntry);
+          }
+        })
+        .catch(err => {
+          console.log(`Error while processing order #${order.id} ${err.message}`);
+          reportErrorToSentry(err, { severity: 'fatal', tags: { feature: FEATURE.RECURRING_CONTRIBUTIONS } });
+        }),
     );
   }
 
@@ -92,7 +99,8 @@ async function run(options) {
         await emailReport(orders, groupProcessedOrders(data), attachments);
       }
     } catch (err) {
-      console.log(err);
+      console.log(`Error while generating report ${err.message}`);
+      reportErrorToSentry(err, { severity: 'fatal', tags: { feature: FEATURE.RECURRING_CONTRIBUTIONS } });
     }
 
     await sequelize.close();
@@ -140,7 +148,6 @@ async function emailReport(orders, data, attachments) {
 
   // Actual send
   return emailLib.sendMessage(REPORT_EMAIL, subject, '', {
-    bcc: ' ',
     text: result.join('\n'),
     attachments,
   });

@@ -4,12 +4,13 @@ import '../../server/env';
 import { ArgumentParser } from 'argparse';
 import { get, intersection } from 'lodash';
 
+import { activities } from '../../server/constants';
 import { MODERATION_CATEGORIES_ALIASES } from '../../server/constants/moderation-categories';
 import orderStatus from '../../server/constants/order_status';
 import { purgeCacheForCollective } from '../../server/lib/cache';
 import logger from '../../server/lib/logger';
-import { notifyAdminsOfCollective } from '../../server/lib/notifications';
 import * as libPayments from '../../server/lib/payments';
+import { reportErrorToSentry } from '../../server/lib/sentry';
 import models, { Op, sequelize } from '../../server/models';
 
 // Fetch all orders potentially affected: contributor flagged AND recipient setup rejection
@@ -189,15 +190,20 @@ async function run({ dryRun, limit, force } = {}) {
 
     if (shouldNotifyContributor) {
       const activity = {
-        type: 'contribution.rejected',
+        type: activities.CONTRIBUTION_REJECTED,
+        OrderId: order.id,
+        FromCollectiveId: fromCollective.id,
+        CollectiveId: collective.id,
+        HostCollectiveId: collective.approvedAt ? collective.HostCollectiveId : null,
         data: {
-          collective: { name: collective.name },
+          collective: collective.info,
+          fromCollective: fromCollective.info,
           rejectionReason: `${collective.name} banned some specific categories of contributors and there was a match with your profile.`,
         },
       };
       logger.info(`  - Notifying admins of ${fromCollective.slug}`);
       if (!dryRun) {
-        await notifyAdminsOfCollective(fromCollective.id, activity);
+        await models.Activity.create(activity);
       }
     }
   }
@@ -241,6 +247,7 @@ if (require.main === module) {
     })
     .catch(e => {
       console.error(e);
+      reportErrorToSentry(e);
       process.exit(1);
     });
 }

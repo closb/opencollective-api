@@ -1,15 +1,13 @@
 import { expect } from 'chai';
 import gql from 'fake-tag';
-import sinon from 'sinon';
+import { createSandbox, stub } from 'sinon';
 
 import roles from '../../../../server/constants/roles';
 import { TransactionKind } from '../../../../server/constants/transaction-kind';
 import * as libcurrency from '../../../../server/lib/currency';
 import models from '../../../../server/models';
 import paypalAdaptive from '../../../../server/paymentProviders/paypal/adaptiveGateway';
-import dataMocks from '../../../mocks/data';
 import paypalMock from '../../../mocks/paypal';
-import { randEmail } from '../../../stores';
 import * as utils from '../../../utils';
 
 let host, admin, user, collective, paypalPaymentMethod;
@@ -113,7 +111,7 @@ describe('server/graphql/v1/paymentMethods', () => {
     const fxrate = 1.1654; // 1 EUR = 1.1654 USD
 
     beforeEach(() => {
-      sandbox = sinon.createSandbox();
+      sandbox = createSandbox();
       sandbox.stub(libcurrency, 'getFxRate').callsFake(() => Promise.resolve(fxrate));
       return models.PaymentMethod.findOne({
         where: {
@@ -131,6 +129,7 @@ describe('server/graphql/v1/paymentMethods', () => {
           paymentMethod: {
             uuid: pm.uuid,
           },
+          hostFeePercent: 0,
         };
       });
     });
@@ -323,7 +322,7 @@ describe('server/graphql/v1/paymentMethods', () => {
     let preapprovalDetailsStub = null;
 
     before(() => {
-      preapprovalDetailsStub = sinon.stub(paypalAdaptive, 'preapprovalDetails').callsFake(() => {
+      preapprovalDetailsStub = stub(paypalAdaptive, 'preapprovalDetails').callsFake(() => {
         return Promise.resolve({
           ...paypalMock.adaptive.preapprovalDetails.completed,
           curPaymentsAmount: '12.50',
@@ -363,62 +362,6 @@ describe('server/graphql/v1/paymentMethods', () => {
       const paymentMethod = result.data.Collective.paymentMethods.find(pm => pm.service.toUpperCase() === 'PAYPAL');
       expect(preapprovalDetailsStub.callCount).to.equal(1);
       expect(paymentMethod.balance).to.equal(198750); // $2000 - $12.50
-    });
-  });
-});
-
-describe('server/graphql/v1/paymentMethods/CRUD', () => {
-  // Queries
-  const createCreditCardMutation = gql`
-    mutation CreateCreditCard(
-      $CollectiveId: Int!
-      $name: String!
-      $token: String!
-      $data: StripeCreditCardDataInputType!
-      $monthlyLimitPerMember: Int
-    ) {
-      createCreditCard(
-        CollectiveId: $CollectiveId
-        name: $name
-        token: $token
-        data: $data
-        monthlyLimitPerMember: $monthlyLimitPerMember
-      ) {
-        id
-      }
-    }
-  `;
-
-  // Test variables
-  let user = null;
-  let externalUser = null;
-
-  // Test preparation
-  before(async () => {
-    user = await models.User.createUserWithCollective({ email: randEmail() });
-    externalUser = await models.User.createUserWithCollective({ email: randEmail() });
-  });
-
-  // Test begins
-  describe('Add', () => {
-    it('Must be authenticated', async () => {
-      const result = await utils.graphqlQuery(
-        createCreditCardMutation,
-        { ...dataMocks.validCreditCard, CollectiveId: user.CollectiveId },
-        null,
-      );
-
-      expect(result.errors[0].message).to.equal('You need to be logged in to create this payment method.');
-    });
-
-    it('Needs to be an admin', async () => {
-      const result = await utils.graphqlQuery(
-        createCreditCardMutation,
-        { ...dataMocks.validCreditCard, CollectiveId: user.CollectiveId },
-        externalUser,
-      );
-
-      expect(result.errors[0].message).to.equal('You must be an admin of this Collective.');
     });
   });
 });

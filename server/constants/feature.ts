@@ -1,4 +1,6 @@
 enum FEATURE {
+  /** Wildcard feature used to freeze and unfreeze collectives */
+  ALL = 'ALL',
   /** Whether people can financially contribute to this initiative */
   RECEIVE_FINANCIAL_CONTRIBUTIONS = 'RECEIVE_FINANCIAL_CONTRIBUTIONS',
   /** Whether this profile can make recurring contributions */
@@ -13,6 +15,8 @@ enum FEATURE {
   USE_EXPENSES = 'USE_EXPENSES',
   /** Whether this profile can receive expenses */
   RECEIVE_EXPENSES = 'RECEIVE_EXPENSES',
+  /** Whether this account can use multi-currency expenses */
+  MULTI_CURRENCY_EXPENSES = 'MULTI_CURRENCY_EXPENSES',
   /** Whether this profile can receive host applications */
   RECEIVE_HOST_APPLICATIONS = 'RECEIVE_HOST_APPLICATIONS',
   /** Whether this profile can create "goals" (displayed on the collective page) */
@@ -60,12 +64,17 @@ enum FEATURE {
   CONNECTED_ACCOUNTS = 'CONNECTED_ACCOUNTS',
   /** Whether this profile can receive donations using AliPay */
   ALIPAY = 'ALIPAY',
+  /** Wheter this profile accepts SEPA or ACH payments through Stripe */
+  STRIPE_PAYMENT_INTENT = 'STRIPE_PAYMENT_INTENT',
 
   /** Whether an account can add and use payment methods */
   USE_PAYMENT_METHODS = 'USE_PAYMENT_METHODS',
 
   /** Whether an account can emit gift cards */
   EMIT_GIFT_CARDS = 'EMIT_GIFT_CARDS',
+
+  /** Whether an account tweak email notifications or not */
+  EMAIL_NOTIFICATIONS_PANEL = 'EMAIL_NOTIFICATIONS_PANEL',
 
   /** Virtual Cards */
   // Whether this profile can assign virtual cards

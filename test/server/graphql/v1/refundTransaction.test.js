@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import gql from 'fake-tag';
 import nock from 'nock';
-import sinon from 'sinon';
+import { stub } from 'sinon';
 
 import { ZERO_DECIMAL_CURRENCIES } from '../../../../server/constants/currencies';
 import * as constants from '../../../../server/constants/transactions';
@@ -19,6 +19,23 @@ const refundTransactionMutation = gql`
     }
   }
 `;
+
+const snapshotTransactionsForRefund = async transactions => {
+  const columns = [
+    'type',
+    'kind',
+    'isRefund',
+    'CollectiveId',
+    'FromCollectiveId',
+    'amount',
+    'paymentProcessorFeeInHostCurrency',
+    'platformFeeInHostCurrency',
+    'netAmountInCollectiveCurrency',
+  ];
+
+  await utils.preloadAssociationsForTransactions(transactions, columns);
+  utils.snapshotTransactions(transactions, { columns });
+};
 
 /**
  * Handles the zero-decimal currencies for Stripe testing; https://stripe.com/docs/currencies#zero-decimal
@@ -179,12 +196,6 @@ describe('server/graphql/v1/refundTransaction', () => {
   });
 
   describe('Save CreatedByUserId', () => {
-    let userStub;
-    beforeEach(() => {
-      userStub = sinon.stub(models.User.prototype, 'isRoot').callsFake(() => true);
-    });
-    afterEach(() => userStub.restore());
-
     // eslint-disable-next-line camelcase
     beforeEach(() => initStripeNock({ amount: -5000, fee: 0, fee_details: [], net: -5000 }));
 
@@ -199,7 +210,9 @@ describe('server/graphql/v1/refundTransaction', () => {
       const anotherUser = await models.User.createUserWithCollective(utils.data('user3'));
 
       // When a refunded attempt happens from the above user
+      const userStub = stub(anotherUser, 'isRoot').returns(true);
       const result = await utils.graphqlQuery(refundTransactionMutation, { id: transaction.id }, anotherUser);
+      userStub.restore();
 
       // Then there should be no errors
       if (result.errors) {
@@ -210,6 +223,7 @@ describe('server/graphql/v1/refundTransaction', () => {
       // retrieved.
       const [tr1, tr2, tr3, tr4] = await models.Transaction.findAll({
         where: { OrderId: transaction.OrderId, kind: 'CONTRIBUTION' },
+        order: [['id', 'ASC']],
       });
 
       // And then the first two transactions (related to the order)
@@ -230,12 +244,6 @@ describe('server/graphql/v1/refundTransaction', () => {
    * complete but we really don't use the other fields retrieved from
    * Stripe. */
   describe('Stripe Transaction - for hosts created before September 17th 2017', () => {
-    let userStub;
-    beforeEach(() => {
-      userStub = sinon.stub(models.User.prototype, 'isRoot').callsFake(() => true);
-    });
-    afterEach(() => userStub.restore());
-
     beforeEach(() =>
       initStripeNock({
         amount: -5000,
@@ -252,6 +260,9 @@ describe('server/graphql/v1/refundTransaction', () => {
       // paymentMethod, an order and a transaction
       const { user, collective, host, transaction } = await setupTestObjects();
 
+      // Balance pre-refund
+      expect(await collective.getBalance()).to.eq(4075);
+
       // When the above transaction is refunded
       const result = await utils.graphqlQuery(refundTransactionMutation, { id: transaction.id }, host);
 
@@ -267,16 +278,21 @@ describe('server/graphql/v1/refundTransaction', () => {
         where: { OrderId: transaction.OrderId },
       });
 
+      // Snapshot
+      await snapshotTransactionsForRefund(allTransactions);
+
+      // Collective balance should go back to 0
+      expect(await collective.getBalance()).to.eq(0);
+
       // And two new transactions should be created in the
-      // database.  This only makes sense in an empty database. For
+      // database. This only makes sense in an empty database. For
       // order with subscriptions we'd probably find more than 4
       expect(allTransactions.length).to.equal(10);
-
-      const allContributions = allTransactions.filter(t => t.kind === 'CONTRIBUTION');
 
       // And then the transaction created for the refund operation
       // should decrement all the fees in the CREDIT from collective
       // to user.
+      const allContributions = allTransactions.filter(t => t.kind === 'CONTRIBUTION');
       const [tr1, tr2, tr3, tr4] = allContributions;
       const refunds = allTransactions.filter(t => t.isRefund);
       const processorFeeRefund = refunds.find(t => t.kind === 'PAYMENT_PROCESSOR_COVER' && t.type === 'CREDIT');
@@ -315,7 +331,7 @@ describe('server/graphql/v1/refundTransaction', () => {
       expect(tr3.paymentProcessorFeeInHostCurrency).to.equal(0);
       expect(tr3.amount).to.equal(-5000);
       expect(tr3.amountInHostCurrency).to.equal(-5000);
-      expect(tr3.netAmountInCollectiveCurrency).to.equal(-5000);
+      expect(tr3.netAmountInCollectiveCurrency).to.equal(-4750);
       expect(tr3.RefundTransactionId).to.equal(tr2.id);
       expect(processorFeeRefund).to.exist;
       expect(processorFeeRefund.amount).to.eq(175);
@@ -331,8 +347,8 @@ describe('server/graphql/v1/refundTransaction', () => {
       expect(tr4.hostFeeInHostCurrency).to.equal(0);
       expect(tr4.paymentProcessorFeeInHostCurrency).to.equal(0);
       expect(tr4.netAmountInCollectiveCurrency).to.equal(5000);
-      expect(tr4.amount).to.equal(5000);
-      expect(tr4.amountInHostCurrency).to.equal(5000);
+      expect(tr4.amount).to.equal(4750);
+      expect(tr4.amountInHostCurrency).to.equal(4750);
       expect(tr4.RefundTransactionId).to.equal(tr1.id);
     });
   }); /* describe("Stripe Transaction - for hosts created before September 17th 2017") */
@@ -343,12 +359,6 @@ describe('server/graphql/v1/refundTransaction', () => {
    * complete but we really don't use the other fields retrieved from
    * Stripe. */
   describe('Stripe Transaction - for hosts created after September 17th 2017', () => {
-    let userStub;
-    beforeEach(() => {
-      userStub = sinon.stub(models.User.prototype, 'isRoot').callsFake(() => true);
-    });
-    afterEach(() => userStub.restore());
-
     // eslint-disable-next-line camelcase
     beforeEach(() => initStripeNock({ amount: -5000, fee: 0, fee_details: [], net: -5000 }));
 
@@ -371,7 +381,11 @@ describe('server/graphql/v1/refundTransaction', () => {
       // retrieved.
       const allTransactions = await models.Transaction.findAll({
         where: { OrderId: transaction.OrderId },
+        order: [['id', 'ASC']],
       });
+
+      // Snapshot
+      await snapshotTransactionsForRefund(allTransactions);
 
       // And two new transactions should be created in the
       // database.  This only makes sense in an empty database. For
@@ -419,7 +433,7 @@ describe('server/graphql/v1/refundTransaction', () => {
       expect(tr3.paymentProcessorFeeInHostCurrency).to.equal(0);
       expect(tr3.amount).to.equal(-5000);
       expect(tr3.amountInHostCurrency).to.equal(-5000);
-      expect(tr3.netAmountInCollectiveCurrency).to.equal(-5000);
+      expect(tr3.netAmountInCollectiveCurrency).to.equal(-4750);
       expect(tr3.RefundTransactionId).to.equal(tr2.id);
 
       // 4. Refund User Ledger
@@ -429,8 +443,8 @@ describe('server/graphql/v1/refundTransaction', () => {
       expect(tr4.platformFeeInHostCurrency).to.equal(250);
       expect(tr4.hostFeeInHostCurrency).to.equal(0);
       expect(tr4.paymentProcessorFeeInHostCurrency).to.equal(0);
-      expect(tr4.amount).to.equal(5000);
-      expect(tr4.amountInHostCurrency).to.equal(5000);
+      expect(tr4.amount).to.equal(4750);
+      expect(tr4.amountInHostCurrency).to.equal(4750);
       expect(tr4.netAmountInCollectiveCurrency).to.equal(5000);
       expect(tr4.RefundTransactionId).to.equal(tr1.id);
     }

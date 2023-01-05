@@ -2,7 +2,9 @@ import { GraphQLBoolean, GraphQLInt, GraphQLList, GraphQLNonNull, GraphQLString 
 import { cloneDeep, invert, isNil } from 'lodash';
 
 import { HOST_FEE_STRUCTURE } from '../../../constants/host-fee-structure';
+import { buildSearchConditions } from '../../../lib/search';
 import models, { Op, sequelize } from '../../../models';
+import { checkScope } from '../../common/scope-check';
 import { ValidationFailed } from '../../errors';
 import { MemberOfCollection } from '../collection/MemberCollection';
 import { AccountType, AccountTypeToModelMapping } from '../enum/AccountType';
@@ -83,7 +85,7 @@ export const IsMemberOfFields = {
         const account = await fetchAccountWithReference(args.account, { loaders: req.loaders });
         where.CollectiveId = account.id;
       }
-      if (!args.includeIncognito || !req.remoteUser?.isAdmin(collective.id)) {
+      if (!args.includeIncognito || !req.remoteUser?.isAdmin(collective.id) || !checkScope(req, 'incognito')) {
         collectiveConditions.isIncognito = false;
       }
       if (!isNil(args.isHostAccount)) {
@@ -100,22 +102,17 @@ export const IsMemberOfFields = {
         }
       }
 
-      if (args.searchTerm) {
-        const sanitizedTerm = args.searchTerm.replace(/(_|%|\\)/g, '\\$1');
-        const ilikeQuery = `%${sanitizedTerm}%`;
+      const searchTermConditions = buildSearchConditions(args.searchTerm, {
+        idFields: ['id', '$collective.id$'],
+        slugFields: ['$collective.slug$'],
+        textFields: ['$collective.name$', '$collective.description$', 'description', 'role'],
+        stringArrayFields: ['$collective.tags$'],
+        stringArrayTransformFn: str => str.toLowerCase(), // collective tags are stored lowercase
+        castStringArraysToVarchar: true,
+      });
 
-        where[Op.or] = [
-          { description: { [Op.iLike]: ilikeQuery } },
-          { role: { [Op.iLike]: ilikeQuery } },
-          { '$collective.slug$': { [Op.iLike]: ilikeQuery } },
-          { '$collective.name$': { [Op.iLike]: ilikeQuery } },
-          { '$collective.description$': { [Op.iLike]: ilikeQuery } },
-          { '$collective.tags$': { [Op.overlap]: sequelize.cast([args.searchTerm.toLowerCase()], 'varchar[]') } },
-        ];
-
-        if (!isNaN(args.searchTerm)) {
-          where[Op.or].push({ '$collective.id$': args.searchTerm });
-        }
+      if (searchTermConditions.length) {
+        where[Op.or] = searchTermConditions;
       }
 
       const order = [];

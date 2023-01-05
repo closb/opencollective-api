@@ -4,6 +4,8 @@ import { GraphQLBoolean, GraphQLNonNull, GraphQLObjectType, GraphQLString } from
 import * as ExpenseLib from '../../common/expenses';
 import { getIdEncodeResolver, IDENTIFIER_TYPES } from '../identifiers';
 
+import { parsePermissionFromEvaluator, Permission } from './Permission';
+
 const ExpensePermissions = new GraphQLObjectType({
   name: 'ExpensePermissions',
   description: 'Fields for the user permissions on an expense',
@@ -83,6 +85,13 @@ const ExpensePermissions = new GraphQLObjectType({
         return ExpenseLib.canMarkAsUnpaid(req, expense);
       },
     },
+    canMarkAsIncomplete: {
+      type: new GraphQLNonNull(GraphQLBoolean),
+      description: 'Whether the current user can mark this expense as incomplete',
+      async resolve(expense, _, req: express.Request): Promise<boolean> {
+        return ExpenseLib.canMarkAsIncomplete(req, expense);
+      },
+    },
     canComment: {
       type: new GraphQLNonNull(GraphQLBoolean),
       description: 'Whether the current user can comment and see comments for this expense',
@@ -96,6 +105,55 @@ const ExpensePermissions = new GraphQLObjectType({
       async resolve(expense, _, req: express.Request): Promise<boolean> {
         return ExpenseLib.canUnschedulePayment(req, expense);
       },
+    },
+    // Extended permissions
+    edit: {
+      type: new GraphQLNonNull(Permission),
+      resolve: parsePermissionFromEvaluator(ExpenseLib.canEditExpense),
+    },
+    editTags: {
+      type: new GraphQLNonNull(Permission),
+      resolve: parsePermissionFromEvaluator(ExpenseLib.canEditExpenseTags),
+    },
+    delete: {
+      type: new GraphQLNonNull(Permission),
+      resolve: parsePermissionFromEvaluator(ExpenseLib.canDeleteExpense),
+    },
+    seeInvoiceInfo: {
+      type: new GraphQLNonNull(Permission),
+      resolve: parsePermissionFromEvaluator(ExpenseLib.canSeeExpenseInvoiceInfo),
+    },
+    pay: {
+      type: new GraphQLNonNull(Permission),
+      resolve: parsePermissionFromEvaluator(ExpenseLib.canPayExpense),
+    },
+    approve: {
+      type: new GraphQLNonNull(Permission),
+      resolve: parsePermissionFromEvaluator(ExpenseLib.canApprove),
+    },
+    unapprove: {
+      type: new GraphQLNonNull(Permission),
+      resolve: parsePermissionFromEvaluator(ExpenseLib.canUnapprove),
+    },
+    reject: {
+      type: new GraphQLNonNull(Permission),
+      resolve: parsePermissionFromEvaluator(ExpenseLib.canReject),
+    },
+    markAsSpam: {
+      type: new GraphQLNonNull(Permission),
+      resolve: parsePermissionFromEvaluator(ExpenseLib.canMarkAsSpam),
+    },
+    markAsUnpaid: {
+      type: new GraphQLNonNull(Permission),
+      resolve: parsePermissionFromEvaluator(ExpenseLib.canMarkAsUnpaid),
+    },
+    comment: {
+      type: new GraphQLNonNull(Permission),
+      resolve: parsePermissionFromEvaluator(ExpenseLib.canComment),
+    },
+    unschedulePayment: {
+      type: new GraphQLNonNull(Permission),
+      resolve: parsePermissionFromEvaluator(ExpenseLib.canUnschedulePayment),
     },
   }),
 });

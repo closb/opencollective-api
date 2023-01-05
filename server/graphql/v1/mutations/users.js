@@ -2,6 +2,7 @@ import crypto from 'crypto';
 
 import config from 'config';
 
+import { activities } from '../../../constants';
 import cache from '../../../lib/cache';
 import emailLib from '../../../lib/email';
 import models from '../../../models';
@@ -57,11 +58,21 @@ export const updateUserEmail = async (user, newEmail) => {
     user: {
       ...user.info,
       emailConfirmationToken: user.emailConfirmationToken,
+      emailWaitingForValidation: user.emailWaitingForValidation,
     },
   };
 
   // Send the email and return updated user
-  await emailLib.send('user.changeEmail', user.emailWaitingForValidation, data);
+  await emailLib.send(activities.USER_CHANGE_EMAIL, data.user.emailWaitingForValidation, data, {
+    sendEvenIfNotProduction: true,
+  });
+  await models.Activity.create({
+    type: activities.USER_CHANGE_EMAIL,
+    UserId: user.id,
+    CollectiveId: user.CollectiveId,
+    FromCollectiveId: user.CollectiveId,
+    data: { notify: false },
+  });
 
   // Update the cache
   cache.set(countCacheKey, existingCount + 1, oneHourInSeconds);
@@ -81,7 +92,9 @@ export const confirmUserEmail = async emailConfirmationToken => {
   const user = await models.User.findOne({ where: { emailConfirmationToken } });
 
   if (!user) {
-    throw new InvalidToken('Invalid email confirmation token', { internalData: { emailConfirmationToken } });
+    throw new InvalidToken('Invalid email confirmation token', 'INVALID_TOKEN', {
+      internalData: { emailConfirmationToken },
+    });
   }
 
   return user.update({

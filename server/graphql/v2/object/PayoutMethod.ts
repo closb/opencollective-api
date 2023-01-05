@@ -1,8 +1,9 @@
 import express from 'express';
 import { GraphQLBoolean, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
-import GraphQLJSON from 'graphql-type-json';
+import { GraphQLJSON } from 'graphql-type-json';
 
 import { getContextPermission, PERMISSION_TYPE } from '../../common/context-permissions';
+import { checkScope } from '../../common/scope-check';
 import PayoutMethodType from '../enum/PayoutMethodType';
 import { getIdEncodeResolver, IDENTIFIER_TYPES } from '../identifiers';
 
@@ -23,9 +24,13 @@ const PayoutMethod = new GraphQLObjectType({
       type: GraphQLString,
       description: 'A friendly name for users to easily find their payout methods',
       resolve: (payoutMethod, _, req: express.Request): string => {
-        // Only collective admins can see the name of a payout method
-        if (req.remoteUser?.isAdmin(payoutMethod.CollectiveId)) {
-          return payoutMethod.name;
+        if (
+          req.remoteUser?.isAdmin(payoutMethod.CollectiveId) ||
+          getContextPermission(req, PERMISSION_TYPE.SEE_PAYOUT_METHOD_DETAILS, payoutMethod.id)
+        ) {
+          if (checkScope(req, 'expenses')) {
+            return payoutMethod.name;
+          }
         }
       },
     },
@@ -33,9 +38,13 @@ const PayoutMethod = new GraphQLObjectType({
       type: GraphQLBoolean,
       description: 'Whether this payout method has been saved to be used for future payouts',
       resolve: (payoutMethod, _, req: express.Request): boolean => {
-        // Only collective admins can see whether a payout method is saved or not
-        if (req.remoteUser?.isAdmin(payoutMethod.CollectiveId)) {
-          return payoutMethod.isSaved;
+        if (
+          req.remoteUser?.isAdmin(payoutMethod.CollectiveId) ||
+          getContextPermission(req, PERMISSION_TYPE.SEE_PAYOUT_METHOD_DETAILS, payoutMethod.id)
+        ) {
+          if (checkScope(req, 'expenses')) {
+            return payoutMethod.isSaved;
+          }
         }
       },
     },
@@ -45,9 +54,11 @@ const PayoutMethod = new GraphQLObjectType({
       resolve: (payoutMethod, _, req: express.Request): Record<string, unknown> => {
         if (
           req.remoteUser?.isAdmin(payoutMethod.CollectiveId) ||
-          getContextPermission(req, PERMISSION_TYPE.SEE_PAYOUT_METHOD_DATA, payoutMethod.id)
+          getContextPermission(req, PERMISSION_TYPE.SEE_PAYOUT_METHOD_DETAILS, payoutMethod.id)
         ) {
-          return payoutMethod.data;
+          if (checkScope(req, 'expenses')) {
+            return payoutMethod.data;
+          }
         }
       },
     },

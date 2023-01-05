@@ -2,45 +2,29 @@ import DataLoader from 'dataloader';
 import express from 'express';
 import { set } from 'lodash';
 
+import { ReactionEmoji } from '../../constants/reaction-emoji';
 import models, { Op, sequelize } from '../../models';
+import EmojiReaction from '../../models/EmojiReaction';
 
-import { createDataLoaderWithOptions, sortResults } from './helpers';
+import { sortResults } from './helpers';
 export default {
-  findAllByAttribute:
-    (_: express.Request, cache) =>
-    (attribute: string): DataLoader<string | number, typeof models.Comment> => {
-      return createDataLoaderWithOptions(
-        (values, attribute) => {
-          return models.Comment.findAll({
-            where: {
-              [attribute]: { [Op.in]: values },
-            },
-            order: [['createdAt', 'DESC']],
-          }).then(results => sortResults(values, results, attribute, []));
-        },
-        cache,
-        attribute,
-        'comments',
-      );
-    },
   countByExpenseId: (): DataLoader<number, number> =>
     new DataLoader(ExpenseIds =>
       models.Comment.count({
         attributes: ['ExpenseId'],
         where: { ExpenseId: { [Op.in]: ExpenseIds } },
         group: ['ExpenseId'],
-      })
-        .then(results => sortResults(ExpenseIds, results, 'ExpenseId', { count: 0 }))
-        .map(result => result.count),
+      }).then(results =>
+        sortResults(ExpenseIds, results, 'ExpenseId', { count: 0 }).map(result => <number>result.count),
+      ),
     ),
-  reactionsByCommentId: (): DataLoader<number, typeof models.EmojiReaction> => {
+  reactionsByCommentId: (): DataLoader<number, EmojiReaction> => {
     return new DataLoader(async commentIds => {
-      const reactionsList = await models.EmojiReaction.count({
+      type ReactionsListQueryResult = [{ CommentId: number; emoji: ReactionEmoji; count: number }];
+      const reactionsList = (await models.EmojiReaction.count({
         where: { CommentId: { [Op.in]: commentIds } },
         group: ['CommentId', 'emoji'],
-        order: [['emoji', 'ASC']],
-        raw: true,
-      });
+      })) as unknown as ReactionsListQueryResult;
 
       const reactionsMap = {};
       reactionsList.forEach(({ CommentId, emoji, count }) => {
@@ -56,12 +40,13 @@ export default {
         return commentIds.map(() => []);
       }
 
-      const reactionsList = await models.EmojiReaction.findAll({
+      type ReactionsListQueryResult = [{ CommentId: number; emojis: ReactionEmoji[] }];
+      const reactionsList = (await models.EmojiReaction.findAll({
         attributes: ['CommentId', [sequelize.fn('ARRAY_AGG', sequelize.col('emoji')), 'emojis']],
         where: { FromCollectiveId: req.remoteUser.CollectiveId, CommentId: { [Op.in]: commentIds } },
         group: ['CommentId'],
         raw: true,
-      });
+      })) as unknown as ReactionsListQueryResult;
 
       const reactionsMap = {};
       reactionsList.forEach(reaction => {

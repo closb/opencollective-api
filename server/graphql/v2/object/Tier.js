@@ -1,11 +1,12 @@
-import { GraphQLInt, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
-import { GraphQLDateTime } from 'graphql-iso-date';
-import GraphQLJSON from 'graphql-type-json';
+import { GraphQLBoolean, GraphQLInt, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
+import { GraphQLDateTime } from 'graphql-scalars';
+import { GraphQLJSON } from 'graphql-type-json';
 
 import models, { Op } from '../../../models';
 import { OrderCollection } from '../collection/OrderCollection';
-import { ContributionFrequency, OrderStatus, TierAmountType, TierInterval, TierType } from '../enum';
-import { idEncode } from '../identifiers';
+import { OrderStatus, TierAmountType, TierInterval, TierType } from '../enum';
+import { getTierFrequencyFromInterval, TierFrequency } from '../enum/TierFrequency';
+import { idEncode, IDENTIFIER_TYPES } from '../identifiers';
 
 import { Amount } from './Amount';
 
@@ -17,7 +18,7 @@ export const Tier = new GraphQLObjectType({
       id: {
         type: new GraphQLNonNull(GraphQLString),
         resolve(tier) {
-          return idEncode(tier.id, 'tier');
+          return idEncode(tier.id, IDENTIFIER_TYPES.TIER);
         },
       },
       legacyId: {
@@ -31,9 +32,6 @@ export const Tier = new GraphQLObjectType({
       },
       name: {
         type: GraphQLString,
-        resolve(tier) {
-          return tier.slug;
-        },
       },
       description: {
         type: GraphQLString,
@@ -66,6 +64,15 @@ export const Tier = new GraphQLObjectType({
           return { value: tier.amount, currency: tier.currency };
         },
       },
+      button: {
+        type: GraphQLString,
+      },
+      goal: {
+        type: new GraphQLNonNull(Amount),
+        resolve(tier) {
+          return { value: tier.goal, currency: tier.currency };
+        },
+      },
       type: {
         type: new GraphQLNonNull(TierType),
       },
@@ -74,7 +81,10 @@ export const Tier = new GraphQLObjectType({
         deprecationReason: '2020-08-24: Please use "frequency"',
       },
       frequency: {
-        type: ContributionFrequency,
+        type: new GraphQLNonNull(TierFrequency),
+        resolve(tier) {
+          return getTierFrequencyFromInterval(tier.interval);
+        },
       },
       presets: {
         type: new GraphQLList(GraphQLInt),
@@ -102,11 +112,20 @@ export const Tier = new GraphQLObjectType({
       minimumAmount: {
         type: new GraphQLNonNull(Amount),
         resolve(tier) {
-          return { value: tier.minimumAmount };
+          return { value: tier.minimumAmount, currency: tier.currency };
         },
       },
       endsAt: {
         type: GraphQLDateTime,
+      },
+      invoiceTemplate: {
+        type: GraphQLString,
+        async resolve(tier) {
+          return tier.data?.invoiceTemplate;
+        },
+      },
+      useStandalonePage: {
+        type: GraphQLBoolean,
       },
     };
   },

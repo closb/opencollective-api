@@ -4,11 +4,11 @@ import moment from 'moment';
 import sanitize from 'sanitize-html';
 import { v4 as uuid } from 'uuid';
 
+import { activities } from '../../constants';
 import { PAYMENT_METHOD_SERVICE, PAYMENT_METHOD_TYPE } from '../../constants/paymentMethods';
 import { ValidationFailed } from '../../graphql/errors';
 import cache from '../../lib/cache';
 import * as currency from '../../lib/currency';
-import emailLib from '../../lib/email';
 import * as libpayments from '../../lib/payments';
 import { formatCurrency, isValidEmail } from '../../lib/utils';
 import models, { Op, sequelize } from '../../models';
@@ -191,17 +191,14 @@ async function create(args, remoteUser) {
  * @param {object} remoteUser
  * @param {integer} count
  */
-export async function bulkCreateGiftCards(args, remoteUser, count) {
+export async function bulkCreateGiftCards(collective, args, remoteUser, count) {
   if (!count) {
     return [];
   }
 
   // Check rate limit
   const totalAmount = (args.amount || args.monthlyLimitPerMember) * count;
-  const collective = await models.Collective.findByPk(args.CollectiveId);
-  if (!collective) {
-    throw new Error('Collective does not exist');
-  } else if (!(await checkCreateLimit(collective, count))) {
+  if (!(await checkCreateLimit(collective, count))) {
     throw new Error(LIMIT_REACHED_ERROR);
   }
 
@@ -226,16 +223,13 @@ export async function bulkCreateGiftCards(args, remoteUser, count) {
  * @param {integer} count
  * @param {string} customMessage A message that will be sent in the invitation email
  */
-export async function createGiftCardsForEmails(args, remoteUser, emails, customMessage) {
+export async function createGiftCardsForEmails(collective, args, remoteUser, emails, customMessage) {
   if (emails.length === 0) {
     return [];
   }
   // Check rate limit
   const totalAmount = (args.amount || args.monthlyLimitPerMember) * emails.length;
-  const collective = await models.Collective.findByPk(args.CollectiveId);
-  if (!collective) {
-    throw new Error('Collective does not exist');
-  } else if (!(await checkCreateLimit(collective, emails.length))) {
+  if (!(await checkCreateLimit(collective, emails.length))) {
     throw new Error(LIMIT_REACHED_ERROR);
   }
 
@@ -415,11 +409,6 @@ function getCurrencyFromCreateArgs(args, collective) {
  * @param {object} sourcePaymentMethod
  */
 function getCreateParams(args, collective, sourcePaymentMethod, remoteUser) {
-  // Make sure user is admin of collective
-  if (!remoteUser.isAdminOfCollective(collective)) {
-    throw new Error('User must be admin of collective');
-  }
-
   // Make sure currency is a string, trim and uppercase it.
   args.currency = getCurrencyFromCreateArgs(args, collective);
 
@@ -518,15 +507,20 @@ async function sendGiftCardCreatedEmail(giftCard, emitterCollective) {
     return false;
   }
 
-  return emailLib.send('user.card.invited', email, {
-    email,
-    redeemCode: code,
-    initialBalance: giftCard.initialBalance,
-    expiryDate: giftCard.expiryDate,
-    name: giftCard.name,
-    currency: giftCard.currency,
-    emitter: emitterCollective,
-    customMessage: get(giftCard, 'data.customMessage', ''),
+  await models.Activity.create({
+    type: activities.USER_CARD_INVITED,
+    CollectiveId: emitterCollective.id, // TODO(InconsistentActivities): Should be the FromCollective
+    // TODO(InconsistentActivities): CollectiveId: invitee.id
+    data: {
+      email,
+      redeemCode: code,
+      initialBalance: giftCard.initialBalance,
+      expiryDate: giftCard.expiryDate,
+      name: giftCard.name,
+      currency: giftCard.currency,
+      emitter: emitterCollective,
+      customMessage: get(giftCard, 'data.customMessage', ''),
+    },
   });
 }
 

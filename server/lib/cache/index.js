@@ -65,10 +65,10 @@ const cache = {
       logger.warn(`Error while clearing cache: ${err.message}`);
     }
   },
-  del: async key => {
+  delete: async key => {
     try {
-      debugCache(`del ${key}`);
-      return getDefaultProvider().del(key);
+      debugCache(`delete ${key}`);
+      return getDefaultProvider().delete(key);
     } catch (err) {
       logger.warn(`Error while deleting from cache: ${err.message}`);
     }
@@ -135,16 +135,19 @@ export function memoize(func, { key, maxAge = 0, serialize, unserialize }) {
   };
 
   memoizedFunction.clear = async function () {
-    cache.del(cacheKey(arguments));
+    cache.delete(cacheKey(arguments));
   };
 
   return memoizedFunction;
 }
 
-export function purgeGQLCacheForCollective(slug) {
-  for (const operationName of purgeCacheForCollectiveOperationNames) {
-    cache.del(`${operationName}_${slug}`);
-  }
+export async function purgeGQLCacheForCollective(slug) {
+  // TODO: This doesn't work as expected cause many operations include the hash of the query in their keys
+  return Promise.all(
+    purgeCacheForCollectiveOperationNames.map(operationName => {
+      return cache.delete(`${operationName}_${slug}`);
+    }),
+  );
 }
 
 export function purgeCacheForCollective(slug) {

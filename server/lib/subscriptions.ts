@@ -1,8 +1,12 @@
 import { isEmpty, keys, pick } from 'lodash';
+import moment from 'moment';
 
+import INTERVALS from '../constants/intervals';
 import OrderStatus from '../constants/order_status';
 import { Unauthorized } from '../graphql/errors';
 import models, { sequelize } from '../models';
+import Tier from '../models/Tier';
+import User from '../models/User';
 
 import { findPaymentMethodProvider } from './payments';
 
@@ -11,8 +15,28 @@ const getIsSubscriptionManagedExternally = pm => {
   return Boolean(provider?.features?.isRecurringManagedExternally);
 };
 
+/**
+ * When the contribution gets updated, we need to update the next charge date as well
+ */
+const getNextChargeDateForUpdateContribution = (baseNextChargeDate, newInterval) => {
+  const previousNextChargeDate = moment(baseNextChargeDate);
+  if (previousNextChargeDate.isBefore(moment())) {
+    // If the contribution was pending, keep it in the past
+    return previousNextChargeDate;
+  } else if (newInterval === 'year') {
+    // Yearly => beginning of next year
+    return moment().add(1, 'years').startOf('year');
+  } else if (previousNextChargeDate.date() > 15) {
+    // Set the next charge date to 2 months time if the subscription was made after 15th of the month.
+    return moment().add(2, 'months').startOf('month');
+  } else {
+    // Otherwise, next charge date will be the beginning of the next month
+    return moment().add(1, 'months').startOf('month');
+  }
+};
+
 export const updatePaymentMethodForSubscription = async (
-  user: typeof models.User,
+  user: User,
   order: typeof models.Order,
   newPaymentMethod: typeof models.PaymentMethod,
 ): Promise<typeof models.Order> => {
@@ -27,18 +51,29 @@ export const updatePaymentMethodForSubscription = async (
   const newOrderData = { PaymentMethodId: newPaymentMethod.id, status: newStatus };
 
   // Subscription changes
-  let newSubscriptionData;
+  const newSubscriptionData = { isActive: true, deactivatedAt: null };
   const wasManagedExternally = getIsSubscriptionManagedExternally(prevPaymentMethod);
   const isManagedExternally = getIsSubscriptionManagedExternally(newPaymentMethod);
-  if (wasManagedExternally !== isManagedExternally) {
-    newSubscriptionData = { isManagedExternally, paypalSubscriptionId: null };
+  if (wasManagedExternally && !isManagedExternally) {
+    // Reset flags for managing the subscription externally
+    newSubscriptionData['isManagedExternally'] = false;
+    newSubscriptionData['paypalSubscriptionId'] = null;
+
+    // Update the next charge dates
+    const previousNextChargeDate = order.Subscription.nextChargeDate;
+    const interval = order.Subscription.interval;
+    const nextChargeDate = getNextChargeDateForUpdateContribution(previousNextChargeDate, interval);
+    newSubscriptionData['nextChargeDate'] = nextChargeDate.toDate();
+    newSubscriptionData['nextPeriodStart'] = nextChargeDate.toDate();
   }
 
+  // Need to cancel previous subscription
+  await order.Subscription.deactivate();
   const { order: updatedOrder } = await updateOrderSubscription(order, null, newOrderData, newSubscriptionData, {});
   return updatedOrder;
 };
 
-const checkSubscriptionDetails = (order, tier, amountInCents) => {
+const checkSubscriptionDetails = (order, tier: Tier, amountInCents) => {
   if (tier && tier.CollectiveId !== order.CollectiveId) {
     throw new Error(`This tier (#${tier.id}) doesn't belong to the given Collective #${order.CollectiveId}`);
   }
@@ -103,7 +138,7 @@ export const updateOrderSubscription = async (
 
 export const updateSubscriptionDetails = async (
   order: typeof models.Order,
-  tier: typeof models.Tier,
+  tier: Tier,
   member: typeof models.Member,
   amountInCents: number,
 ): Promise<OrderSubscriptionUpdate> => {
@@ -124,6 +159,19 @@ export const updateSubscriptionDetails = async (
   if (tier?.interval && tier.interval !== 'flexible' && tier.interval !== order.interval) {
     newOrderData['interval'] = tier.interval;
     newSubscriptionData['interval'] = tier.interval;
+  }
+
+  // Update next charge date
+  if (
+    newOrderData['interval'] &&
+    newOrderData['interval'] !== order.interval &&
+    newOrderData['interval'] !== INTERVALS.FLEXIBLE
+  ) {
+    const newInterval = newOrderData['interval'];
+    const previousNextChargeDate = order.Subscription.nextChargeDate;
+    const nextChargeDate = getNextChargeDateForUpdateContribution(previousNextChargeDate, newInterval);
+    newSubscriptionData['nextChargeDate'] = nextChargeDate.toDate();
+    newSubscriptionData['nextPeriodStart'] = nextChargeDate.toDate();
   }
 
   // Update order's Tier

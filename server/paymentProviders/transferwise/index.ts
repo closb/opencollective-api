@@ -1,8 +1,9 @@
 import crypto from 'crypto';
 
+import { isMemberOfTheEuropeanUnion } from '@opencollective/taxes';
 import config from 'config';
 import express from 'express';
-import { compact, difference, find, has, omit, pick, split, toNumber } from 'lodash';
+import { cloneDeep, compact, difference, find, has, omit, pick, set, split, toNumber } from 'lodash';
 import moment from 'moment';
 import { v4 as uuid } from 'uuid';
 
@@ -11,16 +12,18 @@ import status from '../../constants/expense_status';
 import { TransferwiseError } from '../../graphql/errors';
 import cache from '../../lib/cache';
 import logger from '../../lib/logger';
+import { reportErrorToSentry } from '../../lib/sentry';
 import * as transferwise from '../../lib/transferwise';
-import models from '../../models';
+import models, { sequelize } from '../../models';
+import { ConnectedAccount } from '../../models/ConnectedAccount';
 import PayoutMethod from '../../models/PayoutMethod';
-import { ConnectedAccount } from '../../types/ConnectedAccount';
 import {
-  Balance,
+  BalanceV4,
   BatchGroup,
   QuoteV2,
   QuoteV2PaymentOption,
   RecipientAccount,
+  TransactionRequirementsType,
   Transfer,
 } from '../../types/transferwise';
 
@@ -29,36 +32,15 @@ const providerName = 'transferwise';
 const hashObject = obj => crypto.createHash('sha1').update(JSON.stringify(obj)).digest('hex').slice(0, 7);
 const splitCSV = string => compact(split(string, /,\s*/));
 
+export const blockedCountries = splitCSV(config.transferwise.blockedCountries);
 export const blockedCurrencies = splitCSV(config.transferwise.blockedCurrencies);
 export const blockedCurrenciesForBusinessProfiles = splitCSV(config.transferwise.blockedCurrenciesForBusinessProfiles);
 export const blockedCurrenciesForNonProfits = splitCSV(config.transferwise.blockedCurrenciesForNonProfits);
 export const currenciesThatRequireReference = ['RUB'];
 
-async function getToken(connectedAccount: ConnectedAccount): Promise<string> {
-  // Old token, does not expires
-  // eslint-disable-next-line camelcase
-  if (!connectedAccount.data?.expires_in) {
-    return connectedAccount.token;
-  }
-  // OAuth token, require us to refresh every 12 hours
-  await connectedAccount.reload();
-  const updatedAt = moment(connectedAccount.updatedAt);
-  const diff = moment.duration(moment().diff(updatedAt)).asSeconds();
-  const isOutdated = diff > <number>connectedAccount.data.expires_in - 60;
-  if (isOutdated) {
-    const newToken = await transferwise.getOrRefreshToken({ refreshToken: connectedAccount.refreshToken });
-    const { access_token: token, refresh_token: refreshToken, ...data } = newToken;
-    await connectedAccount.update({ token, refreshToken, data: { ...connectedAccount.data, ...data } });
-    return token;
-  } else {
-    return connectedAccount.token;
-  }
-}
-
-async function populateProfileId(connectedAccount: typeof models.ConnectedAccount, profileId?: number): Promise<void> {
+async function populateProfileId(connectedAccount: ConnectedAccount, profileId?: number): Promise<void> {
   if (!connectedAccount.data?.id) {
-    const token = await getToken(connectedAccount);
-    const profiles = await transferwise.getProfiles(token);
+    const profiles = await transferwise.getProfiles(connectedAccount);
     const profile = profileId
       ? profiles.find(p => p.id === profileId)
       : profiles.find(p => p.type === connectedAccount.data?.type) ||
@@ -71,12 +53,11 @@ async function populateProfileId(connectedAccount: typeof models.ConnectedAccoun
 }
 
 async function getTemporaryQuote(
-  connectedAccount: typeof models.ConnectedAccount,
+  connectedAccount: ConnectedAccount,
   payoutMethod: PayoutMethod,
   expense: typeof models.Expense,
 ): Promise<QuoteV2> {
-  const token = await getToken(connectedAccount);
-  return await transferwise.getTemporaryQuote(token, {
+  return await transferwise.getTemporaryQuote(connectedAccount, {
     sourceCurrency: expense.currency,
     targetCurrency: <string>payoutMethod.unfilteredData.currency,
     sourceAmount: expense.amount / 100,
@@ -84,12 +65,10 @@ async function getTemporaryQuote(
 }
 
 async function createRecipient(
-  connectedAccount: typeof models.ConnectedAccount,
+  connectedAccount: ConnectedAccount,
   payoutMethod: PayoutMethod,
 ): Promise<RecipientAccount & { payoutMethodId: number }> {
-  const token = await getToken(connectedAccount);
-  const recipient = await transferwise.createRecipientAccount(token, {
-    profileId: connectedAccount.data.id,
+  const recipient = await transferwise.createRecipientAccount(connectedAccount, {
     ...(<RecipientAccount>payoutMethod.data),
   });
 
@@ -97,31 +76,61 @@ async function createRecipient(
 }
 
 async function quoteExpense(
-  connectedAccount: typeof models.ConnectedAccount,
+  connectedAccount: ConnectedAccount,
   payoutMethod: PayoutMethod,
   expense: typeof models.Expense,
   targetAccount?: number,
 ): Promise<QuoteV2> {
   await populateProfileId(connectedAccount);
 
-  const token = await getToken(connectedAccount);
-  // Guarantees the target amount if in the same currency of expense
-  const { rate } = await getTemporaryQuote(connectedAccount, payoutMethod, expense);
-  const targetAmount = (expense.amount / 100) * rate;
+  const isExistingQuoteValid =
+    expense.data?.quote &&
+    expense.data.quote.paymentOption &&
+    !expense.data.transfer && // We can not reuse quotes if a Transfer was already created
+    moment.utc().subtract(60, 'seconds').isBefore(expense.data.quote.expirationTime);
+  if (isExistingQuoteValid) {
+    logger.debug(`quoteExpense(): reusing existing quote...`);
+    return expense.data.quote;
+  }
 
-  const quote = await transferwise.createQuote(token, {
+  expense.collective = expense.collective || (await models.Collective.findByPk(expense.CollectiveId));
+  const hasMultiCurrency = expense.currency !== expense.collective.currency;
+  const quoteParams = {
     profileId: connectedAccount.data.id,
-    sourceCurrency: expense.currency,
+    sourceCurrency: expense.collective.currency,
     targetCurrency: <string>payoutMethod.unfilteredData.currency,
-    targetAmount,
     targetAccount,
-  });
+  };
+
+  // Adapt the fees payer
+  if (expense.feesPayer === 'PAYEE') {
+    // We assume that expense.currency is always collective.currency
+    quoteParams['sourceAmount'] = expense.amount / 100;
+    if (hasMultiCurrency) {
+      throw new Error('Putting the fees on the payee is not yet supported for multi-currency expenses');
+    }
+  } else {
+    // Guarantees the target amount if in the same currency of expense
+    const { rate } = await getTemporaryQuote(connectedAccount, payoutMethod, expense);
+    quoteParams['targetAmount'] = (expense.amount / 100) * rate;
+  }
+
+  // Adapt for multi-currency
+  if (hasMultiCurrency) {
+    quoteParams['targetCurrency'] = expense.currency;
+    quoteParams['targetAmount'] = expense.amount / 100;
+  }
+
+  const quote = await transferwise.createQuote(connectedAccount, quoteParams);
+
+  quote['paymentOption'] = quote.paymentOptions.find(p => p.payIn === 'BALANCE' && p.payOut === quote.payOut);
+  await expense.update({ data: { ...expense.data, quote: omit(quote, ['paymentOptions']) } });
 
   return quote;
 }
 
 async function createTransfer(
-  connectedAccount: typeof models.ConnectedAccount,
+  connectedAccount: ConnectedAccount,
   payoutMethod: PayoutMethod,
   expense: typeof models.Expense,
   options?: { token?: string; batchGroupId?: string },
@@ -131,44 +140,25 @@ async function createTransfer(
   transfer: Transfer;
   paymentOption: QuoteV2PaymentOption;
 }> {
+  if (!payoutMethod) {
+    payoutMethod = await expense.getPayoutMethod();
+  }
+
+  const recipient =
+    expense.data?.recipient?.payoutMethodId === payoutMethod.id
+      ? expense.data.recipient
+      : await createRecipient(connectedAccount, payoutMethod);
+
+  const quote = await quoteExpense(connectedAccount, payoutMethod, expense, recipient.id);
+  const paymentOption = quote['paymentOption'];
+  if (!paymentOption || paymentOption.disabled) {
+    const message =
+      paymentOption?.disabledReason?.message ||
+      `We can't find a compatible wise payment method for this transaction. Please re-connecte Wise or contact support at support@opencollective.com`;
+    throw new TransferwiseError(message, null, { quote });
+  }
+
   try {
-    const token = options?.token || (await getToken(connectedAccount));
-    const profileId = connectedAccount.data.id;
-
-    if (!payoutMethod) {
-      payoutMethod = await expense.getPayoutMethod();
-    }
-
-    const recipient =
-      expense.data?.recipient?.payoutMethodId === payoutMethod.id
-        ? expense.data.recipient
-        : await createRecipient(connectedAccount, payoutMethod);
-
-    const quote = await quoteExpense(connectedAccount, payoutMethod, expense, recipient.id);
-    const paymentOption = quote.paymentOptions.find(p => p.payIn === 'BALANCE' && p.payOut === quote.payOut);
-    if (!paymentOption || paymentOption.disabled) {
-      const message =
-        paymentOption?.disabledReason?.message ||
-        `We can't find a compatible wise payment method for this transaction. Please re-connecte Wise or contact support at support@opencollective.com`;
-      throw new TransferwiseError(message, null, { quote });
-    }
-
-    const account = await transferwise.getBorderlessAccount(token, <number>profileId);
-    if (!account) {
-      throw new TransferwiseError(
-        `We can't retrieve your Transferwise borderless account. Please re-connect or contact support at support@opencollective.com.`,
-        'transferwise.error.accountnotfound',
-      );
-    }
-    const balance = account.balances.find(b => b.currency === quote.sourceCurrency);
-    if (!balance || balance.amount.value < quote.sourceAmount) {
-      throw new TransferwiseError(
-        `You don't have enough funds in your ${quote.sourceCurrency} balance. Please top up your account considering the source amount of ${quote.sourceAmount} (includes the fee ${paymentOption.fee.total}) and try again.`,
-        'transferwise.error.insufficientFunds',
-        { currency: quote.sourceCurrency },
-      );
-    }
-
     const transferOptions: transferwise.CreateTransfer = {
       accountId: recipient.id,
       quoteUuid: quote.id,
@@ -183,8 +173,8 @@ async function createTransfer(
     }
 
     const transfer = options?.batchGroupId
-      ? await transferwise.createBatchGroupTransfer(token, profileId, options.batchGroupId, transferOptions)
-      : await transferwise.createTransfer(token, transferOptions);
+      ? await transferwise.createBatchGroupTransfer(connectedAccount, options.batchGroupId, transferOptions)
+      : await transferwise.createTransfer(connectedAccount, transferOptions);
 
     await expense.update({
       data: { ...expense.data, quote: omit(quote, ['paymentOptions']), recipient, transfer, paymentOption },
@@ -195,13 +185,16 @@ async function createTransfer(
     logger.error(`Wise: Error creating transaction for expense: ${expense.id}`, e);
     await expense.update({ status: status.ERROR });
     const user = await models.User.findByPk(expense.lastEditedById);
-    await expense.createActivity(activities.COLLECTIVE_EXPENSE_ERROR, user, { error: { message: e.message } });
+    await expense.createActivity(activities.COLLECTIVE_EXPENSE_ERROR, user, {
+      error: { message: e.message },
+      isSystem: true,
+    });
     throw e;
   }
 }
 
 async function payExpense(
-  connectedAccount: typeof models.ConnectedAccount,
+  connectedAccount: ConnectedAccount,
   payoutMethod: PayoutMethod,
   expense: typeof models.Expense,
   batchGroupId?: string,
@@ -212,9 +205,7 @@ async function payExpense(
   transfer: Transfer;
   paymentOption: QuoteV2PaymentOption;
 }> {
-  const token = await getToken(connectedAccount);
-  const profileId = connectedAccount.data.id;
-
+  const token = await transferwise.getToken(connectedAccount);
   const { quote, recipient, transfer, paymentOption } = await createTransfer(connectedAccount, payoutMethod, expense, {
     batchGroupId,
     token,
@@ -222,13 +213,12 @@ async function payExpense(
 
   let fund;
   try {
-    fund = await transferwise.fundTransfer(token, {
-      profileId,
+    fund = await transferwise.fundTransfer(connectedAccount, {
       transferId: transfer.id,
     });
   } catch (e) {
     logger.error(`Wise: Error paying expense ${expense.id}`, e);
-    await transferwise.cancelTransfer(token, transfer.id);
+    await transferwise.cancelTransfer(connectedAccount, transfer.id);
     throw e;
   }
 
@@ -253,20 +243,18 @@ const getOrCreateActiveBatch = async (
     ],
   });
 
+  const connectedAccount = options?.connectedAccount || (await host.getAccountForPaymentProvider(providerName));
   if (expense) {
-    return expense.data.batchGroup as BatchGroup;
-  } else {
-    const connectedAccount = await host.getAccountForPaymentProvider(providerName);
-
-    const profileId = connectedAccount.data.id;
-    const token = options?.token || (await getToken(connectedAccount));
-    const batchGroup = await transferwise.createBatchGroup(token, profileId, {
-      name: uuid(),
-      sourceCurrency: connectedAccount.data.currency || host.currency,
-    });
-
-    return batchGroup;
+    const batchGroup = await transferwise.getBatchGroup(connectedAccount, expense.data.batchGroup.id);
+    if (batchGroup.status === 'NEW') {
+      return batchGroup;
+    }
   }
+
+  return transferwise.createBatchGroup(connectedAccount, {
+    name: uuid(),
+    sourceCurrency: connectedAccount.data.currency || host.currency,
+  });
 };
 
 async function scheduleExpenseForPayment(expense: typeof models.Expense): Promise<typeof models.Expense> {
@@ -276,12 +264,12 @@ async function scheduleExpenseForPayment(expense: typeof models.Expense): Promis
     throw new Error(`Can not find Host for expense ${expense.id}`);
   }
 
-  if (expense.currency !== host.currency) {
+  if (collective.currency !== host.currency) {
     throw new Error('Can not batch an expense with a currency different from its host currency');
   }
 
   const connectedAccount = await host.getAccountForPaymentProvider(providerName);
-  const token = await getToken(connectedAccount);
+  const token = await transferwise.getToken(connectedAccount);
 
   // Check for any existing Batch Group where status = NEW, create a new one if needed
   const batchGroup = await getOrCreateActiveBatch(host, { connectedAccount, token });
@@ -307,16 +295,13 @@ async function unscheduleExpenseForPayment(expense: typeof models.Expense): Prom
 
   const connectedAccount = await host.getAccountForPaymentProvider(providerName);
 
-  const profileId = connectedAccount.data.id;
-  const token = await getToken(connectedAccount);
-
-  const batchGroup = await transferwise.getBatchGroup(token, profileId, expense.data.batchGroup.id);
+  const batchGroup = await transferwise.getBatchGroup(connectedAccount, expense.data.batchGroup.id);
   const expensesInBatch = await models.Expense.findAll({
     where: { data: { batchGroup: { id: batchGroup.id } } },
   });
 
   logger.warn(`Wise: canceling batchGroup ${batchGroup.id} with ${expensesInBatch.length} for host ${host.slug}`);
-  await transferwise.cancelBatchGroup(token, profileId, batchGroup.id, batchGroup.version);
+  await transferwise.cancelBatchGroup(connectedAccount, batchGroup.id, batchGroup.version);
   await Promise.all(
     expensesInBatch.map(expense => {
       return expense.update({
@@ -331,13 +316,13 @@ async function payExpensesBatchGroup(host, expenses, x2faApproval?: string) {
   const connectedAccount = await host.getAccountForPaymentProvider(providerName);
 
   const profileId = connectedAccount.data.id;
-  const token = await getToken(connectedAccount);
+  const token = await transferwise.getToken(connectedAccount);
 
   try {
     if (!x2faApproval && expenses) {
-      let batchGroup = await transferwise.getBatchGroup(token, profileId, expenses[0].data.batchGroup.id);
+      let batchGroup = await transferwise.getBatchGroup(connectedAccount, expenses[0].data.batchGroup.id);
       if (batchGroup.status !== 'NEW') {
-        throw new Error('Can not pay batch group, status !== NEW');
+        throw new Error('Can not pay batch group, existing batch group was already processed');
       }
       const expenseTransferIds = expenses.map(e => e.data.transfer.id);
       if (difference(batchGroup.transferIds, expenseTransferIds).length > 0) {
@@ -357,7 +342,22 @@ async function payExpensesBatchGroup(host, expenses, x2faApproval?: string) {
         }
       });
 
-      batchGroup = await transferwise.completeBatchGroup(token, profileId, batchGroup.id, batchGroup.version);
+      batchGroup = await transferwise.completeBatchGroup(connectedAccount, batchGroup.id, batchGroup.version);
+
+      // Update batchGroup status to make sure we don't try to reuse a completed batchGroup
+      await sequelize.query(
+        `
+        UPDATE "Expenses" SET "data" = JSONB_SET("data", '{batchGroup}', :newBatchGroup::JSONB) WHERE "id" IN (:expenseIds) AND "data"#>>'{batchGroup, id}' = :batchGroupId;
+      `,
+        {
+          replacements: {
+            expenseIds: expenses.map(e => e.id),
+            newBatchGroup: JSON.stringify(batchGroup),
+            batchGroupId: batchGroup.id,
+          },
+        },
+      );
+
       const fundResponse = await transferwise.fundBatchGroup(token, profileId, batchGroup.id);
       if ('status' in fundResponse && 'headers' in fundResponse) {
         const cacheKey = `transferwise_ott_${fundResponse.headers['x-2fa-approval']}`;
@@ -403,17 +403,16 @@ async function getAvailableCurrencies(
     return fromCache.filter(c => !currencyBlockList.includes(c.code));
   }
 
-  const token = await getToken(connectedAccount);
   await populateProfileId(connectedAccount);
 
-  const pairs = await transferwise.getCurrencyPairs(token);
+  const pairs = await transferwise.getCurrencyPairs(connectedAccount);
   const source = pairs.sourceCurrencies.find(sc => sc.currencyCode === host.currency);
   const currencies = source.targetCurrencies.map(c => ({ code: c.currencyCode, minInvoiceAmount: c.minInvoiceAmount }));
   cache.set(cacheKey, currencies, 24 * 60 * 60 /* a whole day and we could probably increase */);
   return currencies.filter(c => !currencyBlockList.includes(c.code));
 }
 
-function validatePayoutMethod(connectedAccount: typeof models.ConnectedAccount, payoutMethod: PayoutMethod): void {
+function validatePayoutMethod(connectedAccount: ConnectedAccount, payoutMethod: PayoutMethod): void {
   const currency = (<RecipientAccount>payoutMethod.data)?.currency;
   if (connectedAccount.data?.type === 'business' && blockedCurrenciesForBusinessProfiles.includes(currency)) {
     throw new Error(`Sorry, this host's business profile can not create a transaction to ${currency}`);
@@ -433,7 +432,7 @@ async function getRequiredBankInformation(
   host: typeof models.Collective,
   currency: string,
   accountDetails?: Record<string, unknown>,
-): Promise<any> {
+): Promise<Array<TransactionRequirementsType>> {
   const cacheKey = accountDetails
     ? `transferwise_required_bank_info_${host.id}_${currency}_${hashObject(
         pick(accountDetails, ['type', 'details.bankCode', 'details.legalType', 'details.address.country']),
@@ -446,7 +445,6 @@ async function getRequiredBankInformation(
 
   const connectedAccount = await host.getAccountForPaymentProvider(providerName);
 
-  const token = await getToken(connectedAccount);
   await populateProfileId(connectedAccount);
 
   const currencyInfo = find(await getAvailableCurrencies(host), { code: currency });
@@ -462,18 +460,29 @@ async function getRequiredBankInformation(
 
   const requiredFields =
     accountDetails && has(accountDetails, 'details')
-      ? await transferwise.validateAccountRequirements(token, transactionParams, accountDetails)
-      : await transferwise.getAccountRequirements(token, transactionParams);
+      ? await transferwise.validateAccountRequirements(connectedAccount, transactionParams, accountDetails)
+      : await transferwise.getAccountRequirements(connectedAccount, transactionParams);
+
+  // Filter out countries blocked by sanctions on Wise
+  requiredFields?.forEach?.((type, itype) => {
+    type.fields?.forEach?.((field, ifield) => {
+      field.group?.forEach?.((group, igroup) => {
+        if (group?.key === 'address.country') {
+          requiredFields[itype].fields[ifield].group[igroup].valuesAllowed = group.valuesAllowed.filter(
+            value => !blockedCountries.includes(value.key),
+          );
+        }
+      });
+    });
+  });
 
   cache.set(cacheKey, requiredFields, 24 * 60 * 60 /* a whole day and we could probably increase */);
   return requiredFields;
 }
 
-async function getAccountBalances(connectedAccount: ConnectedAccount): Promise<Balance[]> {
+async function getAccountBalances(connectedAccount: ConnectedAccount): Promise<BalanceV4[]> {
   await populateProfileId(connectedAccount);
-  const token = await getToken(connectedAccount);
-  const account = await transferwise.getBorderlessAccount(token, <number>connectedAccount.data.id);
-  return account?.balances || [];
+  return transferwise.listBalancesAccount(connectedAccount);
 }
 
 const oauth = {
@@ -507,6 +516,10 @@ const oauth = {
     const redirectUrl = new URL(redirect);
     try {
       const { code, profileId } = req.query;
+      const collective = await models.Collective.findByPk(CollectiveId);
+      if (!collective) {
+        throw new Error(`Could not find Collective #${CollectiveId}`);
+      }
       const accessToken = await transferwise.getOrRefreshToken({ code: code?.toString() });
       const { access_token: token, refresh_token: refreshToken, ...data } = accessToken;
 
@@ -531,9 +544,20 @@ const oauth = {
         await populateProfileId(connectedAccount, toNumber(profileId));
       }
 
+      // Automatically set OTT flag on for European contries and Australia.
+      if (
+        collective.countryISO &&
+        (isMemberOfTheEuropeanUnion(collective.countryISO) || collective.countryISO === 'AU')
+      ) {
+        const settings = collective.settings ? cloneDeep(collective.settings) : {};
+        set(settings, 'transferwise.ott', true);
+        await collective.update({ settings });
+      }
+
       res.redirect(redirectUrl.href);
     } catch (e) {
       logger.error(`Error with TransferWise OAuth callback: ${e.message}`, { ...e, state });
+      reportErrorToSentry(e);
       redirectUrl.searchParams.append(
         'error',
         `Could not OAuth with TransferWise, please contact support@opencollective.com. State: ${state}`,
@@ -569,7 +593,6 @@ export default {
   getRequiredBankInformation,
   getAccountBalances,
   getTemporaryQuote,
-  getToken,
   createRecipient,
   quoteExpense,
   payExpense,

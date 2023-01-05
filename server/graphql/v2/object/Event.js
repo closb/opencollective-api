@@ -1,12 +1,10 @@
-import { GraphQLBoolean, GraphQLNonNull, GraphQLObjectType } from 'graphql';
-import { GraphQLDateTime } from 'graphql-iso-date';
+import { GraphQLBoolean, GraphQLNonNull, GraphQLObjectType, GraphQLString } from 'graphql';
+import { GraphQLDateTime } from 'graphql-scalars';
 
 import { Account, AccountFields } from '../interface/Account';
 import { AccountWithContributions, AccountWithContributionsFields } from '../interface/AccountWithContributions';
 import { AccountWithHost, AccountWithHostFields } from '../interface/AccountWithHost';
 import { AccountWithParent, AccountWithParentFields } from '../interface/AccountWithParent';
-
-import { Collective } from './Collective';
 
 export const Event = new GraphQLObjectType({
   name: 'Event',
@@ -31,18 +29,6 @@ export const Event = new GraphQLObjectType({
           }
         },
       },
-      parentCollective: {
-        description: 'The Collective hosting this Event',
-        deprecationReason: '2020/07/01 - Use parent instead.',
-        type: Collective,
-        async resolve(event, _, req) {
-          if (!event.ParentCollectiveId) {
-            return null;
-          } else {
-            return req.loaders.Collective.byId.load(event.ParentCollectiveId);
-          }
-        },
-      },
       startsAt: {
         description: 'The Event start date and time',
         type: GraphQLDateTime,
@@ -50,6 +36,10 @@ export const Event = new GraphQLObjectType({
       endsAt: {
         description: 'The Event end date and time',
         type: GraphQLDateTime,
+      },
+      timezone: {
+        description: 'Timezone of the Event (TZ database format, e.g. UTC or Europe/Berlin)',
+        type: GraphQLString,
       },
     };
   },

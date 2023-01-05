@@ -1,31 +1,77 @@
+import assert from 'assert';
+
+import * as LibTaxes from '@opencollective/taxes';
 import debugLib from 'debug';
 import express from 'express';
-import { flatten, get, isEqual, isNil, omit, omitBy, pick, size } from 'lodash';
+import {
+  cloneDeep,
+  find,
+  flatten,
+  get,
+  isBoolean,
+  isEqual,
+  isNil,
+  isNumber,
+  keyBy,
+  mapValues,
+  omit,
+  omitBy,
+  pick,
+  set,
+  size,
+  sumBy,
+  uniq,
+} from 'lodash';
 
 import { activities, expenseStatus, roles } from '../../constants';
+import ActivityTypes from '../../constants/activities';
 import { types as collectiveTypes } from '../../constants/collectives';
 import statuses from '../../constants/expense_status';
-import expenseType from '../../constants/expense_type';
+import EXPENSE_TYPE from '../../constants/expense_type';
+import { ExpenseFeesPayer } from '../../constants/expense-fees-payer';
 import FEATURE from '../../constants/feature';
+import { EXPENSE_PERMISSION_ERROR_CODES } from '../../constants/permissions';
+import POLICIES from '../../constants/policies';
+import { TransactionKind } from '../../constants/transaction-kind';
+import cache from '../../lib/cache';
 import { getFxRate } from '../../lib/currency';
+import { simulateDBEntriesDiff } from '../../lib/data';
+import errors from '../../lib/errors';
 import logger from '../../lib/logger';
 import { floatAmountToCents } from '../../lib/math';
 import * as libPayments from '../../lib/payments';
+import { getPolicy } from '../../lib/policies';
+import { reportErrorToSentry, reportMessageToSentry } from '../../lib/sentry';
 import { notifyTeamAboutSpamExpense } from '../../lib/spam';
-import { createFromPaidExpense as createTransactionFromPaidExpense } from '../../lib/transactions';
-import {
-  handleTwoFactorAuthenticationPayoutLimit,
-  resetRollingPayoutLimitOnFailure,
-} from '../../lib/two-factor-authentication';
+import { createTransactionsForManuallyPaidExpense, createTransactionsFromPaidExpense } from '../../lib/transactions';
+import twoFactorAuthLib from '../../lib/two-factor-authentication';
 import { canUseFeature } from '../../lib/user-permissions';
-import { formatCurrency } from '../../lib/utils';
+import { formatCurrency, parseToBoolean } from '../../lib/utils';
 import models, { sequelize } from '../../models';
 import { ExpenseAttachedFile } from '../../models/ExpenseAttachedFile';
 import { ExpenseItem } from '../../models/ExpenseItem';
+import { MigrationLogType } from '../../models/MigrationLog';
 import { PayoutMethodTypes } from '../../models/PayoutMethod';
+import User from '../../models/User';
 import paymentProviders from '../../paymentProviders';
-import { RecipientAccount as BankAccountPayoutMethodData } from '../../types/transferwise';
-import { BadRequest, FeatureNotAllowedForUser, Forbidden, NotFound, Unauthorized, ValidationFailed } from '../errors';
+import {
+  Quote as WiseQuote,
+  QuoteV2 as WiseQuoteV2,
+  RecipientAccount as BankAccountPayoutMethodData,
+  Transfer as WiseTransfer,
+} from '../../types/transferwise';
+import {
+  BadRequest,
+  FeatureNotAllowedForUser,
+  FeatureNotSupportedForCollective,
+  Forbidden,
+  NotFound,
+  Unauthorized,
+  ValidationFailed,
+} from '../errors';
+import { CurrencyExchangeRateSourceTypeEnum } from '../v2/enum/CurrencyExchangeRateSourceType';
+
+import { checkRemoteUserCanRoot } from './scope-check';
 
 const debug = debugLib('expenses');
 
@@ -42,6 +88,16 @@ const isOwner = async (req: express.Request, expense: typeof models.Expense): Pr
   }
 
   return req.remoteUser.isAdminOfCollective(expense.fromCollective);
+};
+
+const isDraftPayee = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
+  if (!req.remoteUser) {
+    return false;
+  } else if (expense.data?.payee?.id) {
+    return req.remoteUser.isAdmin(expense.data.payee.id);
+  } else {
+    return false;
+  }
 };
 
 const isCollectiveAccountant = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
@@ -91,7 +147,18 @@ const isHostAdmin = async (req: express.Request, expense: typeof models.Expense)
   return req.remoteUser.isAdmin(expense.collective.HostCollectiveId) && expense.collective.isActive;
 };
 
-type PermissionCondition = (req: express.Request, expense: typeof models.Expense) => Promise<boolean>;
+const isAdminOfHostWhoPaidExpense = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
+  if (!req.remoteUser) {
+    return false;
+  }
+  return expense.HostCollectiveId && req.remoteUser.isAdmin(expense.HostCollectiveId);
+};
+
+export type ExpensePermissionEvaluator = (
+  req: express.Request,
+  expense: typeof models.Expense,
+  options?: { throw?: boolean },
+) => Promise<boolean>;
 
 /**
  * Returns true if the expense meets at least one condition.
@@ -100,9 +167,13 @@ type PermissionCondition = (req: express.Request, expense: typeof models.Expense
 const remoteUserMeetsOneCondition = async (
   req: express.Request,
   expense: typeof models.Expense,
-  conditions: PermissionCondition[],
+  conditions: ExpensePermissionEvaluator[],
+  options: { throw?: boolean } = { throw: false },
 ): Promise<boolean> => {
   if (!req.remoteUser) {
+    if (options?.throw) {
+      throw new Unauthorized('User is required', EXPENSE_PERMISSION_ERROR_CODES.MINIMAL_CONDITION_NOT_MET);
+    }
     return false;
   }
 
@@ -112,43 +183,68 @@ const remoteUserMeetsOneCondition = async (
     }
   }
 
+  if (options?.throw) {
+    throw new Unauthorized(
+      'User does not meet minimal condition',
+      EXPENSE_PERMISSION_ERROR_CODES.MINIMAL_CONDITION_NOT_MET,
+    );
+  }
   return false;
 };
 
 /** Checks if the user can see expense's attachments (items URLs, attached files) */
-export const canSeeExpenseAttachments = async (
-  req: express.Request,
-  expense: typeof models.Expense,
-): Promise<boolean> => {
-  return remoteUserMeetsOneCondition(req, expense, [isOwner, isCollectiveAdmin, isCollectiveAccountant, isHostAdmin]);
+export const canSeeExpenseAttachments: ExpensePermissionEvaluator = async (req, expense) => {
+  return remoteUserMeetsOneCondition(req, expense, [
+    isOwner,
+    isCollectiveAdmin,
+    isCollectiveAccountant,
+    isHostAdmin,
+    isAdminOfHostWhoPaidExpense,
+  ]);
 };
 
 /** Checks if the user can see expense's payout method */
-export const canSeeExpensePayoutMethod = async (
-  req: express.Request,
-  expense: typeof models.Expense,
-): Promise<boolean> => {
-  return remoteUserMeetsOneCondition(req, expense, [isOwner, isCollectiveAdmin, isCollectiveAccountant, isHostAdmin]);
+export const canSeeExpensePayoutMethod: ExpensePermissionEvaluator = async (req, expense) => {
+  return remoteUserMeetsOneCondition(req, expense, [
+    isOwner,
+    isCollectiveAdmin,
+    isCollectiveAccountant,
+    isHostAdmin,
+    isAdminOfHostWhoPaidExpense,
+  ]);
 };
 
 /** Checks if the user can see expense's payout method */
-export const canSeeExpenseInvoiceInfo = async (
-  req: express.Request,
-  expense: typeof models.Expense,
-): Promise<boolean> => {
-  return remoteUserMeetsOneCondition(req, expense, [isOwner, isCollectiveAdmin, isCollectiveAccountant, isHostAdmin]);
+export const canSeeExpenseInvoiceInfo: ExpensePermissionEvaluator = async (
+  req,
+  expense,
+  options = { throw: false },
+) => {
+  return remoteUserMeetsOneCondition(
+    req,
+    expense,
+    [isOwner, isCollectiveAdmin, isCollectiveAccountant, isHostAdmin, isAdminOfHostWhoPaidExpense],
+    options,
+  );
 };
 
 /** Checks if the user can see expense's payout method */
-export const canSeeExpensePayeeLocation = async (
-  req: express.Request,
-  expense: typeof models.Expense,
-): Promise<boolean> => {
-  return remoteUserMeetsOneCondition(req, expense, [isOwner, isCollectiveAdmin, isCollectiveAccountant, isHostAdmin]);
+export const canSeeExpensePayeeLocation: ExpensePermissionEvaluator = async (req, expense) => {
+  return remoteUserMeetsOneCondition(req, expense, [
+    isOwner,
+    isCollectiveAdmin,
+    isCollectiveAccountant,
+    isHostAdmin,
+    isAdminOfHostWhoPaidExpense,
+  ]);
+};
+
+export const canSeeExpenseSecurityChecks: ExpensePermissionEvaluator = async (req, expense) => {
+  return remoteUserMeetsOneCondition(req, expense, [isHostAdmin]);
 };
 
 /** Checks if the user can verify or resend a draft */
-export const canVerifyDraftExpense = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
+export const canVerifyDraftExpense: ExpensePermissionEvaluator = async (req, expense) => {
   return remoteUserMeetsOneCondition(req, expense, [isOwner, isCollectiveAdmin, isHostAdmin]);
 };
 
@@ -163,10 +259,7 @@ export const getExpenseItems = async (expenseId: number, req: express.Request): 
  * Only admin of expense.collective or of expense.collective.host can approve/reject expenses
  * @deprecated: Please use more specific helpers like `canEdit`, `canDelete`, etc.
  */
-export const canUpdateExpenseStatus = async (
-  req: express.Request,
-  expense: typeof models.Expense,
-): Promise<boolean> => {
+export const canUpdateExpenseStatus: ExpensePermissionEvaluator = async (req, expense) => {
   const { remoteUser } = req;
   if (!remoteUser) {
     return false;
@@ -186,38 +279,45 @@ export const canUpdateExpenseStatus = async (
 /**
  * Only the author or an admin of the collective or collective.host can edit an expense when it hasn't been paid yet
  */
-export const canEditExpense = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
+export const canEditExpense: ExpensePermissionEvaluator = async (req, expense, options = { throw: false }) => {
   const nonEditableStatuses = [
     expenseStatus.PAID,
     expenseStatus.PROCESSING,
-    expenseStatus.DRAFT,
     expenseStatus.SCHEDULED_FOR_PAYMENT,
+    expenseStatus.CANCELED,
   ];
 
-  // Collective Admin can attach receipts to paid charge expenses
-  if (
-    expense.type === expenseType.CHARGE &&
-    expense.status === expenseStatus.PAID &&
-    req.remoteUser?.hasRole([roles.ADMIN], expense.CollectiveId)
-  ) {
-    return true;
+  // Host and Collective Admin can attach receipts to paid charge expenses
+  if (expense.type === EXPENSE_TYPE.CHARGE && [expenseStatus.PAID, expenseStatus.PROCESSING].includes(expense.status)) {
+    return remoteUserMeetsOneCondition(req, expense, [isOwner, isHostAdmin, isCollectiveAdmin], options);
+  } else if (expense.status === expenseStatus.DRAFT) {
+    return remoteUserMeetsOneCondition(req, expense, [isOwner, isHostAdmin, isDraftPayee], options);
   } else if (nonEditableStatuses.includes(expense.status)) {
+    if (options?.throw) {
+      throw new Forbidden('Can not edit expense in current status', EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_STATUS);
+    }
     return false;
   } else if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
+    if (options?.throw) {
+      throw new Forbidden('User cannot edit expenses', EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_USER_FEATURE);
+    }
     return false;
   } else {
-    return remoteUserMeetsOneCondition(req, expense, [isOwner, isHostAdmin, isCollectiveAdmin]);
+    return remoteUserMeetsOneCondition(req, expense, [isOwner, isHostAdmin, isCollectiveAdmin], options);
   }
 };
 
-export const canEditExpenseTags = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
+export const canEditExpenseTags: ExpensePermissionEvaluator = async (req, expense, options = { throw: false }) => {
   if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
+    if (options?.throw) {
+      throw new Forbidden('User cannot edit expense tags', EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_USER_FEATURE);
+    }
     return false;
   } else if (expense.status === expenseStatus.PAID) {
     // Only collective/host admins can edit tags after the expense is paid
-    return remoteUserMeetsOneCondition(req, expense, [isHostAdmin, isCollectiveAdmin]);
+    return remoteUserMeetsOneCondition(req, expense, [isHostAdmin, isCollectiveAdmin], options);
   } else {
-    return remoteUserMeetsOneCondition(req, expense, [isOwner, isHostAdmin, isCollectiveAdmin]);
+    return remoteUserMeetsOneCondition(req, expense, [isOwner, isHostAdmin, isCollectiveAdmin], options);
   }
 };
 
@@ -225,88 +325,191 @@ export const canEditExpenseTags = async (req: express.Request, expense: typeof m
  * Only the author or an admin of the collective or collective.host can delete an expense,
  * and only when its status is REJECTED.
  */
-export const canDeleteExpense = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
-  if (![expenseStatus.REJECTED, expenseStatus.DRAFT].includes(expense.status)) {
+export const canDeleteExpense: ExpensePermissionEvaluator = async (req, expense, options = { throw: false }) => {
+  if (
+    ![expenseStatus.REJECTED, expenseStatus.DRAFT, expenseStatus.SPAM, expenseStatus.CANCELED].includes(expense.status)
+  ) {
+    if (options?.throw) {
+      throw new Forbidden(
+        'Can not delete expense in current status',
+        EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_STATUS,
+      );
+    }
     return false;
   } else if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
+    if (options?.throw) {
+      throw new Forbidden('User cannot delete expenses', EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_USER_FEATURE);
+    }
     return false;
   } else {
-    return remoteUserMeetsOneCondition(req, expense, [isOwner, isCollectiveAdmin, isHostAdmin]);
+    return remoteUserMeetsOneCondition(req, expense, [isOwner, isCollectiveAdmin, isHostAdmin], options);
   }
 };
 
 /**
  * Returns true if expense can be paid by user
  */
-export const canPayExpense = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
+export const canPayExpense: ExpensePermissionEvaluator = async (req, expense, options = { throw: false }) => {
   if (![expenseStatus.APPROVED, expenseStatus.ERROR].includes(expense.status)) {
+    if (options?.throw) {
+      throw new Forbidden('Can not pay expense in current status', EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_STATUS);
+    }
     return false;
   } else if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
+    if (options?.throw) {
+      throw new Forbidden('User cannot pay expenses', EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_USER_FEATURE);
+    }
     return false;
   } else {
-    return isHostAdmin(req, expense);
+    return remoteUserMeetsOneCondition(req, expense, [isHostAdmin], options);
   }
 };
 
 /**
  * Returns true if expense can be approved by user
  */
-export const canApprove = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
-  if (![expenseStatus.PENDING, expenseStatus.REJECTED].includes(expense.status)) {
+export const canApprove: ExpensePermissionEvaluator = async (req, expense, options = { throw: false }) => {
+  if (![expenseStatus.PENDING, expenseStatus.REJECTED, expenseStatus.INCOMPLETE].includes(expense.status)) {
+    if (options?.throw) {
+      throw new Forbidden(
+        'Can not approve expense in current status',
+        EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_STATUS,
+      );
+    }
     return false;
   } else if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
+    if (options?.throw) {
+      throw new Forbidden('User cannot approve expenses', EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_USER_FEATURE);
+    }
     return false;
   } else {
-    return remoteUserMeetsOneCondition(req, expense, [isCollectiveAdmin, isHostAdmin]);
+    expense.collective = expense.collective || (await req.loaders.Collective.byId.load(expense.CollectiveId));
+
+    if (expense.collective.HostCollectiveId && expense.collective.approvedAt) {
+      expense.collective.host =
+        expense.collective.host || (await req.loaders.Collective.byId.load(expense.collective.HostCollectiveId));
+    }
+
+    const currency = expense.collective.host?.currency || expense.collective.currency;
+    const hostPolicy = getPolicy(expense.collective.host, POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE);
+    const collectivePolicy = getPolicy(expense.collective, POLICIES.EXPENSE_AUTHOR_CANNOT_APPROVE);
+
+    let policy = collectivePolicy;
+    if (hostPolicy.enabled && hostPolicy.appliesToHostedCollectives) {
+      policy = hostPolicy;
+
+      if (!hostPolicy.appliesToSingleAdminCollectives) {
+        const collectiveAdminCount = await req.loaders.Member.countAdminMembersOfCollective.load(expense.collective.id);
+        if (collectiveAdminCount === 1) {
+          policy = collectivePolicy;
+        }
+      }
+    }
+
+    if (policy.enabled && expense.amount >= policy.amountInCents && req.remoteUser.id === expense.UserId) {
+      if (options?.throw) {
+        throw new Forbidden(
+          'User cannot approve their own expenses',
+          EXPENSE_PERMISSION_ERROR_CODES.AUTHOR_CANNOT_APPROVE,
+          {
+            reasonDetails: {
+              amount: policy.amountInCents / 100,
+              currency,
+            },
+          },
+        );
+      }
+      return false;
+    }
+    if (expense.status === expenseStatus.INCOMPLETE) {
+      return isHostAdmin(req, expense);
+    }
+    return remoteUserMeetsOneCondition(req, expense, [isCollectiveAdmin, isHostAdmin], options);
   }
 };
 
 /**
  * Returns true if expense can be rejected by user
  */
-export const canReject = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
-  if (![expenseStatus.PENDING, expenseStatus.UNVERIFIED].includes(expense.status)) {
+export const canReject: ExpensePermissionEvaluator = async (req, expense, options = { throw: false }) => {
+  if (![expenseStatus.PENDING, expenseStatus.UNVERIFIED, expenseStatus.INCOMPLETE].includes(expense.status)) {
+    if (options?.throw) {
+      throw new Forbidden(
+        'Can not reject expense in current status',
+        EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_STATUS,
+      );
+    }
     return false;
   } else if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
+    if (options?.throw) {
+      throw new Forbidden('User cannot reject expenses', EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_USER_FEATURE);
+    }
     return false;
   } else {
-    return remoteUserMeetsOneCondition(req, expense, [isCollectiveAdmin, isHostAdmin]);
+    return remoteUserMeetsOneCondition(req, expense, [isCollectiveAdmin, isHostAdmin], options);
   }
 };
 
 /**
  * Returns true if expense can be rejected by user
  */
-export const canMarkAsSpam = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
+export const canMarkAsSpam: ExpensePermissionEvaluator = async (req, expense, options = { throw: false }) => {
   if (![expenseStatus.REJECTED].includes(expense.status)) {
+    if (options?.throw) {
+      throw new Forbidden(
+        'Can not mark expense as spam in current status',
+        EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_STATUS,
+      );
+    }
     return false;
   } else if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
+    if (options?.throw) {
+      throw new Forbidden('User cannot mark expenses as spam', EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_USER_FEATURE);
+    }
     return false;
   } else {
-    return remoteUserMeetsOneCondition(req, expense, [isCollectiveAdmin, isHostAdmin]);
+    return remoteUserMeetsOneCondition(req, expense, [isCollectiveAdmin, isHostAdmin], options);
   }
 };
 
 /**
  * Returns true if expense can be unapproved by user
  */
-export const canUnapprove = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
-  if (expense.status !== expenseStatus.APPROVED) {
+export const canUnapprove: ExpensePermissionEvaluator = async (req, expense, options = { throw: false }) => {
+  if (![expenseStatus.APPROVED, expenseStatus.ERROR].includes(expense.status)) {
+    if (options?.throw) {
+      throw new Forbidden(
+        'Can not unapprove expense in current status',
+        EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_STATUS,
+      );
+    }
     return false;
   } else if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
+    if (options?.throw) {
+      throw new Forbidden('User cannot unapprove expenses', EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_USER_FEATURE);
+    }
     return false;
   } else {
-    return remoteUserMeetsOneCondition(req, expense, [isCollectiveAdmin, isHostAdmin]);
+    return remoteUserMeetsOneCondition(req, expense, [isCollectiveAdmin, isHostAdmin], options);
   }
 };
 
-/**
- * Returns true if expense can be marked as unpaid by user
- */
-export const canMarkAsUnpaid = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
-  if (expense.status !== expenseStatus.PAID) {
+export const canMarkAsIncomplete: ExpensePermissionEvaluator = async (req, expense, options = { throw: false }) => {
+  if (![expenseStatus.APPROVED, expenseStatus.PENDING, expenseStatus.ERROR].includes(expense.status)) {
+    if (options?.throw) {
+      throw new Forbidden(
+        'Can not mark expense as incomplete in current status',
+        EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_STATUS,
+      );
+    }
     return false;
   } else if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
+    if (options?.throw) {
+      throw new Forbidden(
+        'User cannot mark expense as incomplete',
+        EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_USER_FEATURE,
+      );
+    }
     return false;
   } else {
     return isHostAdmin(req, expense);
@@ -314,28 +517,70 @@ export const canMarkAsUnpaid = async (req: express.Request, expense: typeof mode
 };
 
 /**
- * Returns true if user can comment and see others comments for this expense
+ * Returns true if expense can be marked as unpaid by user
  */
-export const canComment = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
-  if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
+export const canMarkAsUnpaid: ExpensePermissionEvaluator = async (req, expense, options = { throw: false }) => {
+  if (expense.status !== expenseStatus.PAID) {
+    if (options?.throw) {
+      throw new Forbidden(
+        'Can not mark expense as unpaid in current status',
+        EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_STATUS,
+      );
+    }
+    return false;
+  } else if (expense.type === EXPENSE_TYPE.CHARGE) {
+    if (options?.throw) {
+      throw new Forbidden(
+        'Can not mark this type of expense as unpaid',
+        EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_TYPE,
+      );
+    }
+    return false;
+  } else if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
+    if (options?.throw) {
+      throw new Forbidden(
+        'User cannot mark expenses as unpaid',
+        EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_USER_FEATURE,
+      );
+    }
     return false;
   } else {
-    return remoteUserMeetsOneCondition(req, expense, [isCollectiveAdmin, isHostAdmin, isOwner]);
+    return remoteUserMeetsOneCondition(req, expense, [isHostAdmin], options);
   }
 };
 
-export const canViewRequiredLegalDocuments = async (
-  req: express.Request,
-  expense: typeof models.Expense,
-): Promise<boolean> => {
-  return remoteUserMeetsOneCondition(req, expense, [isHostAdmin, isCollectiveAdmin, isCollectiveAccountant, isOwner]);
+/**
+ * Returns true if user can comment and see others comments for this expense
+ */
+export const canComment: ExpensePermissionEvaluator = async (req, expense, options = { throw: false }) => {
+  if (!canUseFeature(req.remoteUser, FEATURE.USE_EXPENSES)) {
+    if (options?.throw) {
+      throw new Forbidden('User cannot pay expenses', EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_USER_FEATURE);
+    }
+    return false;
+  } else {
+    return remoteUserMeetsOneCondition(req, expense, [isCollectiveAdmin, isHostAdmin, isOwner], options);
+  }
 };
 
-export const canUnschedulePayment = async (req: express.Request, expense: typeof models.Expense): Promise<boolean> => {
-  if (expense.status === expenseStatus.SCHEDULED_FOR_PAYMENT && (await isHostAdmin(req, expense))) {
-    return true;
+export const canViewRequiredLegalDocuments: ExpensePermissionEvaluator = async (req, expense) => {
+  return remoteUserMeetsOneCondition(req, expense, [
+    isHostAdmin,
+    isCollectiveAdmin,
+    isCollectiveAccountant,
+    isOwner,
+    isAdminOfHostWhoPaidExpense,
+  ]);
+};
+
+export const canUnschedulePayment: ExpensePermissionEvaluator = async (req, expense, options = { throw: false }) => {
+  if (expense.status !== expenseStatus.SCHEDULED_FOR_PAYMENT) {
+    if (options?.throw) {
+      throw new Forbidden('Can not pay expense in current status', EXPENSE_PERMISSION_ERROR_CODES.UNSUPPORTED_STATUS);
+    }
+    return false;
   }
-  return false;
+  return remoteUserMeetsOneCondition(req, expense, [isHostAdmin], options);
 };
 
 // ---- Expense actions ----
@@ -370,6 +615,22 @@ export const unapproveExpense = async (
   return updatedExpense;
 };
 
+export const markExpenseAsIncomplete = async (
+  req: express.Request,
+  expense: typeof models.Expense,
+  message?: string,
+): Promise<typeof models.Expense> => {
+  if (expense.status === expenseStatus.INCOMPLETE) {
+    return expense;
+  } else if (!(await canMarkAsIncomplete(req, expense))) {
+    throw new Forbidden();
+  }
+
+  const updatedExpense = await expense.update({ status: expenseStatus.INCOMPLETE, lastEditedById: req.remoteUser.id });
+  await expense.createActivity(activities.COLLECTIVE_EXPENSE_MARKED_AS_INCOMPLETE, req.remoteUser, { message });
+  return updatedExpense;
+};
+
 export const rejectExpense = async (
   req: express.Request,
   expense: typeof models.Expense,
@@ -401,6 +662,12 @@ export const markExpenseAsSpam = async (
   const submittedByUser = await updatedExpense.getSubmitterUser();
   await submittedByUser.limitFeature(FEATURE.USE_EXPENSES);
 
+  // Cancel recurring expense
+  const recurringExpense = await expense.getRecurringExpense();
+  if (recurringExpense) {
+    await recurringExpense.destroy();
+  }
+
   // We create the activity as a good practice but there is no email sent right now
   const activity = await expense.createActivity(activities.COLLECTIVE_EXPENSE_MARKED_AS_SPAM, req.remoteUser);
 
@@ -410,9 +677,50 @@ export const markExpenseAsSpam = async (
   return updatedExpense;
 };
 
+const ROLLING_LIMIT_CACHE_VALIDITY = 3600; // 1h in secs for cache to expire
+
+async function validateExpensePayout2FALimit(req, host, expense, expensePaidAmountKey) {
+  const hostPayoutTwoFactorAuthenticationRollingLimit = get(
+    host,
+    'settings.payoutsTwoFactorAuth.rollingLimit',
+    1000000,
+  );
+
+  const twoFactorSession =
+    req.jwtPayload?.sessionId || (req.personalToken?.id && `personalToken_${req.personalToken.id}`);
+
+  const currentPaidExpenseAmountCache = await cache.get(expensePaidAmountKey);
+  const currentPaidExpenseAmount = currentPaidExpenseAmountCache || 0;
+
+  // requires a 2FA token to be present if there is no value in the cache (first payout by user)
+  // or the this payout would put the user over the rolling limit.
+  const use2FAToken =
+    isNil(currentPaidExpenseAmountCache) ||
+    currentPaidExpenseAmount + expense.amount > hostPayoutTwoFactorAuthenticationRollingLimit;
+
+  if (!twoFactorAuthLib.userHasTwoFactorAuthEnabled(req.remoteUser)) {
+    throw new Error('Host has two-factor authentication enabled for large payouts.');
+  }
+
+  await twoFactorAuthLib.validateRequest(req, {
+    requireTwoFactorAuthEnabled: true, // requires user to have 2FA configured
+    alwaysAskForToken: use2FAToken,
+    sessionDuration: ROLLING_LIMIT_CACHE_VALIDITY, // duration of a auth session after a token is presented
+    sessionKey: `2fa_expense_payout_${twoFactorSession}`, // key of the 2fa session where the 2fa will be valid for the duration
+  });
+
+  if (use2FAToken) {
+    // if a 2fa token was used, reset rolling limit
+    cache.set(expensePaidAmountKey, 0, ROLLING_LIMIT_CACHE_VALIDITY);
+  } else {
+    cache.set(expensePaidAmountKey, currentPaidExpenseAmount + expense.amount, ROLLING_LIMIT_CACHE_VALIDITY);
+  }
+}
+
 export const scheduleExpenseForPayment = async (
   req: express.Request,
   expense: typeof models.Expense,
+  options: { feesPayer?: 'COLLECTIVE' | 'PAYEE' } = {},
 ): Promise<typeof models.Expense> => {
   if (expense.status === expenseStatus.SCHEDULED_FOR_PAYMENT) {
     throw new BadRequest('Expense is already scheduled for payment');
@@ -420,21 +728,34 @@ export const scheduleExpenseForPayment = async (
     throw new Forbidden("You're authenticated but you can't schedule this expense for payment");
   }
 
-  // Warning: expense.collective is only loaded because we call `canPayExpense`
-  const balance = await expense.collective.getBalanceWithBlockedFunds();
-  if (expense.amount > balance) {
-    throw new Unauthorized(
-      `You don't have enough funds to pay this expense. Current balance: ${formatCurrency(
-        balance,
-        expense.collective.currency,
-      )}, Expense amount: ${formatCurrency(expense.amount, expense.collective.currency)}`,
-    );
+  const host = await expense.collective.getHostCollective();
+  if (expense.currency !== expense.collective.currency && !hasMultiCurrency(expense.collective, host)) {
+    throw new Unauthorized('Multi-currency expenses are not enabled for this collective');
+  }
+
+  const payoutMethod = await expense.getPayoutMethod();
+  await checkHasBalanceToPayExpense(host, expense, payoutMethod);
+  if (payoutMethod.type === PayoutMethodTypes.PAYPAL) {
+    const hostHasPayoutTwoFactorAuthenticationEnabled = get(host, 'settings.payoutsTwoFactorAuth.enabled', false);
+
+    if (hostHasPayoutTwoFactorAuthenticationEnabled) {
+      const expensePaidAmountKey = `${req.remoteUser.id}_2fa_payment_limit`;
+      await validateExpensePayout2FALimit(req, host, expense, expensePaidAmountKey);
+    }
+  }
+
+  const { feesPayer } = options;
+  if (feesPayer && feesPayer !== expense.feesPayer) {
+    await expense.update({ feesPayer: feesPayer });
   }
 
   // If Wise, add expense to a new batch group
-  const payoutMethod = await expense.getPayoutMethod();
   if (payoutMethod.type === PayoutMethodTypes.BANK_ACCOUNT) {
     await paymentProviders.transferwise.scheduleExpenseForPayment(expense);
+  }
+  // If PayPal, check if host is connected to PayPal
+  else if (payoutMethod.type === PayoutMethodTypes.PAYPAL) {
+    await host.getAccountForPaymentProvider('paypal');
   }
 
   const updatedExpense = await expense.update({
@@ -463,22 +784,24 @@ export const unscheduleExpensePayment = async (
     status: expenseStatus.APPROVED,
     lastEditedById: req.remoteUser.id,
   });
+
+  await expense.createActivity(activities.COLLECTIVE_EXPENSE_UNSCHEDULED_FOR_PAYMENT, req.remoteUser);
+
   return updatedExpense;
 };
 
 /** Compute the total amount of expense from expense items */
-const getTotalAmountFromItems = items => {
-  if (!items) {
-    return 0;
-  } else {
-    return items.reduce((total, item) => {
-      return total + item.amount;
-    }, 0);
-  }
+const computeTotalAmountForExpense = (items: Record<string, unknown>[], taxes: TaxDefinition[]) => {
+  return Math.round(
+    sumBy(items, item => {
+      const totalTaxes = sumBy(taxes, tax => <number>item['amount'] * tax.rate);
+      return <number>item['amount'] + totalTaxes;
+    }),
+  );
 };
 
 /** Check expense's items values, throw if something's wrong */
-const checkExpenseItems = (expenseData, items) => {
+const checkExpenseItems = (expenseType, items, taxes) => {
   // Check the number of items
   if (!items || items.length === 0) {
     throw new ValidationFailed('Your expense needs to have at least one item');
@@ -487,17 +810,21 @@ const checkExpenseItems = (expenseData, items) => {
   }
 
   // Check amounts
-  const sumItems = getTotalAmountFromItems(items);
-  if (sumItems !== expenseData.amount) {
-    throw new ValidationFailed(
-      `The sum of all items must be equal to the total expense's amount. Expense's total is ${expenseData.amount}, but the total of items was ${sumItems}.`,
-    );
-  } else if (!sumItems) {
+  items.forEach((item, idx) => {
+    if (isNil(item.amount)) {
+      throw new ValidationFailed(
+        `Amount not set for item ${item.description ? `"${item.description}"` : `number ${idx}`}`,
+      );
+    }
+  });
+
+  const sumItems = computeTotalAmountForExpense(items, taxes);
+  if (!sumItems) {
     throw new ValidationFailed(`The sum of all items must be above 0`);
   }
 
   // If expense is a receipt (not an invoice) then files must be attached
-  if (expenseData.type === expenseType.RECEIPT) {
+  if (expenseType === EXPENSE_TYPE.RECEIPT) {
     const hasMissingFiles = items.some(a => !a.url);
     if (hasMissingFiles) {
       throw new ValidationFailed('Some items are missing a file');
@@ -505,8 +832,35 @@ const checkExpenseItems = (expenseData, items) => {
   }
 };
 
+const checkExpenseType = (
+  type: EXPENSE_TYPE,
+  account: typeof models.Collective,
+  parent: typeof models.Collective | null,
+  host: typeof models.Collective | null,
+): void => {
+  // Check flag in settings in the priority order of collective > parent > host
+  const accounts = { account, parent, host };
+  for (const level of ['account', 'parent', 'host']) {
+    const account = accounts[level];
+    const value = account?.settings?.expenseTypes?.[type];
+    if (isBoolean(value)) {
+      if (value) {
+        return; // Flag is explicitly set to true, we're good
+      } else {
+        throw new ValidationFailed(`Expenses of type ${type.toLowerCase()} are not allowed by the ${level}`);
+      }
+    }
+  }
+
+  // Fallback on default values
+  if (type === EXPENSE_TYPE.GRANT) {
+    // TODO: enforce this to resolve https://github.com/opencollective/opencollective/issues/5395
+  }
+};
+
 const EXPENSE_EDITABLE_FIELDS = [
   'amount',
+  'currency',
   'description',
   'longDescription',
   'type',
@@ -522,18 +876,21 @@ const getPayoutMethodFromExpenseData = async (expenseData, remoteUser, fromColle
   if (expenseData.payoutMethod) {
     if (expenseData.payoutMethod.id) {
       const pm = await models.PayoutMethod.findByPk(expenseData.payoutMethod.id);
-      if (!pm || !remoteUser.isAdmin(pm.CollectiveId)) {
-        throw new Error("This payout method does not exist or you don't have the permission to use it");
+      if (!pm) {
+        throw new Error('This payout method does not exist.');
       }
+      // Special case: Payout Method from the Host for "Expense Accross Hosts"
+      // No need for extra checks
       if (
-        // Payout Method from Collective
-        pm.CollectiveId !== fromCollective.id &&
-        // Bank Account or PayPal Payout Method from Host
-        !(
-          pm.CollectiveId === fromCollective.HostCollectiveId &&
-          [PayoutMethodTypes.BANK_ACCOUNT, PayoutMethodTypes.PAYPAL].includes(pm.type)
-        )
+        pm.CollectiveId === fromCollective.HostCollectiveId &&
+        [PayoutMethodTypes.BANK_ACCOUNT, PayoutMethodTypes.PAYPAL].includes(pm.type)
       ) {
+        return pm;
+      }
+      if (!remoteUser.isAdmin(pm.CollectiveId)) {
+        throw new Error("You don't have the permission to use this payout method.");
+      }
+      if (pm.CollectiveId !== fromCollective.id) {
         throw new Error('This payout method cannot be used for this collective');
       }
       return pm;
@@ -555,12 +912,22 @@ const createAttachedFiles = async (expense, attachedFilesData, remoteUser, trans
   if (size(attachedFilesData) > 0) {
     return Promise.all(
       attachedFilesData.map(attachedFile => {
-        return models.ExpenseAttachedFile.createFromData(attachedFile.url, remoteUser, expense, transaction);
+        return models.ExpenseAttachedFile.createFromData(attachedFile, remoteUser, expense, transaction);
       }),
     );
   } else {
     return [];
   }
+};
+
+export const hasMultiCurrency = (collective, host): boolean => {
+  return collective.currency === host?.currency; // Only support multi-currency when collective/host have the same currency
+};
+
+type TaxDefinition = {
+  type: string;
+  rate: number;
+  idNumber: string;
 };
 
 type ExpenseData = {
@@ -573,14 +940,33 @@ type ExpenseData = {
   fromCollective?: Record<string, unknown>;
   tags?: string[];
   incurredAt?: Date;
-  amount?: number;
+  type?: EXPENSE_TYPE;
   description?: string;
+  currency?: string;
+  tax?: TaxDefinition[];
 };
 
-export async function createExpense(
-  remoteUser: typeof models.User | null,
-  expenseData: ExpenseData,
-): Promise<typeof models.Expense> {
+const checkTaxes = (account, host, expenseType: string, taxes): void => {
+  if (!taxes?.length) {
+    return;
+  } else if (taxes.length > 1) {
+    throw new ValidationFailed('Only one tax is allowed per expense');
+  } else if (expenseType !== EXPENSE_TYPE.INVOICE) {
+    throw new ValidationFailed('Only invoices can have taxes');
+  } else {
+    return taxes.forEach(({ type, rate }) => {
+      if (rate < 0 || rate > 1) {
+        throw new ValidationFailed(`Tax rate for ${type} must be between 0% and 100%`);
+      } else if (type === LibTaxes.TaxType.VAT && !LibTaxes.accountHasVAT(account, host)) {
+        throw new ValidationFailed(`This account does not have VAT enabled`);
+      } else if (type === LibTaxes.TaxType.GST && !LibTaxes.accountHasGST(host)) {
+        throw new ValidationFailed(`This host does not have GST enabled`);
+      }
+    });
+  }
+};
+
+export async function createExpense(remoteUser: User | null, expenseData: ExpenseData): Promise<typeof models.Expense> {
   if (!remoteUser) {
     throw new Unauthorized('You need to be logged in to create an expense');
   } else if (!canUseFeature(remoteUser, FEATURE.USE_EXPENSES)) {
@@ -591,22 +977,35 @@ export async function createExpense(
     throw new Unauthorized('Missing expense.collective.id');
   }
 
-  const isMember = Boolean(remoteUser.rolesByCollectiveId[String(expenseData.collective.id)]);
-  if (expenseData.collective.settings?.['disablePublicExpenseSubmission'] && !isMember) {
+  const collective = await models.Collective.findByPk(expenseData.collective.id, {
+    include: [
+      { association: 'host', required: false },
+      { association: 'parent', required: false },
+    ],
+  });
+  if (!collective) {
+    throw new ValidationFailed('Collective not found');
+  }
+
+  const isMember = Boolean(remoteUser.rolesByCollectiveId[String(collective.id)]);
+  if (
+    expenseData.collective.settings?.['disablePublicExpenseSubmission'] &&
+    !isMember &&
+    !remoteUser.isAdminOfCollectiveOrHost(collective) &&
+    !remoteUser.isRoot()
+  ) {
     throw new Error('You must be a member of the collective to create new expense');
   }
 
   const itemsData = expenseData.items;
+  const taxes = expenseData.tax || [];
 
-  checkExpenseItems(expenseData, itemsData);
+  checkTaxes(collective, collective.host, expenseData.type, taxes);
+  checkExpenseItems(expenseData.type, itemsData, taxes);
+  checkExpenseType(expenseData.type, collective, collective.parent, collective.host);
 
   if (size(expenseData.attachedFiles) > 15) {
     throw new ValidationFailed('The number of files that you can attach to an expense is limited to 15');
-  }
-
-  const collective = await models.Collective.findByPk(expenseData.collective.id);
-  if (!collective) {
-    throw new ValidationFailed('Collective not found');
   }
 
   const isAllowedType = [
@@ -620,6 +1019,16 @@ export async function createExpense(
     throw new ValidationFailed(
       'Expenses can only be submitted to Collectives, Events, Funds, Projects and active Hosts.',
     );
+  }
+
+  // Let submitter customize the currency
+  let currency = collective.currency;
+  if (expenseData.currency && expenseData.currency !== currency) {
+    if (!hasMultiCurrency(collective, collective.host)) {
+      throw new FeatureNotSupportedForCollective('Multi-currency expenses are not enabled for this account');
+    } else {
+      currency = expenseData.currency;
+    }
   }
 
   // Load the payee profile
@@ -657,8 +1066,9 @@ export async function createExpense(
     if (accountHolderName && legalName && !isAccountHolderNameAndLegalNameMatch(accountHolderName, legalName)) {
       logger.warn('The legal name should match the bank account holder name (${accountHolderName} ≠ ${legalName})');
     }
-    const host = await collective.getHostCollective();
-    const connectedAccounts = host && (await host.getConnectedAccounts({ where: { service: 'transferwise' } }));
+
+    const connectedAccounts =
+      collective.host && (await collective.host.getConnectedAccounts({ where: { service: 'transferwise' } }));
     if (connectedAccounts?.[0]) {
       paymentProviders.transferwise.validatePayoutMethod(connectedAccounts[0], payoutMethod);
       recipient = await paymentProviders.transferwise.createRecipient(connectedAccounts[0], payoutMethod);
@@ -670,7 +1080,7 @@ export async function createExpense(
     const createdExpense = await models.Expense.create(
       {
         ...pick(expenseData, EXPENSE_EDITABLE_FIELDS),
-        currency: collective.currency,
+        currency,
         tags: expenseData.tags,
         status: statuses.PENDING,
         CollectiveId: collective.id,
@@ -680,8 +1090,8 @@ export async function createExpense(
         incurredAt: expenseData.incurredAt || new Date(),
         PayoutMethodId: payoutMethod && payoutMethod.id,
         legacyPayoutMethod: models.Expense.getLegacyPayoutMethodTypeFromPayoutMethod(payoutMethod),
-        amount: expenseData.amount || getTotalAmountFromItems(itemsData),
-        data: { recipient },
+        amount: computeTotalAmountForExpense(itemsData, taxes),
+        data: { recipient, taxes },
       },
       { transaction: t },
     );
@@ -714,9 +1124,10 @@ export const changesRequireStatusUpdate = (
 ): boolean => {
   const updatedValues = { ...expense.dataValues, ...newExpenseData };
   const hasAmountChanges = typeof updatedValues.amount !== 'undefined' && updatedValues.amount !== expense.amount;
-  const isPaidCreditCardCharge = expense.type === expenseType.CHARGE && expense.status === expenseStatus.PAID;
+  const isPaidOrProcessingCharge =
+    expense.type === EXPENSE_TYPE.CHARGE && [expenseStatus.PAID, expenseStatus.PROCESSING].includes(expense.status);
 
-  if (isPaidCreditCardCharge && !hasAmountChanges) {
+  if (isPaidOrProcessingCharge && !hasAmountChanges) {
     return false;
   }
   return hasItemsChanges || hasAmountChanges || hasPayoutChanges;
@@ -724,18 +1135,15 @@ export const changesRequireStatusUpdate = (
 
 /** Returns infos about the changes made to items */
 export const getItemsChanges = async (
-  expense: typeof models.Expense,
+  existingItems: ExpenseItem[],
   expenseData: ExpenseData,
-): Promise<
-  [boolean, Record<string, unknown>[], [Record<string, unknown>[], ExpenseItem[], Record<string, unknown>[]]]
-> => {
+): Promise<[boolean, [Record<string, unknown>[], ExpenseItem[], Record<string, unknown>[]]]> => {
   if (expenseData.items) {
-    const baseItems = await models.ExpenseItem.findAll({ where: { ExpenseId: expense.id } });
-    const itemsDiff = models.ExpenseItem.diffDBEntries(baseItems, expenseData.items);
+    const itemsDiff = models.ExpenseItem.diffDBEntries(existingItems, expenseData.items);
     const hasItemChanges = flatten(<unknown[]>itemsDiff).length > 0;
-    return [hasItemChanges, expenseData.items, itemsDiff];
+    return [hasItemChanges, itemsDiff];
   } else {
-    return [false, [], [[], [], []]];
+    return [false, [[], [], []]];
   }
 };
 
@@ -785,17 +1193,47 @@ export async function editExpense(
 
   const expense = await models.Expense.findByPk(expenseData.id, {
     include: [
-      { model: models.Collective, as: 'collective' },
+      {
+        model: models.Collective,
+        as: 'collective',
+        required: true,
+        include: [
+          { association: 'host', required: false },
+          { association: 'parent', required: false },
+        ],
+      },
       { model: models.Collective, as: 'fromCollective' },
       { model: models.ExpenseAttachedFile, as: 'attachedFiles' },
       { model: models.PayoutMethod },
+      { association: 'items' },
     ],
   });
-  const [hasItemChanges, itemsData, itemsDiff] = await getItemsChanges(expense, expenseData);
 
   if (!expense) {
     throw new NotFound('Expense not found');
   }
+
+  const { collective } = expense;
+  const { host } = collective;
+
+  // Check if 2FA is enforced on any of the account remote user is admin of, stop the loop if 2FA gets validated for any of them
+  if (req.remoteUser) {
+    for (const account of [expense.fromCollective, collective, host].filter(Boolean)) {
+      if (await twoFactorAuthLib.enforceForAccountAdmins(req, account, { onlyAskOnLogin: true })) {
+        break;
+      }
+    }
+  }
+
+  // When changing the type, we must make sure that the new type is allowed
+  if (expenseData.type && expenseData.type !== expense.type) {
+    checkExpenseType(expenseData.type, collective, collective.parent, collective.host);
+  }
+
+  const [hasItemChanges, itemsDiff] = await getItemsChanges(expense.items, expenseData);
+  const taxes = expenseData.tax || expense.data?.taxes || [];
+  const expenseType = expenseData.type || expense.type;
+  checkTaxes(expense.collective, expense.collective.host, expenseType, taxes);
 
   const modifiedFields = Object.keys(omitBy(expenseData, (value, key) => key === 'id' || isNil(value)));
   if (isEqual(modifiedFields, ['tags'])) {
@@ -812,7 +1250,9 @@ export async function editExpense(
   }
 
   const isPaidCreditCardCharge =
-    expense.type === expenseType.CHARGE && expense.status === expenseStatus.PAID && Boolean(expense.VirtualCardId);
+    expense.type === EXPENSE_TYPE.CHARGE &&
+    [expenseStatus.PAID, expenseStatus.PROCESSING].includes(expense.status) &&
+    Boolean(expense.VirtualCardId);
 
   if (isPaidCreditCardCharge && !hasItemChanges) {
     throw new ValidationFailed(
@@ -847,7 +1287,14 @@ export async function editExpense(
     isPaidCreditCardCharge ? EXPENSE_PAID_CHARGE_EDITABLE_FIELDS : EXPENSE_EDITABLE_FIELDS,
   );
 
+  // Let submitter customize the currency
+  const isChangingCurrency = expenseData.currency && expenseData.currency !== expense.currency;
+  if (isChangingCurrency && expenseData.currency !== collective.currency && !hasMultiCurrency(collective, host)) {
+    throw new FeatureNotSupportedForCollective('Multi-currency expenses are not enabled for this account');
+  }
+
   let payoutMethod = await expense.getPayoutMethod();
+  let feesPayer = expense.feesPayer;
 
   // Validate bank account payout method
   if (payoutMethod?.type === PayoutMethodTypes.BANK_ACCOUNT) {
@@ -858,34 +1305,43 @@ export async function editExpense(
       logger.warn('The legal name should match the bank account holder name (${accountHolderName} ≠ ${legalName})');
     }
   }
-  const updatedExpense = await sequelize.transaction(async t => {
+  const updatedExpense = await sequelize.transaction(async transaction => {
     // Update payout method if we get new data from one of the param for it
     if (
       !isPaidCreditCardCharge &&
       expenseData.payoutMethod !== undefined &&
       expenseData.payoutMethod?.id !== expense.PayoutMethodId
     ) {
-      payoutMethod = await getPayoutMethodFromExpenseData(expenseData, remoteUser, fromCollective, t);
+      payoutMethod = await getPayoutMethodFromExpenseData(expenseData, remoteUser, fromCollective, transaction);
+
+      // Reset fees payer when changing the payout method and the new one doesn't support it
+      if (feesPayer === ExpenseFeesPayer.PAYEE && !models.PayoutMethod.typeSupportsFeesPayer(payoutMethod?.type)) {
+        feesPayer = ExpenseFeesPayer.COLLECTIVE;
+      }
     }
 
     // Update items
     if (hasItemChanges) {
-      checkExpenseItems({ ...expense.dataValues, ...cleanExpenseData }, itemsData);
-      const [newItemsData, oldItems, itemsToUpdate] = itemsDiff;
+      const simulatedItemsUpdate = simulateDBEntriesDiff(expense.items, itemsDiff);
+      checkExpenseItems(expenseType, simulatedItemsUpdate, taxes);
+      const [newItemsData, itemsToRemove, itemsToUpdate] = itemsDiff;
       await Promise.all(<Promise<void>[]>[
         // Delete
-        ...oldItems.map(item => {
-          return item.destroy({ transaction: t });
+        ...itemsToRemove.map(item => {
+          return item.destroy({ transaction });
         }),
         // Create
         ...newItemsData.map(itemData => {
-          return models.ExpenseItem.createFromData(itemData, remoteUser, expense, t);
+          return models.ExpenseItem.createFromData(itemData, remoteUser, expense, transaction);
         }),
         // Update
         ...itemsToUpdate.map(itemData => {
-          return models.ExpenseItem.updateFromData(itemData, t);
+          return models.ExpenseItem.updateFromData(itemData, transaction);
         }),
       ]);
+
+      // Reload items
+      expense.items = await expense.getItems({ transaction, order: [['id', 'ASC']] });
     }
 
     // Update expense
@@ -905,29 +1361,45 @@ export async function editExpense(
         expenseData.attachedFiles,
       );
 
-      await createAttachedFiles(expense, newAttachedFiles, remoteUser, t);
+      await createAttachedFiles(expense, newAttachedFiles, remoteUser, transaction);
       await Promise.all(removedAttachedFiles.map((file: ExpenseAttachedFile) => file.destroy()));
       await Promise.all(
         updatedAttachedFiles.map((file: Record<string, unknown>) =>
-          models.ExpenseAttachedFile.update({ url: file.url }, { where: { id: file.id, ExpenseId: expense.id } }),
+          models.ExpenseAttachedFile.update(
+            { url: file.url, name: file.name },
+            { where: { id: file.id, ExpenseId: expense.id } },
+          ),
         ),
       );
     }
 
+    let status = expense.status;
+    if (shouldUpdateStatus) {
+      status = expenseStatus.PENDING;
+    } else if (status === expenseStatus.INCOMPLETE) {
+      status = expenseStatus.APPROVED;
+    }
+
     const updatedExpenseProps = {
       ...cleanExpenseData,
+      data: !expense.data ? null : cloneDeep(expense.data),
+      amount: computeTotalAmountForExpense(expense.items, taxes),
       lastEditedById: remoteUser.id,
       incurredAt: expenseData.incurredAt || new Date(),
-      status: shouldUpdateStatus ? 'PENDING' : expense.status,
+      status,
       FromCollectiveId: fromCollective.id,
       PayoutMethodId: PayoutMethodId,
       legacyPayoutMethod: models.Expense.getLegacyPayoutMethodTypeFromPayoutMethod(payoutMethod),
       tags: cleanExpenseData.tags,
     };
+
     if (isPaidCreditCardCharge) {
-      updatedExpenseProps['data'] = { ...expense.data, missingDetails: false };
+      set(updatedExpenseProps, 'data.missingDetails', false);
     }
-    return expense.update(updatedExpenseProps, { transaction: t });
+    if (!isEqual(expense.data?.taxes, taxes)) {
+      set(updatedExpenseProps, 'data.taxes', taxes);
+    }
+    return expense.update(updatedExpenseProps, { transaction });
   });
 
   if (isPaidCreditCardCharge) {
@@ -937,10 +1409,18 @@ export async function editExpense(
         { where: { ExpenseId: updatedExpense.id } },
       );
     }
-  } else {
-    await updatedExpense.createActivity(activities.COLLECTIVE_EXPENSE_UPDATED, remoteUser);
+
+    // Auto Resume Virtual Card
+    if (host?.settings?.virtualcards?.autopause) {
+      const virtualCard = await expense.getVirtualCard();
+      const expensesMissingReceipts = await virtualCard.getExpensesMissingDetails();
+      if (virtualCard.isPaused() && expensesMissingReceipts.length === 0) {
+        await virtualCard.resume();
+      }
+    }
   }
 
+  await updatedExpense.createActivity(activities.COLLECTIVE_EXPENSE_UPDATED, remoteUser);
   return updatedExpense;
 }
 
@@ -978,32 +1458,19 @@ async function markExpenseAsPaid(expense, remoteUser, isManualPayout = false): P
   return expense;
 }
 
-async function createTransactions(
-  host,
-  expense,
-  fees: {
-    paymentProcessorFeeInHostCurrency?: number;
-    hostFeeInHostCurrency?: number;
-    platformFeeInHostCurrency?: number;
-  } = {},
-  data = {},
-) {
-  debug('marking expense as paid and creating transactions in the ledger', expense.id);
-  return await createTransactionFromPaidExpense(
-    host,
-    null,
-    expense,
-    null,
-    expense.UserId,
-    fees['paymentProcessorFeeInHostCurrency'],
-    fees['hostFeeInHostCurrency'],
-    fees['platformFeeInHostCurrency'],
-    data,
-  );
-}
+async function payExpenseWithPayPalAdaptive(remoteUser, expense, host, paymentMethod, toPaypalEmail, fees = {}) {
+  debug('payExpenseWithPayPalAdaptive', expense.id);
 
-async function payExpenseWithPayPal(remoteUser, expense, host, paymentMethod, toPaypalEmail, fees = {}) {
-  debug('payExpenseWithPayPal', expense.id);
+  if (expense.currency !== expense.collective.currency) {
+    throw new Error(
+      'Multi-currency expenses are not supported by the legacy PayPal adaptive implementation. Please migrate to PayPal payouts: https://docs.opencollective.com/help/fiscal-hosts/payouts/payouts-with-paypal',
+    );
+  }
+
+  if (parseToBoolean(process.env.DISABLE_PAYPAL_ADAPTIVE) && !remoteUser.isRoot()) {
+    throw new Error('PayPal adaptive is currently under maintenance. Please try again later.');
+  }
+
   try {
     const paymentResponse = await paymentProviders.paypal.types['adaptive'].pay(
       expense.collective,
@@ -1011,16 +1478,66 @@ async function payExpenseWithPayPal(remoteUser, expense, host, paymentMethod, to
       toPaypalEmail,
       paymentMethod.token,
     );
-    await createTransactionFromPaidExpense(
-      host,
-      paymentMethod,
-      expense,
-      paymentResponse,
-      expense.UserId,
-      fees['paymentProcessorFeeInHostCurrency'],
-      fees['hostFeeInHostCurrency'],
-      fees['platformFeeInHostCurrency'],
-    );
+
+    debug(JSON.stringify(paymentResponse));
+    const { createPaymentResponse, executePaymentResponse } = paymentResponse;
+
+    switch (executePaymentResponse.paymentExecStatus) {
+      case 'COMPLETED':
+        break;
+
+      case 'CREATED':
+        /*
+         * When we don't provide a preapprovalKey (paymentMethod.token) to payServices['paypal'](),
+         * it creates a payKey that we can use to redirect the user to PayPal.com to manually approve that payment
+         * TODO We should handle that case on the frontend
+         */
+        throw new errors.BadRequest(
+          `Please approve this payment manually on ${createPaymentResponse.paymentApprovalUrl}`,
+        );
+
+      case 'ERROR':
+        // Backward compatible error message parsing
+        // eslint-disable-next-line no-case-declarations
+        const errorMessage =
+          executePaymentResponse.payErrorList?.payError?.[0].error?.message ||
+          executePaymentResponse.payErrorList?.[0].error?.message;
+        throw new errors.ServerError(
+          `Error while paying the expense with PayPal: "${errorMessage}". Please contact support@opencollective.com or pay it manually through PayPal.`,
+        );
+
+      default:
+        throw new errors.ServerError(
+          `Error while paying the expense with PayPal. Please contact support@opencollective.com or pay it manually through PayPal.`,
+        );
+    }
+
+    // Warning senderFees can be null
+    let senderFees = createPaymentResponse.defaultFundingPlan.senderFees?.amount;
+    if (senderFees) {
+      senderFees = floatAmountToCents(parseFloat(senderFees));
+    } else {
+      // PayPal stopped providing senderFees in the response, we need to compute it ourselves
+      // We don't have to check for feesPayer here because it is not supported for PayPal adaptive
+      const { fundingAmount } = createPaymentResponse.defaultFundingPlan;
+      const amountPaidByTheHost = floatAmountToCents(parseFloat(fundingAmount.amount));
+      const amountReceivedByPayee = expense.amount;
+      senderFees = Math.round(amountPaidByTheHost - amountReceivedByPayee) || 0;
+
+      // No example yet, but we want to know if this ever happens
+      if (fundingAmount.code !== expense.currency) {
+        reportMessageToSentry(`PayPal adaptive got a funding amount with a different currency than the expense`, {
+          severity: 'error',
+        });
+      }
+    }
+
+    const currencyConversion = createPaymentResponse.defaultFundingPlan.currencyConversion || { exchangeRate: 1 };
+    const hostCurrencyFxRate = 1 / parseFloat(currencyConversion.exchangeRate); // paypal returns a float from host.currency to expense.currency
+    fees['paymentProcessorFeeInHostCurrency'] = Math.round(hostCurrencyFxRate * senderFees);
+
+    // Adaptive does not work with multi-currency expenses, so we can safely assume that expense.currency = collective.currency
+    await createTransactionsFromPaidExpense(host, expense, fees, hostCurrencyFxRate, paymentResponse, paymentMethod);
     const updatedExpense = await markExpenseAsPaid(expense, remoteUser);
     await paymentMethod.updateBalance();
     return updatedExpense;
@@ -1033,15 +1550,66 @@ async function payExpenseWithPayPal(remoteUser, expense, host, paymentMethod, to
         'Not enough funds in your existing Paypal preapproval. Please refill your PayPal payment balance.',
       );
     } else {
+      reportErrorToSentry(err);
       throw new BadRequest(err.message);
     }
   }
 }
 
-export async function createTransferWiseTransactionsAndUpdateExpense({ host, expense, data, fees, remoteUser }) {
-  await createTransactions(host, expense, fees, data);
-  await expense.createActivity(activities.COLLECTIVE_EXPENSE_PROCESSING, remoteUser);
+const matchFxRateWithCurrency = (
+  expectedSourceCurrency: string,
+  expectedTargetCurrency: string,
+  rateSourceCurrency: string,
+  rateTargetCurrency: string,
+  rate: number | null | undefined,
+) => {
+  if (!rate) {
+    return null;
+  } else if (expectedSourceCurrency === rateSourceCurrency && expectedTargetCurrency === rateTargetCurrency) {
+    return rate;
+  } else if (expectedSourceCurrency === rateTargetCurrency && expectedTargetCurrency === rateSourceCurrency) {
+    return 1 / rate;
+  }
+};
+
+export const getWiseFxRateInfoFromExpenseData = (
+  expense,
+  expectedSourceCurrency: string,
+  expectedTargetCurrency: string,
+) => {
+  if (expectedSourceCurrency === expectedTargetCurrency) {
+    return { value: 1 };
+  }
+
+  const wiseInfo: WiseTransfer | WiseQuote | WiseQuoteV2 = expense.data?.transfer || expense.data?.quote;
+  if (wiseInfo?.rate) {
+    const wiseSourceCurrency = wiseInfo['sourceCurrency'] || wiseInfo['source'];
+    const wiseTargetCurrency = wiseInfo['targetCurrency'] || wiseInfo['target'];
+    const fxRate = matchFxRateWithCurrency(
+      expectedSourceCurrency,
+      expectedTargetCurrency,
+      wiseSourceCurrency,
+      wiseTargetCurrency,
+      wiseInfo.rate,
+    );
+    if (fxRate) {
+      return {
+        value: fxRate,
+        date: new Date(wiseInfo['created'] || wiseInfo['createdTime']), // "created" for transfers, "createdTime" for quotes
+        isFinal: Boolean(expense.data?.transfer),
+      };
+    }
+  }
+};
+
+export async function setTransferWiseExpenseAsProcessing({ host, expense, data, feesInHostCurrency, remoteUser }) {
+  await expense.update({ HostCollectiveId: host.id, data: { ...expense.data, ...data, feesInHostCurrency } });
   await expense.setProcessing(remoteUser.id);
+  await expense.createActivity(activities.COLLECTIVE_EXPENSE_PROCESSING, remoteUser, {
+    message: expense.data?.paymentOption?.formattedEstimatedDelivery
+      ? `ETA: ${expense.data.paymentOption.formattedEstimatedDelivery}`
+      : undefined,
+  });
   return expense;
 }
 
@@ -1071,24 +1639,33 @@ const lockExpense = async (id, callback) => {
   }
 };
 
-export const getExpenseFeesInHostCurrency = async ({
-  host,
+type FeesArgs = {
+  paymentProcessorFeeInCollectiveCurrency?: number;
+  hostFeeInCollectiveCurrency?: number;
+  platformFeeInCollectiveCurrency?: number;
+};
+
+/**
+ * Estimates the fees for an expense
+ */
+export const getExpenseFees = async (
   expense,
-  fees,
-  payoutMethod,
-  forceManual,
-}): Promise<{
+  host,
+  { fees = {}, payoutMethod, useExistingWiseData = false },
+): Promise<{
   feesInHostCurrency: {
     paymentProcessorFeeInHostCurrency: number;
     hostFeeInHostCurrency: number;
     platformFeeInHostCurrency: number;
   };
-  fees: {
-    paymentProcessorFeeInCollectiveCurrency: number;
-    hostFeeInCollectiveCurrency: number;
-    platformFeeInCollectiveCurrency: number;
+  feesInExpenseCurrency: {
+    paymentProcessorFee?: number;
+    hostFee?: number;
+    platformFee?: number;
   };
+  feesInCollectiveCurrency: FeesArgs;
 }> => {
+  const resultFees = { ...fees };
   const feesInHostCurrency = {
     paymentProcessorFeeInHostCurrency: undefined,
     hostFeeInHostCurrency: undefined,
@@ -1099,43 +1676,194 @@ export const getExpenseFeesInHostCurrency = async ({
     expense.collective = await models.Collective.findByPk(expense.CollectiveId);
   }
 
-  const fxrate = await getFxRate(expense.collective.currency, host.currency);
+  const collectiveToHostFxRate = await getFxRate(expense.collective.currency, host.currency);
   const payoutMethodType = payoutMethod ? payoutMethod.type : expense.getPayoutMethodTypeFromLegacy();
 
-  if (payoutMethodType === PayoutMethodTypes.BANK_ACCOUNT && !forceManual) {
+  if (payoutMethodType === PayoutMethodTypes.BANK_ACCOUNT) {
     const [connectedAccount] = await host.getConnectedAccounts({
       where: { service: 'transferwise', deletedAt: null },
     });
     if (!connectedAccount) {
       throw new Error('Host is not connected to Transferwise');
     }
-    const quote = await paymentProviders.transferwise.getTemporaryQuote(connectedAccount, payoutMethod, expense);
-    const paymentOption = quote.paymentOptions.find(p => p.payIn === 'BALANCE' && p.payOut === quote.payOut);
+    const quote = useExistingWiseData
+      ? expense.data.quote
+      : await paymentProviders.transferwise.getTemporaryQuote(connectedAccount, payoutMethod, expense);
+    const paymentOption = useExistingWiseData
+      ? expense.data.paymentOption
+      : quote.paymentOptions.find(p => p.payIn === 'BALANCE' && p.payOut === quote.payOut);
     if (!paymentOption) {
       throw new BadRequest(`Could not find available payment option for this transaction.`, null, quote);
     }
-    // Notice this is the FX rate between Host and Collective, that's why we use `fxrate`.
-    fees.paymentProcessorFeeInCollectiveCurrency = floatAmountToCents(paymentOption.fee.total / fxrate);
-  } else if (payoutMethodType === PayoutMethodTypes.PAYPAL && !forceManual) {
-    fees.paymentProcessorFeeInCollectiveCurrency = await paymentProviders.paypal.types['adaptive'].fees({
+    // Notice this is the FX rate between Host and Collective, that's why we use `collectiveToHostFxRate`.
+    resultFees['paymentProcessorFeeInCollectiveCurrency'] = floatAmountToCents(
+      paymentOption.fee.total / collectiveToHostFxRate,
+    );
+  } else if (payoutMethodType === PayoutMethodTypes.PAYPAL) {
+    resultFees['paymentProcessorFeeInCollectiveCurrency'] = await paymentProviders.paypal.types['adaptive'].fees({
       amount: expense.amount,
       currency: expense.collective.currency,
       host,
     });
   }
 
+  // Build fees in host currency
   feesInHostCurrency.paymentProcessorFeeInHostCurrency = Math.round(
-    fxrate * (<number>fees.paymentProcessorFeeInCollectiveCurrency || 0),
+    collectiveToHostFxRate * (<number>resultFees['paymentProcessorFeeInCollectiveCurrency'] || 0),
   );
-  feesInHostCurrency.hostFeeInHostCurrency = Math.round(fxrate * (<number>fees.hostFeeInCollectiveCurrency || 0));
+  feesInHostCurrency.hostFeeInHostCurrency = Math.round(
+    collectiveToHostFxRate * (<number>fees['hostFeeInCollectiveCurrency'] || 0),
+  );
   feesInHostCurrency.platformFeeInHostCurrency = Math.round(
-    fxrate * (<number>fees.platformFeeInCollectiveCurrency || 0),
+    collectiveToHostFxRate * (<number>resultFees['platformFeeInCollectiveCurrency'] || 0),
   );
 
-  if (!fees.paymentProcessorFeeInCollectiveCurrency) {
-    fees.paymentProcessorFeeInCollectiveCurrency = 0;
+  if (!resultFees['paymentProcessorFeeInCollectiveCurrency']) {
+    resultFees['paymentProcessorFeeInCollectiveCurrency'] = 0;
   }
-  return { fees, feesInHostCurrency };
+
+  // Build fees in expense currency
+  let feesInExpenseCurrency = {};
+  if (expense.currency === expense.collective.currency) {
+    feesInExpenseCurrency = {
+      paymentProcessorFee: resultFees['paymentProcessorFeeInCollectiveCurrency'],
+      hostFee: resultFees['hostFeeInCollectiveCurrency'],
+      platformFee: resultFees['platformFeeInCollectiveCurrency'],
+    };
+  } else {
+    const collectiveToExpenseFxRate = await getFxRate(expense.collective.currency, expense.currency);
+    const applyCollectiveToExpenseFxRate = (amount: number) => Math.round((amount || 0) * collectiveToExpenseFxRate);
+    feesInExpenseCurrency = {
+      paymentProcessorFee: applyCollectiveToExpenseFxRate(resultFees['paymentProcessorFeeInCollectiveCurrency']),
+      hostFee: applyCollectiveToExpenseFxRate(resultFees['hostFeeInCollectiveCurrency']),
+      platformFee: applyCollectiveToExpenseFxRate(resultFees['platformFeeInCollectiveCurrency']),
+    };
+  }
+
+  return { feesInCollectiveCurrency: resultFees, feesInHostCurrency, feesInExpenseCurrency };
+};
+
+/**
+ * Check if the collective balance is enough to pay the expense. Throws if not.
+ */
+export const checkHasBalanceToPayExpense = async (
+  host,
+  expense,
+  payoutMethod,
+  {
+    forceManual = false,
+    manualFees = {},
+    useExistingWiseData = false,
+    totalAmountPaidInHostCurrency = undefined,
+    paymentProcessorFeeInHostCurrency = undefined,
+  } = {},
+) => {
+  const payoutMethodType = payoutMethod ? payoutMethod.type : expense.getPayoutMethodTypeFromLegacy();
+  const balanceInCollectiveCurrency = await expense.collective.getBalanceWithBlockedFunds();
+  const isSameCurrency = expense.currency === expense.collective.currency;
+
+  if (expense.feesPayer === 'PAYEE') {
+    assert(
+      models.PayoutMethod.typeSupportsFeesPayer(payoutMethodType),
+      'Putting the payment processor fees on the payee is only supported for bank accounts and manual payouts at the moment',
+    );
+    assert(
+      expense.currency === expense.collective.currency,
+      'Cannot put the payment processor fees on the payee when the expense currency is not the same as the collective currency',
+    );
+  }
+
+  if (forceManual) {
+    assert(totalAmountPaidInHostCurrency >= 0, 'Total amount paid must be positive');
+    const collectiveToHostFxRate = await getFxRate(expense.collective.currency, host.currency);
+    const balanceInHostCurrency = Math.round(balanceInCollectiveCurrency * collectiveToHostFxRate);
+    if (balanceInHostCurrency < totalAmountPaidInHostCurrency) {
+      throw new Error(
+        `Collective does not have enough funds to pay this expense. Current balance: ${formatCurrency(
+          balanceInHostCurrency,
+          host.currency,
+        )}, Expense amount: ${formatCurrency(balanceInHostCurrency, host.currency)}`,
+      );
+    }
+    return {
+      feesInCollectiveCurrency: {},
+      feesInHostCurrency: {
+        paymentProcessorFeeInHostCurrency,
+      },
+      feesInExpenseCurrency: {},
+    };
+  }
+
+  const exchangeStats =
+    !isSameCurrency && (await models.CurrencyExchangeRate.getPairStats(expense.collective.currency, expense.currency));
+
+  // Ensure the collective has enough funds to pay the expense, with an error margin of 2σ (standard deviations) the exchange rate of past 5 days
+  // to account for fluctuating rates. If no exchange rate is available, fallback to the 20% rule.
+  const assertMinExpectedBalance = (amountToPayInExpenseCurrency, feesInExpenseCurrency?) => {
+    let defaultErrorMessage = `Collective does not have enough funds ${
+      feesInExpenseCurrency ? 'to cover for the fees of this payment method' : 'to pay this expense'
+    }. Current balance: ${formatCurrency(
+      balanceInCollectiveCurrency,
+      expense.collective.currency,
+    )}, Expense amount: ${formatCurrency(expense.amount, expense.currency)}`;
+    if (feesInExpenseCurrency) {
+      defaultErrorMessage += `, Estimated ${payoutMethodType} fees: ${formatCurrency(
+        feesInExpenseCurrency,
+        expense.currency,
+      )}`;
+    }
+    if (isSameCurrency) {
+      if (balanceInCollectiveCurrency < amountToPayInExpenseCurrency) {
+        throw new ValidationFailed(`${defaultErrorMessage}.`);
+      }
+    } else if (isNumber(exchangeStats?.latestRate)) {
+      const rate = exchangeStats.latestRate - exchangeStats.stddev * 2;
+      const safeAmount = Math.round(amountToPayInExpenseCurrency / rate);
+      if (balanceInCollectiveCurrency < safeAmount) {
+        throw new ValidationFailed(
+          `${defaultErrorMessage}. For expenses submitted in a different currency than the collective, an error margin is applied to accommodate for fluctuations. The maximum amount that can be paid is ${formatCurrency(
+            Math.round(balanceInCollectiveCurrency * rate),
+            expense.currency,
+          )}.`,
+        );
+      }
+    } else {
+      const safeAmount = Math.round(amountToPayInExpenseCurrency * 1.2);
+      if (balanceInCollectiveCurrency < safeAmount) {
+        throw new ValidationFailed(
+          `${defaultErrorMessage}. For expenses submitted in a different currency than the collective, an error margin is applied to accommodate for fluctuations. The maximum amount that can be paid is ${formatCurrency(
+            Math.round(balanceInCollectiveCurrency / 1.2),
+            expense.collective.currency,
+          )}.`,
+        );
+      }
+    }
+  };
+
+  // Check base balance before fees
+  assertMinExpectedBalance(expense.amount);
+
+  const { feesInHostCurrency, feesInCollectiveCurrency, feesInExpenseCurrency } = await getExpenseFees(expense, host, {
+    fees: manualFees,
+    payoutMethod,
+    useExistingWiseData,
+  });
+
+  // Estimate the total amount to pay from the collective, based on who's supposed to pay the fee
+  let totalAmountToPay;
+  if (expense.feesPayer === 'COLLECTIVE') {
+    totalAmountToPay = expense.amount + feesInExpenseCurrency.paymentProcessorFee;
+  } else if (expense.feesPayer === 'PAYEE') {
+    totalAmountToPay = expense.amount; // Ignore the fee as it will be deduced from the payee
+  } else {
+    throw new Error(`Expense fee payer "${expense.feesPayer}" not supported yet`);
+  }
+
+  // Ensure the collective has enough funds to cover the fees for this expense, with an error margin of 20% of the expense amount
+  // to account for fluctuating rates. Example: to pay for a $100 expense in euros, the collective needs to have at least $120.
+  assertMinExpectedBalance(totalAmountToPay, feesInExpenseCurrency.paymentProcessorFee);
+
+  return { feesInCollectiveCurrency, feesInExpenseCurrency, feesInHostCurrency, totalAmountToPay };
 };
 
 /**
@@ -1146,6 +1874,7 @@ export const getExpenseFeesInHostCurrency = async ({
 export async function payExpense(req: express.Request, args: Record<string, unknown>): Promise<typeof models.Expense> {
   const { remoteUser } = req;
   const expenseId = args.id;
+  const forceManual = Boolean(args.forceManual);
 
   if (!remoteUser) {
     throw new Unauthorized('You need to be logged in to pay an expense');
@@ -1174,7 +1903,7 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
     if (
       expense.status !== statuses.APPROVED &&
       // Allow errored expenses to be marked as paid
-      !(expense.status === statuses.ERROR && args.forceManual)
+      !(expense.status === statuses.ERROR)
     ) {
       throw new Unauthorized(`Expense needs to be approved. Current status of the expense: ${expense.status}.`);
     }
@@ -1182,46 +1911,34 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
       throw new Unauthorized("You don't have permission to pay this expense");
     }
     const host = await expense.collective.getHostCollective();
+    if (expense.currency !== expense.collective.currency && !hasMultiCurrency(expense.collective, host)) {
+      throw new Unauthorized('Multi-currency expenses are not enabled for this collective');
+    }
 
     if (expense.legacyPayoutMethod === 'donation') {
       throw new Error('"In kind" donations are not supported anymore');
     }
 
-    const balance = await expense.collective.getBalanceWithBlockedFunds();
-    if (expense.amount > balance) {
-      throw new Unauthorized(
-        `Collective does not have enough funds to pay this expense. Current balance: ${formatCurrency(
-          balance,
-          expense.collective.currency,
-        )}, Expense amount: ${formatCurrency(expense.amount, expense.collective.currency)}`,
-      );
+    if (args.feesPayer && args.feesPayer !== expense.feesPayer) {
+      await expense.update({ feesPayer: args.feesPayer });
     }
 
+    const totalAmountPaidInHostCurrency = args.totalAmountPaidInHostCurrency;
+    const paymentProcessorFeeInHostCurrency = args.paymentProcessorFeeInHostCurrency || 0;
     const payoutMethod = await expense.getPayoutMethod();
     const payoutMethodType = payoutMethod ? payoutMethod.type : expense.getPayoutMethodTypeFromLegacy();
-
-    const { feesInHostCurrency, fees } = await getExpenseFeesInHostCurrency({
-      host,
-      expense,
-      fees: omit(args, ['id', 'forceManual']),
-      payoutMethod,
-      forceManual: args.forceManual,
+    const { feesInHostCurrency } = await checkHasBalanceToPayExpense(host, expense, payoutMethod, {
+      forceManual,
+      totalAmountPaidInHostCurrency,
+      paymentProcessorFeeInHostCurrency,
+      manualFees: <FeesArgs>(
+        pick(args, [
+          'paymentProcessorFeeInCollectiveCurrency',
+          'hostFeeInCollectiveCurrency',
+          'platformFeeInCollectiveCurrency',
+        ])
+      ),
     });
-
-    if (expense.amount + fees.paymentProcessorFeeInCollectiveCurrency > balance) {
-      throw new Error(
-        `Collective does not have enough funds to cover for the fees of this payment method. Current balance: ${formatCurrency(
-          balance,
-          expense.collective.currency,
-        )}, Expense amount: ${formatCurrency(
-          expense.amount,
-          expense.collective.currency,
-        )}, Estimated ${payoutMethodType} fees: ${formatCurrency(
-          fees.paymentProcessorFeeInCollectiveCurrency,
-          expense.collective.currency,
-        )}`,
-      );
-    }
 
     // 2FA for payouts
     const isTwoFactorAuthenticationRequiredForPayoutMethod = [
@@ -1229,18 +1946,39 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
       PayoutMethodTypes.BANK_ACCOUNT,
     ].includes(payoutMethodType);
     const hostHasPayoutTwoFactorAuthenticationEnabled = get(host, 'settings.payoutsTwoFactorAuth.enabled', false);
-    const useTwoFactorAuthentication =
-      isTwoFactorAuthenticationRequiredForPayoutMethod &&
-      !args.forceManual &&
-      hostHasPayoutTwoFactorAuthenticationEnabled;
+    const use2FARollingLimit =
+      isTwoFactorAuthenticationRequiredForPayoutMethod && !forceManual && hostHasPayoutTwoFactorAuthenticationEnabled;
 
-    if (useTwoFactorAuthentication) {
-      await handleTwoFactorAuthenticationPayoutLimit(req.remoteUser, args.twoFactorAuthenticatorCode, expense);
+    const totalPaidExpensesAmountKey = `${req.remoteUser.id}_2fa_payment_limit`;
+    let totalPaidExpensesAmount;
+
+    if (use2FARollingLimit) {
+      totalPaidExpensesAmount = await cache.get(totalPaidExpensesAmountKey);
+      await validateExpensePayout2FALimit(req, host, expense, totalPaidExpensesAmountKey);
+    } else {
+      // Not using rolling limit, but still enforcing 2FA for all admins
+      await twoFactorAuthLib.enforceForAccountAdmins(req, host, { onlyAskOnLogin: true });
     }
 
     try {
-      // Pay expense based on chosen payout method
-      if (payoutMethodType === PayoutMethodTypes.PAYPAL) {
+      if (forceManual) {
+        await createTransactionsForManuallyPaidExpense(
+          host,
+          expense,
+          paymentProcessorFeeInHostCurrency,
+          totalAmountPaidInHostCurrency,
+        );
+        await expense.update({
+          // Remove all fields related to a previous automatic payment
+          data: omit(expense.data, ['transfer', 'quote', 'fund', 'recipient', 'paymentOption']),
+        });
+      } else if (payoutMethodType === PayoutMethodTypes.PAYPAL) {
+        if (expense.collective.currency !== host.currency) {
+          throw new Error(
+            'PayPal adaptive payouts are not supported when the collective currency is different from the host currency. Please migrate to PayPal payouts: https://docs.opencollective.com/help/fiscal-hosts/payouts/payouts-with-paypal',
+          );
+        }
+
         const paypalEmail = payoutMethod.data.email;
         let paypalPaymentMethod = null;
         try {
@@ -1252,37 +1990,37 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
         // then we simply mark the expense as paid
         if (paypalPaymentMethod && paypalEmail === paypalPaymentMethod.name) {
           feesInHostCurrency['paymentProcessorFeeInHostCurrency'] = 0;
-          await createTransactions(host, expense, feesInHostCurrency);
-        } else if (args.forceManual) {
-          await createTransactions(host, expense, feesInHostCurrency);
+          await createTransactionsFromPaidExpense(host, expense, feesInHostCurrency, 'auto', { isManual: true });
         } else if (paypalPaymentMethod) {
-          return payExpenseWithPayPal(remoteUser, expense, host, paypalPaymentMethod, paypalEmail, feesInHostCurrency);
+          return payExpenseWithPayPalAdaptive(
+            remoteUser,
+            expense,
+            host,
+            paypalPaymentMethod,
+            paypalEmail,
+            feesInHostCurrency,
+          );
         } else {
           throw new Error('No Paypal account linked, please reconnect Paypal or pay manually');
         }
       } else if (payoutMethodType === PayoutMethodTypes.BANK_ACCOUNT) {
-        if (args.forceManual) {
-          feesInHostCurrency['paymentProcessorFeeInHostCurrency'] = 0;
-          await createTransactions(host, expense, feesInHostCurrency);
-        } else {
-          const [connectedAccount] = await host.getConnectedAccounts({
-            where: { service: 'transferwise', deletedAt: null },
-          });
-          if (!connectedAccount) {
-            throw new Error('Host is not connected to Transferwise');
-          }
-
-          const data = await paymentProviders.transferwise.payExpense(connectedAccount, payoutMethod, expense);
-
-          // Early return, Webhook will mark expense as Paid when the transaction completes.
-          return createTransferWiseTransactionsAndUpdateExpense({
-            host,
-            expense,
-            data,
-            fees: feesInHostCurrency,
-            remoteUser,
-          });
+        const [connectedAccount] = await host.getConnectedAccounts({
+          where: { service: 'transferwise', deletedAt: null },
+        });
+        if (!connectedAccount) {
+          throw new Error('Host is not connected to Transferwise');
         }
+
+        const data = await paymentProviders.transferwise.payExpense(connectedAccount, payoutMethod, expense);
+
+        // Early return, Webhook will mark expense as Paid when the transaction completes.
+        return setTransferWiseExpenseAsProcessing({
+          host,
+          expense,
+          data,
+          feesInHostCurrency,
+          remoteUser,
+        });
       } else if (payoutMethodType === PayoutMethodTypes.ACCOUNT_BALANCE) {
         const payee = expense.fromCollective;
         const payeeHost = await payee.getHostCollective();
@@ -1294,14 +2032,16 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
             'The payee needs to be on the same Host than the payer to be paid on its Open Collective balance.',
           );
         }
-        await createTransactions(host, expense, feesInHostCurrency);
+        await createTransactionsFromPaidExpense(host, expense, feesInHostCurrency, 'auto');
       } else if (expense.legacyPayoutMethod === 'manual' || expense.legacyPayoutMethod === 'other') {
         // note: we need to check for manual and other for legacy reasons
-        await createTransactions(host, expense, feesInHostCurrency);
+        await createTransactionsFromPaidExpense(host, expense, feesInHostCurrency, 'auto');
       }
     } catch (error) {
-      if (useTwoFactorAuthentication) {
-        await resetRollingPayoutLimitOnFailure(req.remoteUser, expense);
+      if (use2FARollingLimit) {
+        if (!isNil(totalPaidExpensesAmount) && totalPaidExpensesAmount !== 0) {
+          cache.set(totalPaidExpensesAmountKey, totalPaidExpensesAmount - expense.amount, ROLLING_LIMIT_CACHE_VALIDITY);
+        }
       }
 
       throw error;
@@ -1316,7 +2056,7 @@ export async function payExpense(req: express.Request, args: Record<string, unkn
 export async function markExpenseAsUnpaid(
   req: express.Request,
   expenseId: number,
-  processorFeeRefunded: boolean,
+  shouldRefundPaymentProcessorFee: boolean,
 ): Promise<typeof models.Expense> {
   const { remoteUser } = req;
 
@@ -1348,11 +2088,18 @@ export async function markExpenseAsUnpaid(
     }
 
     const transaction = await models.Transaction.findOne({
-      where: { ExpenseId: expenseId, RefundTransactionId: null },
+      where: {
+        ExpenseId: expenseId,
+        RefundTransactionId: null,
+        kind: TransactionKind.EXPENSE,
+        isRefund: false,
+      },
       include: [{ model: models.Expense }],
     });
 
-    const paymentProcessorFeeInHostCurrency = processorFeeRefunded ? transaction.paymentProcessorFeeInHostCurrency : 0;
+    const paymentProcessorFeeInHostCurrency = shouldRefundPaymentProcessorFee
+      ? transaction.paymentProcessorFeeInHostCurrency
+      : 0;
     await libPayments.createRefundTransaction(transaction, paymentProcessorFeeInHostCurrency, null, expense.User);
 
     return expense.update({ status: statuses.APPROVED, lastEditedById: remoteUser.id });
@@ -1361,3 +2108,222 @@ export async function markExpenseAsUnpaid(
   await updatedExpense.createActivity(activities.COLLECTIVE_EXPENSE_MARKED_AS_UNPAID, remoteUser);
   return updatedExpense;
 }
+
+export async function quoteExpense(expense_, { req }) {
+  const expense = await models.Expense.findByPk(expense_.id, {
+    include: [
+      { model: models.Collective, as: 'collective' },
+      { model: models.Collective, as: 'fromCollective' },
+    ],
+  });
+  const payoutMethod = await expense.getPayoutMethod();
+  const payoutMethodType = payoutMethod ? payoutMethod.type : expense.getPayoutMethodTypeFromLegacy();
+  if (!(await canPayExpense(req, expense))) {
+    throw new Unauthorized("You don't have permission to pay this expense");
+  }
+
+  const host = await expense.collective.getHostCollective();
+  if (payoutMethodType === PayoutMethodTypes.BANK_ACCOUNT) {
+    const [connectedAccount] = await host.getConnectedAccounts({
+      where: { service: 'transferwise', deletedAt: null },
+    });
+    if (!connectedAccount) {
+      throw new Error('Host is not connected to Transferwise');
+    }
+
+    const quote = await paymentProviders.transferwise.quoteExpense(connectedAccount, payoutMethod, expense);
+    return quote;
+  }
+}
+
+export const getExpenseAmountInDifferentCurrency = async (expense, toCurrency, req) => {
+  // Small helper to quickly generate an Amount object with fxRate
+  const buildAmount = (
+    fxRatePercentage: number,
+    fxRateSource: CurrencyExchangeRateSourceTypeEnum,
+    isApproximate: boolean,
+    date = expense.createdAt,
+  ) => ({
+    value: Math.round(expense.amount * fxRatePercentage),
+    currency: toCurrency,
+    exchangeRate: {
+      value: fxRatePercentage,
+      source: fxRateSource,
+      fromCurrency: expense.currency,
+      toCurrency: toCurrency,
+      date: date || expense.createdAt,
+      isApproximate,
+    },
+  });
+
+  // Simple case: no conversion needed
+  if (toCurrency === expense.currency) {
+    return { value: expense.amount, currency: expense.currency, exchangeRate: null };
+  }
+
+  // Retrieve existing FX rate based from payment provider payload (for already paid or quoted stuff)
+  const { WISE, PAYPAL, OPENCOLLECTIVE } = CurrencyExchangeRateSourceTypeEnum;
+  const payoutMethod = expense.PayoutMethodId && (await req.loaders.PayoutMethod.byId.load(expense.PayoutMethodId));
+
+  if (payoutMethod) {
+    if (payoutMethod.type === PayoutMethodTypes.BANK_ACCOUNT) {
+      const wiseFxRateInfo = getWiseFxRateInfoFromExpenseData(expense, expense.currency, toCurrency);
+      if (wiseFxRateInfo) {
+        return buildAmount(wiseFxRateInfo.value, WISE, !wiseFxRateInfo.isFinal, wiseFxRateInfo.date);
+      }
+    } else if (payoutMethod.type === PayoutMethodTypes.PAYPAL) {
+      const currencyConversion = expense.data?.['currency_conversion'];
+      if (currencyConversion) {
+        const fxRate = matchFxRateWithCurrency(
+          expense.currency,
+          toCurrency,
+          currencyConversion['from_amount']['currency'],
+          currencyConversion['to_amount']['currency'],
+          parseFloat(currencyConversion['exchange_rate']),
+        );
+
+        if (fxRate) {
+          const date = expense.data['time_processed'] ? new Date(expense.data['time_processed']) : null;
+          return buildAmount(fxRate, PAYPAL, false, date);
+        }
+      }
+    }
+  }
+
+  // TODO: Can we retrieve something for virtual cards?
+
+  if (expense.status === 'PAID') {
+    const result = await req.loaders.Expense.expenseToHostTransactionFxRateLoader.load(expense.id);
+    // If collective changed their currency since the expense was paid, we can't rely on transaction.currency
+    if (!isNil(result?.rate) && (!expense.collective || expense.collective.currency === result.currency)) {
+      return buildAmount(result.rate, OPENCOLLECTIVE, false, expense.createdAt);
+    }
+  }
+
+  // Fallback on internal system
+  const fxRate = await req.loaders.CurrencyExchangeRate.fxRate.load({ fromCurrency: expense.currency, toCurrency });
+  return buildAmount(fxRate, OPENCOLLECTIVE, true);
+};
+
+/**
+ * Move expenses to destination account
+ * @param expenses the list of models.Expense, with the collective association preloaded
+ */
+export const moveExpenses = async (
+  req: express.Request,
+  expenses: typeof models.Expense[],
+  destinationAccount: typeof models.Collective,
+) => {
+  // Root also checked in the mutation resolver, but duplicating just to be safe if someone decides to use this elsewhere
+  checkRemoteUserCanRoot(req);
+  if (!expenses.length) {
+    return [];
+  } else if (destinationAccount.type === collectiveTypes.USER) {
+    throw new ValidationFailed('The "destinationAccount" must not be an USER account');
+  }
+
+  // -- Move expenses --
+  const expenseIds: number[] = uniq(expenses.map(expense => expense.id));
+  const recurringExpenseIds: number[] = uniq(expenses.map(expense => expense.RecurringExpenseId).filter(Boolean));
+  const result = await sequelize.transaction(async dbTransaction => {
+    const associatedTransactionsCount = await models.Transaction.count({
+      where: { ExpenseId: expenseIds },
+      transaction: dbTransaction,
+    });
+
+    if (associatedTransactionsCount > 0) {
+      throw new ValidationFailed('Cannot move expenses with associated transactions');
+    }
+
+    // Moving associated models
+    const [, updatedExpenses] = await models.Expense.update(
+      { CollectiveId: destinationAccount.id },
+      {
+        transaction: dbTransaction,
+        returning: true,
+        where: { id: expenseIds },
+        hooks: false,
+      },
+    );
+
+    const [, updatedComments] = await models.Comment.update(
+      { CollectiveId: destinationAccount.id },
+      {
+        transaction: dbTransaction,
+        returning: ['id'],
+        where: { ExpenseId: expenseIds },
+        hooks: false,
+      },
+    );
+
+    const [, updatedActivities] = await models.Activity.update(
+      { CollectiveId: destinationAccount.id },
+      {
+        transaction: dbTransaction,
+        returning: ['id'],
+        where: { ExpenseId: expenseIds },
+        hooks: false,
+      },
+    );
+
+    let updatedRecurringExpenses = [];
+    if (recurringExpenseIds.length) {
+      [, updatedRecurringExpenses] = await models.RecurringExpense.update(
+        { CollectiveId: destinationAccount.id },
+        {
+          transaction: dbTransaction,
+          returning: ['id'],
+          where: { id: recurringExpenseIds },
+          hooks: false,
+        },
+      );
+    }
+
+    // Record the individual activities for moving the expenses
+    await models.Activity.bulkCreate(
+      updatedExpenses.map(expense => {
+        const originalExpense = find(expenses, { id: expense.id });
+        return {
+          type: ActivityTypes.COLLECTIVE_EXPENSE_MOVED,
+          UserId: req.remoteUser.id,
+          UserTokenId: req.userToken?.id,
+          FromCollectiveId: originalExpense.collective.id,
+          CollectiveId: destinationAccount.id,
+          HostCollectiveId: destinationAccount.HostCollectiveId,
+          ExpenseId: expense.id,
+          data: {
+            expense: expense.info,
+            movedFromCollective: originalExpense.collective.info,
+            collective: destinationAccount.info,
+          },
+        };
+      }),
+      {
+        transaction: dbTransaction,
+        hooks: false, // Hooks are not playing well with `bulkCreate`, and we don't need to send any email here anyway
+      },
+    );
+
+    // Record the migration log
+    await models.MigrationLog.create(
+      {
+        type: MigrationLogType.MOVE_EXPENSES,
+        description: `Moved ${updatedExpenses.length} expenses`,
+        CreatedByUserId: req.remoteUser.id,
+        data: {
+          expenses: updatedExpenses.map(o => o.id),
+          recurringExpenses: updatedRecurringExpenses.map(o => o.id),
+          comments: updatedComments.map(c => c.id),
+          activities: updatedActivities.map(a => a.id),
+          destinationAccount: destinationAccount.id,
+          previousExpenseValues: mapValues(keyBy(expenses, 'id'), expense => pick(expense, ['CollectiveId'])),
+        },
+      },
+      { transaction: dbTransaction },
+    );
+
+    return updatedExpenses;
+  });
+
+  return result;
+};

@@ -11,9 +11,10 @@ import {
   GraphQLString,
 } from 'graphql';
 import { Kind } from 'graphql/language';
-import GraphQLJSON from 'graphql-type-json';
+import { GraphQLJSON } from 'graphql-type-json';
 
 import { CaptchaInput } from '../v2/input/CaptchaInput';
+import { SocialLinkInput } from '../v2/input/SocialLinkInput';
 
 import { DateString } from './types';
 
@@ -106,18 +107,16 @@ export const UserInputType = new GraphQLInputObjectType({
   fields: () => ({
     id: { type: GraphQLInt },
     email: { type: EmailType },
-    firstName: { type: GraphQLString, deprecationReason: '2021-09-24: Use "name"' },
-    lastName: { type: GraphQLString, deprecationReason: '2021-09-24: Use "name"' },
     legalName: { type: GraphQLString },
     name: { type: GraphQLString },
     company: { type: GraphQLString },
     image: { type: GraphQLString },
-    username: { type: GraphQLString },
+    username: { type: GraphQLString, deprecationReason: '2022-01-13: Not used anymore. Will be ignored' },
     description: { type: GraphQLString },
     twitterHandle: { type: GraphQLString },
-    githubHandle: { type: GraphQLString },
+    githubHandle: { type: GraphQLString, deprecationReason: '2022-06-03: Please use repositoryUrl' },
+    repositoryUrl: { type: GraphQLString },
     website: { type: GraphQLString },
-    paypalEmail: { type: GraphQLString, deprecationReason: '2020-01-21: Replaced by PayoutMethods' },
     newsletterOptIn: { type: GraphQLBoolean },
     location: { type: LocationInputType },
   }),
@@ -158,7 +157,9 @@ export const CollectiveInputType = new GraphQLInputObjectType({
     company: { type: GraphQLString },
     website: { type: GraphQLString },
     twitterHandle: { type: GraphQLString },
-    githubHandle: { type: GraphQLString },
+    githubHandle: { type: GraphQLString, deprecationReason: '2022-06-03: Please use repositoryUrl' },
+    repositoryUrl: { type: GraphQLString },
+    socialLinks: { type: new GraphQLList(new GraphQLNonNull(SocialLinkInput)) },
     description: { type: GraphQLString },
     longDescription: { type: GraphQLString },
     expensePolicy: { type: GraphQLString },
@@ -181,8 +182,6 @@ export const CollectiveInputType = new GraphQLInputObjectType({
     ParentCollectiveId: { type: GraphQLInt },
     // not very logical to have this here. Might need some refactoring. Used to add/edit members and to create a new user on a new order
     email: { type: GraphQLString },
-    firstName: { type: GraphQLString, deprecationReason: '2021-09-24: Use "name"' },
-    lastName: { type: GraphQLString, deprecationReason: '2021-09-24: Use "name"' },
     isIncognito: { type: GraphQLBoolean },
     isActive: { type: GraphQLBoolean },
     contributionPolicy: { type: GraphQLString },
@@ -207,15 +206,14 @@ export const CollectiveAttributesInputType = new GraphQLInputObjectType({
     type: { type: GraphQLString },
     name: { type: GraphQLString },
     company: { type: GraphQLString },
-    firstName: { type: GraphQLString, deprecationReason: '2021-09-24: Use "name"' }, // for Collective type USER
-    lastName: { type: GraphQLString, deprecationReason: '2021-09-24: Use "name"' }, // for Collective type USER
     email: { type: GraphQLString }, // for Collective type USER
     description: { type: GraphQLString },
     longDescription: { type: GraphQLString },
     expensePolicy: { type: GraphQLString },
     website: { type: GraphQLString },
     twitterHandle: { type: GraphQLString },
-    githubHandle: { type: GraphQLString },
+    githubHandle: { type: GraphQLString, deprecationReason: '2022-06-03: Please use repositoryUrl' },
+    repositoryUrl: { type: GraphQLString },
     location: { type: LocationInputType },
     startsAt: { type: GraphQLString },
     endsAt: { type: GraphQLString },
@@ -302,6 +300,10 @@ export const TierInputType = new GraphQLInputObjectType({
       type: GraphQLString,
       description: 'End of the campaign',
     },
+    invoiceTemplate: {
+      type: GraphQLString,
+      description: 'Invoice receipt template',
+    },
   }),
 });
 
@@ -384,49 +386,5 @@ export const ConfirmOrderInputType = new GraphQLInputObjectType({
   description: 'Input type for ConfirmOrderType',
   fields: () => ({
     id: { type: GraphQLInt },
-  }),
-});
-
-export const CommentInputType = new GraphQLInputObjectType({
-  name: 'CommentInputType',
-  description: 'Input type for CommentType',
-  deprecationReason: 'Comments are now fully supported by API V2',
-  fields: () => ({
-    id: { type: GraphQLInt },
-    html: { type: GraphQLString },
-    FromCollectiveId: {
-      type: GraphQLInt,
-      description: 'Not supported yet. Defaults to user collective ID.',
-    },
-    CollectiveId: {
-      type: GraphQLInt,
-      deprecationReason:
-        '2019-11-28: This field is not used by the query. Collective ID is automatically guessed from linked entity (expense, update or conversation)',
-    },
-    ExpenseId: {
-      type: GraphQLInt,
-      deprecationReason: '2020-03-18: Comments on expenses must use API V2',
-    },
-    UpdateId: {
-      type: GraphQLInt,
-      deprecationReason: '2020-03-18: Comments on updates are not yet supported',
-    },
-    ConversationId: {
-      type: GraphQLInt,
-      deprecationReason: '2020-03-18: Comments on conversations must use API V2',
-    },
-  }),
-});
-
-export const CommentAttributesInputType = new GraphQLInputObjectType({
-  name: 'CommentAttributesInputType',
-  description: 'Input type for CommentType',
-  fields: () => ({
-    id: { type: GraphQLInt },
-    html: { type: GraphQLString },
-    UpdateId: {
-      deprecationReason: 'Deprecated since 2020-03-18: This field has never been active and will be removed soon.',
-      type: GraphQLInt,
-    },
   }),
 });

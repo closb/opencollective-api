@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import config from 'config';
 import gqlV2 from 'fake-tag';
-import sinon from 'sinon';
+import { createSandbox } from 'sinon';
 
 import { verifyJwt } from '../../../../../server/lib/auth';
 import emailLib from '../../../../../server/lib/email';
@@ -41,7 +41,7 @@ describe('server/graphql/v2/mutation/GuestMutations', () => {
 
   before(async () => {
     await resetTestDB();
-    sandbox = sinon.createSandbox();
+    sandbox = createSandbox();
     emailSendMessageSpy = sandbox.spy(emailLib, 'sendMessage');
     sandbox.stub(config, 'limits').value({
       sendGuestConfirmPerMinutePerIp: 1000000,
@@ -81,7 +81,6 @@ describe('server/graphql/v2/mutation/GuestMutations', () => {
       result.errors && console.error(result.errors);
       expect(result.errors).to.not.exist;
       expect(result.data.sendGuestConfirmationEmail).to.be.true;
-      console.log(result);
 
       await waitForCondition(() => emailSendMessageSpy.callCount === 1);
       expect(emailSendMessageSpy.callCount).to.equal(1);

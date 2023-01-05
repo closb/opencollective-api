@@ -1,13 +1,24 @@
 import { GraphQLInt, GraphQLObjectType, GraphQLString } from 'graphql';
-import { GraphQLDateTime } from 'graphql-iso-date';
+import { GraphQLDateTime } from 'graphql-scalars';
 import { GraphQLJSONObject } from 'graphql-type-json';
 
+import ExpenseStatus from '../../../constants/expense_status';
+import { VirtualCardLimitIntervals } from '../../../constants/virtual-cards';
+import { getSpendingLimitIntervalDates } from '../../../lib/stripe';
+import models, { Op } from '../../../models';
+import { checkScope } from '../../common/scope-check';
+import { Currency } from '../enum';
+import { VirtualCardLimitInterval } from '../enum/VirtualCardLimitInterval';
 import { Account } from '../interface/Account';
-import { Individual } from '../object/Individual';
+
+import { Individual } from './Individual';
+
+const canSeeVirtualCardPrivateInfo = (req, collective) =>
+  req.remoteUser?.isAdminOfCollectiveOrHost(collective) && checkScope(req, 'virtualCards');
 
 export const VirtualCard = new GraphQLObjectType({
   name: 'VirtualCard',
-  description: 'VirtualCard related properties.',
+  description: 'A Virtual Card used to pay expenses',
   fields: () => ({
     id: { type: GraphQLString },
     account: {
@@ -44,45 +55,36 @@ export const VirtualCard = new GraphQLObjectType({
     },
     name: {
       type: GraphQLString,
-      resolve(virtualCard, _, req) {
-        if (
-          req.remoteUser?.isAdmin(virtualCard.CollectiveId) ||
-          req.remoteUser?.isAdmin(virtualCard.HostCollectiveId)
-        ) {
+      async resolve(virtualCard, _, req) {
+        const collective = await req.loaders.Collective.byId.load(virtualCard.CollectiveId);
+        if (canSeeVirtualCardPrivateInfo(req, collective)) {
           return virtualCard.name;
         }
       },
     },
     last4: {
       type: GraphQLString,
-
-      resolve(virtualCard, _, req) {
-        if (
-          req.remoteUser?.isAdmin(virtualCard.CollectiveId) ||
-          req.remoteUser?.isAdmin(virtualCard.HostCollectiveId)
-        ) {
+      async resolve(virtualCard, _, req) {
+        const collective = await req.loaders.Collective.byId.load(virtualCard.CollectiveId);
+        if (canSeeVirtualCardPrivateInfo(req, collective)) {
           return virtualCard.last4;
         }
       },
     },
     data: {
       type: GraphQLJSONObject,
-      resolve(virtualCard, _, req) {
-        if (
-          req.remoteUser?.isAdmin(virtualCard.CollectiveId) ||
-          req.remoteUser?.isAdmin(virtualCard.HostCollectiveId)
-        ) {
+      async resolve(virtualCard, _, req) {
+        const collective = await req.loaders.Collective.byId.load(virtualCard.CollectiveId);
+        if (canSeeVirtualCardPrivateInfo(req, collective)) {
           return virtualCard.data;
         }
       },
     },
     privateData: {
       type: GraphQLJSONObject,
-      resolve(virtualCard, _, req) {
-        if (
-          req.remoteUser?.isAdmin(virtualCard.CollectiveId) ||
-          req.remoteUser?.isAdmin(virtualCard.HostCollectiveId)
-        ) {
+      async resolve(virtualCard, _, req) {
+        const collective = await req.loaders.Collective.byId.load(virtualCard.CollectiveId);
+        if (canSeeVirtualCardPrivateInfo(req, collective)) {
           return virtualCard.get('privateData');
         }
       },
@@ -90,26 +92,61 @@ export const VirtualCard = new GraphQLObjectType({
     provider: { type: GraphQLString },
     spendingLimitAmount: {
       type: GraphQLInt,
-      resolve(virtualCard, _, req) {
-        if (
-          req.remoteUser?.isAdmin(virtualCard.CollectiveId) ||
-          req.remoteUser?.isAdmin(virtualCard.HostCollectiveId)
-        ) {
+      async resolve(virtualCard, _, req) {
+        const collective = await req.loaders.Collective.byId.load(virtualCard.CollectiveId);
+        if (canSeeVirtualCardPrivateInfo(req, collective)) {
           return virtualCard.spendingLimitAmount;
         }
       },
     },
     spendingLimitInterval: {
-      type: GraphQLString,
-      resolve(virtualCard, _, req) {
-        if (
-          req.remoteUser?.isAdmin(virtualCard.CollectiveId) ||
-          req.remoteUser?.isAdmin(virtualCard.HostCollectiveId)
-        ) {
+      type: VirtualCardLimitInterval,
+      async resolve(virtualCard, _, req) {
+        const collective = await req.loaders.Collective.byId.load(virtualCard.CollectiveId);
+        if (canSeeVirtualCardPrivateInfo(req, collective)) {
           return virtualCard.spendingLimitInterval;
         }
       },
     },
+    spendingLimitRenewsOn: {
+      type: GraphQLDateTime,
+      async resolve(virtualCard, _, req) {
+        const collective = await req.loaders.Collective.byId.load(virtualCard.CollectiveId);
+        if (canSeeVirtualCardPrivateInfo(req, collective)) {
+          const { spendingLimitInterval } = virtualCard;
+
+          const { renewsOn } = getSpendingLimitIntervalDates(spendingLimitInterval);
+
+          return renewsOn;
+        }
+      },
+    },
+    remainingLimit: {
+      type: GraphQLInt,
+      async resolve(virtualCard, _, req) {
+        const collective = await req.loaders.Collective.byId.load(virtualCard.CollectiveId);
+        if (canSeeVirtualCardPrivateInfo(req, collective)) {
+          const { spendingLimitAmount, spendingLimitInterval } = virtualCard;
+
+          if (spendingLimitInterval === VirtualCardLimitIntervals.PER_AUTHORIZATION) {
+            return spendingLimitAmount;
+          }
+
+          const { renewedOn } = getSpendingLimitIntervalDates(spendingLimitInterval);
+
+          const sumExpensesInPeriod = await models.Expense.sum('amount', {
+            where: {
+              VirtualCardId: virtualCard.id,
+              status: [ExpenseStatus.PROCESSING, ExpenseStatus.PAID],
+              ...(renewedOn && { incurredAt: { [Op.gte]: renewedOn } }),
+            },
+          });
+
+          return spendingLimitAmount - sumExpensesInPeriod;
+        }
+      },
+    },
+    currency: { type: Currency },
     createdAt: { type: GraphQLDateTime },
     updatedAt: { type: GraphQLDateTime },
   }),

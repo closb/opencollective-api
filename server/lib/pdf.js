@@ -7,6 +7,7 @@ import models, { Op } from '../models';
 import { TOKEN_EXPIRATION_PDF } from './auth';
 import { fetchWithTimeout } from './fetch';
 import logger from './logger';
+import { reportErrorToSentry } from './sentry';
 import { parseToBoolean } from './utils';
 
 export const getTransactionPdf = async (transaction, user) => {
@@ -31,18 +32,16 @@ export const getTransactionPdf = async (transaction, user) => {
     })
     .catch(error => {
       logger.error(`Error fetching PDF: ${error.message}`);
+      reportErrorToSentry(error);
     });
 };
 
 export const getConsolidatedInvoicesData = async fromCollective => {
   const fromAccountCondition = [fromCollective.id];
 
-  const fromUser = await fromCollective.getUser();
-  if (fromUser) {
-    const incognitoProfile = await fromUser.getIncognitoProfile();
-    if (incognitoProfile) {
-      fromAccountCondition.push(incognitoProfile.id);
-    }
+  const incognitoProfile = await fromCollective.getIncognitoProfile();
+  if (incognitoProfile) {
+    fromAccountCondition.push(incognitoProfile.id);
   }
 
   const where = {
@@ -50,6 +49,11 @@ export const getConsolidatedInvoicesData = async fromCollective => {
     createdAt: { [Op.lt]: moment().startOf('month') },
     [Op.or]: [{ FromCollectiveId: fromAccountCondition }, { UsingGiftCardFromCollectiveId: fromCollective.id }],
   };
+
+  // If collective is a Host account, we'll ignore receipts that were fulfilled by the same host
+  if (fromCollective.isHostAccount) {
+    where['HostCollectiveId'] = { [Op.ne]: fromCollective.id };
+  }
 
   const transactions = await models.Transaction.findAll({
     attributes: ['createdAt', 'HostCollectiveId'],
@@ -144,6 +148,7 @@ export const getConsolidatedInvoicePdfs = async fromCollective => {
       }
     } catch (error) {
       logger.error(`Error fetching PDF: ${error.message}`);
+      reportErrorToSentry(error);
     }
 
     // Push invoice to attachments if fetch is successful

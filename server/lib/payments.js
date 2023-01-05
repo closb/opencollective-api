@@ -6,6 +6,7 @@ import { find, get, includes, isNil, isNumber, omit, pick } from 'lodash';
 import { v4 as uuid } from 'uuid';
 
 import activities from '../constants/activities';
+import { ExpenseFeesPayer } from '../constants/expense-fees-payer';
 import status from '../constants/order_status';
 import { PAYMENT_METHOD_TYPE } from '../constants/paymentMethods';
 import roles from '../constants/roles';
@@ -16,17 +17,19 @@ import models, { Op } from '../models';
 import TransactionSettlement, { TransactionSettlementStatus } from '../models/TransactionSettlement';
 import paymentProviders from '../paymentProviders';
 
+import { notify } from './notifications/email';
 import { getFxRate } from './currency';
 import emailLib from './email';
 import logger from './logger';
-import { notifyAdminsOfCollective } from './notifications';
 import { getTransactionPdf } from './pdf';
 import { createPrepaidPaymentMethod, isPrepaidBudgetOrder } from './prepaid-budget';
 import { getNextChargeAndPeriodStartDates } from './recurring-contributions';
 import { stripHTML } from './sanitize-html';
+import { reportMessageToSentry } from './sentry';
 import { netAmount } from './transactions';
 import { formatAccountDetails } from './transferwise';
-import { formatCurrency, parseToBoolean, toIsoDateStr } from './utils';
+import { getEditRecurringContributionsUrl } from './url-utils';
+import { formatCurrency, toIsoDateStr } from './utils';
 
 const { CREDIT, DEBIT } = TransactionTypes;
 
@@ -104,9 +107,18 @@ export async function processOrder(order, options) {
  * @param {string} message a optional message to explain why the transaction is rejected
  */
 export async function refundTransaction(transaction, user, message) {
+  // Make sure to fetch PaymentMethod
+  // Fetch PaymentMethod even if it's deleted
+  if (!transaction.PaymentMethod && transaction.PaymentMethodId) {
+    transaction.PaymentMethod = await models.PaymentMethod.findByPk(transaction.PaymentMethodId, { paranoid: false });
+  }
+
   // If no payment method was used, it means that we're using a manual payment method
   const paymentMethodProvider = transaction.PaymentMethod
     ? findPaymentMethodProvider(transaction.PaymentMethod)
+    : // TODO: Drop this in favor of findPaymentMethodProvider when persisting PaymentIntents as Payment Methods
+    ['us_bank_account', 'sepa_debit'].includes(transaction.data?.charge?.payment_method_details?.type)
+    ? paymentProviders.stripe.types.paymentintent
     : paymentProviders.opencollective.types.manual;
 
   if (!paymentMethodProvider.refundTransaction) {
@@ -119,7 +131,7 @@ export async function refundTransaction(transaction, user, message) {
     result = await paymentMethodProvider.refundTransaction(transaction, user, message);
   } catch (e) {
     if (
-      e.message.includes('has already been refunded') &&
+      (e.message.includes('has already been refunded') || e.message.includes('has been charged back')) &&
       paymentMethodProvider &&
       paymentMethodProvider.refundTransactionOnlyInDatabase
     ) {
@@ -158,10 +170,12 @@ export const buildRefundForTransaction = (t, user, data, refundedPaymentProcesso
     'hostFeeInHostCurrency',
     'platformFeeInHostCurrency',
     'paymentProcessorFeeInHostCurrency',
-    'data.isFeesOnTop',
+    'data.hasPlatformTip',
+    'data.isFeesOnTop', // deprecated form, replaced by hasPlatformTip
     'data.tax',
     'kind',
     'isDebt',
+    'PayoutMethodId',
   ]);
 
   refund.CreatedByUserId = user?.id || null;
@@ -176,26 +190,42 @@ export const buildRefundForTransaction = (t, user, data, refundedPaymentProcesso
   refund.platformFeeInHostCurrency = -refund.platformFeeInHostCurrency;
   refund.paymentProcessorFeeInHostCurrency = -refund.paymentProcessorFeeInHostCurrency;
 
-  /* If the payment processor doesn't refund the fee, the equivalent
-   * of the fee will be transferred from the host to the user so the
-   * user can get the full refund. */
-  if (refundedPaymentProcessorFee === 0 && !parseToBoolean(config.ledger.separateHostFees)) {
-    refund.hostFeeInHostCurrency += refund.paymentProcessorFeeInHostCurrency;
-    refund.paymentProcessorFeeInHostCurrency = 0;
-  }
-
   /* Amount fields. Must be calculated after tweaking all the fees */
   refund.amount = -t.amount;
   refund.amountInHostCurrency = -t.amountInHostCurrency;
   refund.netAmountInCollectiveCurrency = -netAmount(t);
   refund.isRefund = true;
 
-  if (parseToBoolean(config.ledger.separateHostFees)) {
-    // We're handling payment processor fees and host fees in separate transactions
-    refund.hostFeeInHostCurrency = 0;
+  // We're handling host fees in separate transactions
+  refund.hostFeeInHostCurrency = 0;
+
+  // Adjust refunded payment processor fee based on the fees payer
+  if (refund.kind === TransactionKind.EXPENSE) {
+    const feesPayer = t.data?.feesPayer || ExpenseFeesPayer.COLLECTIVE;
+    if (feesPayer === ExpenseFeesPayer.PAYEE) {
+      if (refundedPaymentProcessorFee) {
+        // If the fee gets refunded, we add it as a positive value on the refund transactions
+        refund.paymentProcessorFeeInHostCurrency = Math.abs(refundedPaymentProcessorFee);
+      } else {
+        // Otherwise, payment processor fees are deducted from the refunded amount which means
+        // the collective will receive the original expense amount minus payment processor fees
+        refund.amountInHostCurrency += Math.abs(t.paymentProcessorFeeInHostCurrency);
+        refund.amount = Math.round(refund.amountInHostCurrency / refund.hostCurrencyFxRate);
+        refund.paymentProcessorFeeInHostCurrency = 0;
+      }
+    } else if (feesPayer === ExpenseFeesPayer.COLLECTIVE) {
+      refund.amountInHostCurrency += Math.abs(t.paymentProcessorFeeInHostCurrency);
+      refund.amount = Math.round(refund.amountInHostCurrency / refund.hostCurrencyFxRate);
+      refund.paymentProcessorFeeInHostCurrency = 0;
+    } else {
+      throw new Error(`Refund not supported for feesPayer = '${feesPayer}'`);
+    }
+  } else {
     refund.paymentProcessorFeeInHostCurrency = 0;
-    refund.netAmountInCollectiveCurrency = -netAmount({ ...t, paymentProcessorFeeInHostCurrency: 0 });
   }
+
+  // Re-compute the net amount
+  refund.netAmountInCollectiveCurrency = netAmount(refund);
 
   return refund;
 };
@@ -215,6 +245,7 @@ export const refundPaymentProcessorFeeToCollective = async (transaction, refundT
     FromCollectiveId: transaction.HostCollectiveId,
     HostCollectiveId: transaction.HostCollectiveId,
     OrderId: transaction.OrderId,
+    ExpenseId: transaction.ExpenseId,
     description: 'Cover of payment processor fee for refund',
     isRefund: true,
     TransactionGroup: refundTransactionGroup,
@@ -256,10 +287,22 @@ export const refundPaymentProcessorFeeToCollective = async (transaction, refundT
  *  method that should be saved within the *data* field of the
  *  transactions being created.
  */
-export async function createRefundTransaction(transaction, refundedPaymentProcessorFee, data, user) {
+export async function createRefundTransaction(
+  transaction,
+  refundedPaymentProcessorFee,
+  data,
+  user,
+  transactionGroupId = null,
+) {
   /* If the transaction passed isn't the one from the collective
-   * perspective, the opposite transaction is retrieved. */
-  if (transaction.type === DEBIT) {
+   * perspective, the opposite transaction is retrieved.
+   *
+   * However when the transaction is between the same collective (say an
+   * an expense from a collective to itself), then there will be no CREDIT
+   * transaction, and therefore we skip.
+   *
+   * */
+  if (transaction.type === DEBIT && transaction.FromCollectiveId !== transaction.CollectiveId) {
     transaction = await transaction.getRelatedTransaction({ type: CREDIT });
   }
 
@@ -273,7 +316,7 @@ export async function createRefundTransaction(transaction, refundedPaymentProces
   const buildRefund = transaction => {
     return {
       ...buildRefundForTransaction(transaction, user, data, refundedPaymentProcessorFee),
-      TransactionGroup: transactionGroup,
+      TransactionGroup: transactionGroupId || transactionGroup,
     };
   };
 
@@ -311,16 +354,21 @@ export async function createRefundTransaction(transaction, refundedPaymentProces
   }
 
   // Refund Payment Processor Fee
-  if (parseToBoolean(config.ledger.separateHostFees)) {
-    if (refundedPaymentProcessorFee && refundedPaymentProcessorFee !== transaction.paymentProcessorFeeInHostCurrency) {
-      logger.error(
-        `Partial processor fees refunds are not supported, got ${refundedPaymentProcessorFee} for #${transaction.id}`,
-      );
-    } else if (transaction.paymentProcessorFeeInHostCurrency) {
-      // When refunding an Expense, we need to use the DEBIT transaction which is attached to the Collective and its Host.
-      const transactionToRefundPaymentProcessorFee = transaction.ExpenseId
-        ? await transaction.getRelatedTransaction({ type: DEBIT })
-        : transaction;
+  if (refundedPaymentProcessorFee && refundedPaymentProcessorFee !== transaction.paymentProcessorFeeInHostCurrency) {
+    logger.error(
+      `Partial processor fees refunds are not supported, got ${refundedPaymentProcessorFee} for #${transaction.id}`,
+    );
+    reportMessageToSentry('Partial processor fees refunds are not supported', {
+      extra: { refundedPaymentProcessorFee, transaction: transaction.info },
+    });
+  } else if (transaction.paymentProcessorFeeInHostCurrency) {
+    // When refunding an Expense, we need to use the DEBIT transaction which is attached to the Collective and its Host.
+    const transactionToRefundPaymentProcessorFee = transaction.ExpenseId
+      ? await transaction.getRelatedTransaction({ type: DEBIT })
+      : transaction;
+
+    const feesPayer = transaction.data?.feesPayer || ExpenseFeesPayer.COLLECTIVE;
+    if (feesPayer === ExpenseFeesPayer.COLLECTIVE) {
       // Host take at their charge the payment processor fee that is lost when refunding a transaction
       await refundPaymentProcessorFeeToCollective(transactionToRefundPaymentProcessorFee, transactionGroup);
     }
@@ -396,14 +444,22 @@ export async function associateTransactionRefundId(transaction, refund, data) {
     credit.data = data;
   }
 
-  debit.RefundTransactionId = refundCredit.id;
-  await debit.save(); // User Ledger
-  credit.RefundTransactionId = refundDebit.id;
-  await credit.save(); // Collective Ledger
-  refundDebit.RefundTransactionId = credit.id;
-  await refundDebit.save(); // Collective Ledger
-  refundCredit.RefundTransactionId = debit.id;
-  await refundCredit.save(); // User Ledger
+  if (refundCredit && debit) {
+    debit.RefundTransactionId = refundCredit.id;
+    await debit.save(); // User Ledger
+  }
+
+  if (refundDebit && credit) {
+    credit.RefundTransactionId = refundDebit.id;
+    await credit.save(); // Collective Ledger
+    refundDebit.RefundTransactionId = credit.id;
+    await refundDebit.save(); // Collective Ledger
+  }
+
+  if (refundCredit && debit) {
+    refundCredit.RefundTransactionId = debit.id;
+    await refundCredit.save(); // User Ledger
+  }
 
   // We need to return the same transactions we received because the
   // graphql mutation needs it to return to the user. However we have
@@ -433,16 +489,21 @@ export const sendEmailNotifications = (order, transaction) => {
     // Check if transaction is from host to one of its hosted collective/fund/project/event
     // fromCollective: host, collective: a collective/fund/project/event
     order.fromCollective?.id !== order.collective?.HostCollectiveId &&
-    // Check is transaction is from a collective/fund/project/event to its host
+    // Check if transaction is from a collective/fund/project/event to its host
     // fromCollective: a collective/fund/project/event, collective: host of fromCollective
-    order.fromCollective?.HostCollectiveId !== order.collective?.id
+    order.fromCollective?.HostCollectiveId !== order.collective?.id &&
+    // Check if transaction is from a collective to itself. This happens when we add funds
+    // choosing the source as itself. In this case do not send an email.
+    order.fromCollective?.id !== order.collective?.id
   ) {
     sendOrderConfirmedEmail(order, transaction); // async
   } else if (order.status === status.PENDING && order.paymentMethod?.type === 'crypto') {
     sendCryptoOrderProcessingEmail(order);
   } else if (order.status === status.PENDING) {
-    sendOrderProcessingEmail(order); // This is the one for the Contributor
+    sendOrderPendingEmail(order); // This is the one for the Contributor
     sendManualPendingOrderEmail(order); // This is the one for the Host Admins
+  } else if (order.status === status.PROCESSING) {
+    sendOrderProcessingEmail(order);
   }
 };
 
@@ -490,7 +551,11 @@ export const executeOrder = async (user, order, options = {}) => {
   if (!order) {
     return Promise.reject(new Error('No order provided'));
   }
-  if (order.processedAt) {
+  /* Added funds have a processedAt date by default because they are processed
+     immediately. If the payment method is manual the host admin will have to
+     process it manually and potentially can set a date using the confirm
+     contribution modal. */
+  if (order.processedAt && !options.isAddedFund && order.paymentMethod.type !== 'manual') {
     return Promise.reject(new Error(`This order (#${order.id}) has already been processed at ${order.processedAt}`));
   }
   debug('executeOrder', user.email, order.description, order.totalAmount, options);
@@ -511,7 +576,18 @@ export const executeOrder = async (user, order, options = {}) => {
 
   const transaction = await processOrder(order, options);
   if (transaction) {
-    await order.update({ status: status.PAID, processedAt: new Date(), data: omit(order.data, ['paymentIntent']) });
+    await order.update({
+      status: status.PAID,
+      processedAt: order.processedAt || new Date(),
+      data: omit(order.data, ['paymentIntent']),
+    });
+
+    // Credit card charges are synchronous. If the transaction is
+    // created here it means that the payment went through so it's
+    // safe to create subscription after this.
+
+    // The order will be updated to ACTIVE
+    order.interval && (await createSubscription(order));
 
     // Register user as collective backer (don't do for internal transfers)
     // Or in the case of tickets register the user as an ATTENDEE
@@ -542,13 +618,6 @@ export const executeOrder = async (user, order, options = {}) => {
       { order, skipActivity: true },
     );
   }
-
-  // Credit card charges are synchronous. If the transaction is
-  // created here it means that the payment went through so it's
-  // safe to create subscription after this.
-
-  // The order will be updated to ACTIVE
-  order.interval && transaction && (await createSubscription(order));
 };
 
 const validatePayment = payment => {
@@ -564,13 +633,19 @@ const validatePayment = payment => {
 const sendOrderConfirmedEmail = async (order, transaction) => {
   const attachments = [];
   const { collective, tier, interval, fromCollective, paymentMethod } = order;
-  const user = order.createdByUser;
+  const user = await order.getUserForActivity();
   const host = await collective.getHostCollective();
+  const parentCollective = await collective.getParentCollective();
+  const customMessage = collective.settings?.customEmailMessage || parentCollective?.settings?.customEmailMessage;
 
   if (tier && tier.type === tiers.TICKET) {
     return models.Activity.create({
       type: activities.TICKET_CONFIRMED,
       CollectiveId: collective.id,
+      FromCollectiveId: fromCollective.id,
+      OrderId: order.id,
+      HostCollectiveId: host?.id,
+      UserId: user.id,
       data: {
         EventCollectiveId: collective.id,
         UserId: user.id,
@@ -578,6 +653,7 @@ const sendOrderConfirmedEmail = async (order, transaction) => {
         order: order.activity,
         tier: tier && tier.info,
         host: host ? host.info : {},
+        customMessage,
       },
     });
   } else {
@@ -594,7 +670,8 @@ const sendOrderConfirmedEmail = async (order, transaction) => {
       relatedCollectives,
       monthlyInterval: interval === 'month',
       firstPayment: true,
-      subscriptionsLink: interval && `${config.host.website}/${fromCollective.slug}/recurring-contributions`,
+      subscriptionsLink: interval && getEditRecurringContributionsUrl(fromCollective),
+      customMessage,
     };
 
     // hit PDF service and get PDF (unless payment method type is gift card)
@@ -625,17 +702,12 @@ const sendOrderConfirmedEmail = async (order, transaction) => {
       }
     }
 
-    const emailOptions = {
-      from: `${collective.name} <no-reply@${collective.slug}.opencollective.com>`,
+    const activity = { type: activities.ORDER_THANKYOU, data };
+    return notify.collective(activity, {
+      collectiveId: data.fromCollective.id,
+      from: emailLib.generateFromEmailHeader(collective.name),
       attachments,
-    };
-
-    const activity = {
-      type: 'thankyou',
-      data,
-    };
-
-    return notifyAdminsOfCollective(data.fromCollective.id, activity, emailOptions);
+    });
   }
 };
 
@@ -657,18 +729,23 @@ const sendCryptoOrderProcessingEmail = async order => {
       pledgeCurrency: order.data.thegivingblock.pledgeCurrency,
     };
 
-    return emailLib.send('order.crypto.processing', user.email, data, {
-      from: `${collective.name} <no-reply@${collective.slug}.opencollective.com>`,
+    await models.Activity.create({
+      type: activities.ORDER_PENDING_CRYPTO,
+      CollectiveId: collective.id,
+      FromCollectiveId: fromCollective.id,
+      OrderId: order.id,
+      HostCollectiveId: host?.id,
+      UserId: user.id,
+      data,
     });
   }
 };
 
 // Assumes one-time payments,
-export const sendOrderProcessingEmail = async order => {
+export const sendOrderPendingEmail = async order => {
   const { collective, fromCollective } = order;
   const user = order.createdByUser;
   const host = await collective.getHostCollective();
-  const parentCollective = await collective.getParentCollective();
   const manualPayoutMethod = await models.PayoutMethod.findOne({
     where: { CollectiveId: host.id, data: { isManualBankTransfer: true } },
   });
@@ -681,7 +758,7 @@ export const sendOrderProcessingEmail = async order => {
     collective: collective.info,
     host: host.info,
     fromCollective: fromCollective.activity,
-    subscriptionsLink: `${config.host.website}/${fromCollective.slug}/recurring-contributions`,
+    subscriptionsLink: getEditRecurringContributionsUrl(fromCollective),
   };
   const instructions = get(host, 'settings.paymentMethods.manual.instructions');
   if (instructions) {
@@ -689,7 +766,7 @@ export const sendOrderProcessingEmail = async order => {
       account,
       reference: order.id,
       amount: formatCurrency(order.totalAmount, order.currency, 2),
-      collective: parentCollective ? `${parentCollective.slug} event` : order.collective.slug,
+      collective: order.collective.name,
       tier: get(order, 'tier.slug') || get(order, 'tier.name'),
       // @deprecated but we still have some entries in the DB
       OrderId: order.id,
@@ -702,8 +779,63 @@ export const sendOrderProcessingEmail = async order => {
       }
     });
   }
-  return emailLib.send('order.processing', user.email, data, {
-    from: `${collective.name} <no-reply@${collective.slug}.opencollective.com>`,
+  await models.Activity.create({
+    type: activities.ORDER_PENDING,
+    UserId: user.id,
+    CollectiveId: collective.id,
+    FromCollectiveId: fromCollective.id,
+    OrderId: order.id,
+    HostCollectiveId: host.id,
+    data,
+  });
+};
+
+export const sendOrderProcessingEmail = async order => {
+  const { collective, fromCollective } = order;
+  const user = order.createdByUser;
+  const host = await collective.getHostCollective();
+
+  const data = {
+    order: order.info,
+    user: user.info,
+    collective: collective.info,
+    host: host.info,
+    fromCollective: fromCollective.activity,
+  };
+
+  await models.Activity.create({
+    type: activities.ORDER_PROCESSING,
+    UserId: user.id,
+    CollectiveId: collective.id,
+    FromCollectiveId: fromCollective.id,
+    OrderId: order.id,
+    HostCollectiveId: host.id,
+    data,
+  });
+};
+
+export const sendOrderFailedEmail = async (order, reason) => {
+  const user = order.createdByUser;
+  const { collective, fromCollective } = order;
+  const host = await collective.getHostCollective();
+
+  const data = {
+    order: order.info,
+    user: user.info,
+    collective: collective.info,
+    host: host.info,
+    fromCollective: fromCollective.activity,
+    reason,
+  };
+
+  await models.Activity.create({
+    type: activities.ORDER_PAYMENT_FAILED,
+    UserId: user.id,
+    CollectiveId: collective.id,
+    FromCollectiveId: fromCollective.id,
+    OrderId: order.id,
+    HostCollectiveId: host.id,
+    data,
   });
 };
 
@@ -729,9 +861,16 @@ const sendManualPendingOrderEmail = async order => {
     host: host.info,
     fromCollective: fromCollective.activity,
     pendingOrderLink: `${config.host.website}/${host.slug}/admin/orders?searchTerm=%23${order.id}`,
+    replyTo,
   };
-
-  return notifyAdminsOfCollective(host.id, { type: 'order.new.pendingFinancialContribution', data }, { replyTo });
+  return models.Activity.create({
+    type: activities.ORDER_PENDING_CONTRIBUTION_NEW,
+    CollectiveId: order.CollectiveId,
+    FromCollectiveId: order.FromCollectiveId,
+    HostCollectiveId: collective.approvedAt ? collective.HostCollectiveId : null,
+    OrderId: order.id,
+    data,
+  });
 };
 
 export const sendReminderPendingOrderEmail = async order => {
@@ -752,17 +891,27 @@ export const sendReminderPendingOrderEmail = async order => {
     fromCollective: fromCollective.activity,
     viewDetailsLink: `${config.host.website}/${host.slug}/admin/orders?searchTerm=%23${order.id}`,
   };
-
-  return notifyAdminsOfCollective(host.id, { type: 'order.reminder.pendingFinancialContribution', data });
+  return await models.Activity.create({
+    type: activities.ORDER_PENDING_CONTRIBUTION_REMINDER,
+    CollectiveId: order.CollectiveId,
+    FromCollectiveId: order.FromCollectiveId,
+    HostCollectiveId: collective.approvedAt ? collective.HostCollectiveId : null,
+    OrderId: order.id,
+    data,
+  });
 };
 
 export const sendExpiringCreditCardUpdateEmail = async data => {
   data = {
     ...data,
-    updateDetailsLink: `${config.host.website}/${data.slug}/paymentmethod/${data.id}/update`,
+    updateDetailsLink: `${config.host.website}/paymentmethod/${data.id}/update`,
+    isSystem: true,
   };
-
-  return emailLib.send('payment.creditcard.expiring', data.email, data);
+  await models.Activity.create({
+    type: activities.PAYMENT_CREDITCARD_EXPIRING,
+    CollectiveId: data.CollectiveId,
+    data,
+  });
 };
 
 export const getApplicationFee = async (order, host = null) => {
@@ -779,16 +928,12 @@ export const getApplicationFee = async (order, host = null) => {
 };
 
 export const getPlatformTip = object => {
-  if (object.data?.platformTip) {
+  if (!isNil(object.platformTipAmount)) {
+    return object.platformTipAmount;
+  }
+  // Legacy form, but still being used sometime when extracting platformTip from transactionData
+  if (!isNil(object.data?.platformTip)) {
     return object.data?.platformTip;
-  }
-  if (object.data?.platformFee) {
-    return object.data?.platformFee;
-  }
-  // Compatibility with some older tests
-  // TODO: doesn't seem accurate in multi currency
-  if (object.data?.isFeesOnTop && !isNil(object.platformFeeInHostCurrency)) {
-    return Math.abs(object.platformFeeInHostCurrency);
   }
   return 0;
 };
@@ -821,7 +966,11 @@ export const isPlatformTipEligible = async (order, host = null) => {
 };
 
 export const getHostFeePercent = async (order, host = null) => {
-  host = host || (await order.collective.getHostCollective());
+  const collective = order.collective;
+
+  const parent = await collective.getParentCollective();
+
+  host = host || (await collective.getHostCollective());
 
   // No Host Fee for money going to an host itself
   if (order.collective.isHostAccount) {
@@ -829,14 +978,23 @@ export const getHostFeePercent = async (order, host = null) => {
   }
 
   const possibleValues = [
-    // Fixed in the Order (special tiers: BackYourStack, Pre-Paid)
+    // Fixed in the Order (Added Funds or special tiers: BackYourStack, Pre-Paid)
     order.data?.hostFeePercent,
   ];
 
   if (order.paymentMethod.service === 'opencollective' && order.paymentMethod.type === 'manual') {
     // Fixed for Bank Transfers at collective level
     // As of August 2020, this will be only set on a selection of Collective (some foundation collectives 5%)
-    possibleValues.push(order.collective.data?.bankTransfersHostFeePercent);
+    possibleValues.push(collective.data?.bankTransfersHostFeePercent);
+    // Fixed for Bank Transfers at parent level
+    possibleValues.push(parent?.data?.bankTransfersHostFeePercent);
+    // Custom fee is a priority over host custom one
+    if (collective.data?.useCustomHostFee) {
+      possibleValues.push(collective.hostFeePercent);
+    }
+    if (parent?.data?.useCustomHostFee) {
+      possibleValues.push(parent?.hostFeePercent);
+    }
     // Fixed for Bank Transfers at host level
     // As of August 2020, this will be only set on a selection of Hosts (foundation 8%)
     possibleValues.push(host.data?.bankTransfersHostFeePercent);
@@ -848,27 +1006,50 @@ export const getHostFeePercent = async (order, host = null) => {
     }
   }
 
-  if (order.paymentMethod.service === 'opencollective') {
-    // Default to 0 for this kind of payments
-    if (order.paymentMethod.type === 'collective' || order.paymentMethod.type === 'host') {
-      possibleValues.push(0);
-    }
+  if (order.paymentMethod.service === 'opencollective' && order.paymentMethod.type === 'host') {
+    // Fixed for Added Funds at collective level
+    possibleValues.push(collective.data?.addedFundsHostFeePercent);
+    // Fixed for Added Funds at parent level
+    possibleValues.push(parent?.data?.addedFundsHostFeePercent);
+    // Fixed for Added Funds at host level
+    possibleValues.push(host.data?.addedFundsHostFeePercent);
+  }
+
+  if (order.paymentMethod.service === 'opencollective' && order.paymentMethod.type === 'collective') {
+    // Default to 0 for Collective to Collective on the same Host
+    possibleValues.push(0);
   }
 
   if (order.paymentMethod.service === 'stripe') {
-    // Configurable by the Host globally or at the Collective level
-    possibleValues.push(order.collective.data?.creditCardHostFeePercent);
+    // Configurable by the Host globally, at the Collective or Parent level
+    possibleValues.push(collective.data?.creditCardHostFeePercent);
+    possibleValues.push(parent?.data?.creditCardHostFeePercent);
+    // Custom fee is a priority over host custom one
+    if (collective.data?.useCustomHostFee) {
+      possibleValues.push(collective.hostFeePercent);
+    }
+    if (parent?.data?.useCustomHostFee) {
+      possibleValues.push(parent?.hostFeePercent);
+    }
     possibleValues.push(host.data?.creditCardHostFeePercent);
   }
 
   if (order.paymentMethod.service === 'paypal') {
     // Configurable by the Host globally or at the Collective level
-    possibleValues.push(order.collective.data?.paypalHostFeePercent);
+    possibleValues.push(collective.data?.paypalHostFeePercent);
+    possibleValues.push(parent?.data?.paypalHostFeePercent);
+    // Custom fee is a priority over host custom one
+    if (collective.data?.useCustomHostFee) {
+      possibleValues.push(collective.hostFeePercent);
+    }
+    if (parent?.data?.useCustomHostFee) {
+      possibleValues.push(parent?.hostFeePercent);
+    }
     possibleValues.push(host.data?.paypalHostFeePercent);
   }
 
   // Default for Collective
-  possibleValues.push(order.collective.hostFeePercent);
+  possibleValues.push(collective.hostFeePercent);
 
   // Just in case, default on the platform (not used in normal operation)
   possibleValues.push(config.fees.default.hostPercent);
@@ -885,11 +1066,15 @@ export const getHostFeeSharePercent = async (order, host = null) => {
   const possibleValues = [];
 
   if (order) {
-    if (order.paymentMethod?.service === 'stripe' && order.paymentMethod?.type === 'creditcard') {
-      possibleValues.push(plan?.creditCardHostFeeSharePercent);
+    // Preload payment method
+    if (!order.paymentMethod && order.PaymentMethodId) {
+      order.paymentMethod = await order.getPaymentMethod();
     }
 
-    if (order.paymentMethod?.service === 'paypal' && order.paymentMethod?.type === 'payment') {
+    // Assign different fees based on the payment provider
+    if (order.paymentMethod?.service === 'stripe' && order.paymentMethod?.type === 'creditcard') {
+      possibleValues.push(plan?.creditCardHostFeeSharePercent);
+    } else if (order.paymentMethod?.service === 'paypal') {
       possibleValues.push(plan?.paypalHostFeeSharePercent);
     }
   }

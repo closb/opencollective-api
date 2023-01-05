@@ -70,11 +70,11 @@ export const NewAccountOrReferenceInput = new GraphQLInputObjectType({
  */
 export const fetchAccountWithReference = async (
   input,
-  { loaders = null, throwIfMissing = false, dbTransaction = undefined, lock = false } = {},
+  { loaders = null, throwIfMissing = false, dbTransaction = undefined, lock = false, paranoid = true } = {},
 ) => {
   const loadCollectiveById = id => {
     if (!loaders || dbTransaction) {
-      return models.Collective.findByPk(id, { transaction: dbTransaction, lock });
+      return models.Collective.findByPk(id, { transaction: dbTransaction, lock, paranoid });
     } else {
       return loaders.Collective.byId.load(id);
     }
@@ -88,7 +88,7 @@ export const fetchAccountWithReference = async (
     collective = await loadCollectiveById(input.legacyId || input.id);
   } else if (input.slug) {
     collective = await models.Collective.findOne(
-      { where: { slug: input.slug.toLowerCase() } },
+      { where: { slug: input.slug.toLowerCase() }, paranoid },
       { transaction: dbTransaction, lock },
     );
   } else {
@@ -111,6 +111,9 @@ export const fetchAccountWithReference = async (
  *    - include: to include associated models
  */
 export const fetchAccountsWithReferences = async (inputs, { throwIfMissing = false, attributes, include } = {}) => {
+  // Compatibility with simple reference inputs not wrapped in an array
+  inputs = Array.isArray(inputs) ? inputs : [inputs];
+
   if (inputs.length > 200) {
     throw new Error('You can only fetch up to 200 accounts at once');
   } else if (inputs.length === 0) {
@@ -165,4 +168,17 @@ export const fetchAccountsWithReferences = async (inputs, { throwIfMissing = fal
   }
 
   return accounts;
+};
+
+/**
+ * A quick helper around `fetchAccountsWithReferences` optimized to fetch accounts IDs
+ * from AccountReferenceInputs
+ */
+export const fetchAccountsIdsWithReference = async accounts => {
+  if (!accounts?.length) {
+    return [];
+  } else {
+    const fetchedAccounts = await fetchAccountsWithReferences(accounts, { attributes: ['id'] });
+    return fetchedAccounts.map(account => account.id);
+  }
 };

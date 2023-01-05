@@ -63,6 +63,24 @@ data['collective.expense.paid'] = {
     viewLatestExpenses: 'https://opencollective.com/wwcodeaustin/expenses',
   },
 };
+data['collective.expense.missing.receipt'] = {
+  host: { id: 1, name: 'WWCode', slug: 'wwcode' },
+  expense: {
+    amount: 1250,
+    currency: 'USD',
+  },
+  collective: {
+    slug: 'wwcodeaustin',
+    name: 'Women Who Code Austin',
+  },
+  fromCollective: {
+    slug: 'xdamman',
+    name: 'Xavier Damman',
+  },
+  actions: {
+    viewLatestExpenses: 'https://opencollective.com/wwcodeaustin/expenses',
+  },
+};
 data['user.card.claimed'] = {
   currency: 'USD',
   initialBalance: 10000,
@@ -390,7 +408,7 @@ data['report.platform'] = {
   },
 };
 data['user.monthlyreport'] = {
-  recipient: { firstName: 'Xavier' },
+  recipient: { name: 'Xavier' },
   month: 'march',
   year: '2017',
   manageSubscriptionsUrl: 'https://opencollective.com/recurring-contributions',

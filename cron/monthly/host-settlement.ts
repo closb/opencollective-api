@@ -13,6 +13,7 @@ import { TransactionKind } from '../../server/constants/transaction-kind';
 import { SETTLEMENT_EXPENSE_PROPERTIES } from '../../server/constants/transactions';
 import { getTransactionsCsvUrl } from '../../server/lib/csv';
 import { getPendingHostFeeShare, getPendingPlatformTips } from '../../server/lib/host-metrics';
+import { reportErrorToSentry, reportMessageToSentry } from '../../server/lib/sentry';
 import { parseToBoolean } from '../../server/lib/utils';
 import models, { sequelize } from '../../server/models';
 import { PayoutMethodTypes } from '../../server/models/PayoutMethod';
@@ -74,12 +75,12 @@ export async function run(baseDate: Date | moment.Moment = defaultDate): Promise
   );
 
   for (const host of hosts) {
-    const pendingPlatformTips = await getPendingPlatformTips(host, { startDate, endDate });
-    const pendingHostFeeShare = await getPendingHostFeeShare(host, { startDate, endDate });
-
     if (HOST_ID && host.id !== parseInt(HOST_ID)) {
       continue;
     }
+
+    const pendingPlatformTips = await getPendingPlatformTips(host, { status: ['OWED'], endDate });
+    const pendingHostFeeShare = await getPendingHostFeeShare(host, { status: ['OWED'], endDate });
 
     const plan = await host.getPlan();
 
@@ -90,13 +91,13 @@ export async function run(baseDate: Date | moment.Moment = defaultDate): Promise
 FROM "Transactions" as t
 INNER JOIN "TransactionSettlements" ts ON ts."TransactionGroup" = t."TransactionGroup" AND t.kind = ts.kind
 WHERE t."CollectiveId" = :CollectiveId
-AND t."createdAt" >= :startDate AND t."createdAt" < :endDate
 AND t."kind" IN ('PLATFORM_TIP_DEBT', 'HOST_FEE_SHARE_DEBT')
 AND t."isDebt" IS TRUE
 AND t."deletedAt" IS NULL
-AND ts."status" != 'SETTLED'`,
+AND ts."status" = 'OWED'
+AND t."createdAt" < :endDate`,
       {
-        replacements: { CollectiveId: host.id, startDate: startDate, endDate: endDate },
+        replacements: { CollectiveId: host.id, endDate: endDate },
         model: models.Transaction,
         mapToModel: true, // pass true here if you have any mapped fields
       },
@@ -173,6 +174,7 @@ AND ts."status" != 'SETTLED'`,
 
       if (!payoutMethod) {
         console.error('No Payout Method found, Open Collective Inc. needs to have at least one payout method.');
+        reportMessageToSentry('No Payout Method found, Open Collective Inc. needs to have at least one payout method.');
         process.exit();
       }
 
@@ -227,6 +229,7 @@ if (require.main === module) {
   run(defaultDate)
     .catch(e => {
       console.error(e);
+      reportErrorToSentry(e);
       process.exit(1);
     })
     .then(() => {
